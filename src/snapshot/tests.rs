@@ -928,8 +928,9 @@ fn inspect_keys_wal_mode_on_the_header_byte_sqlite_reads() {
 
 /// Either version byte being 2 takes the copy: byte 19 is what SQLite acts on,
 /// byte 18 keeps every header that took the copy in 0.181.0 on it. A header
-/// whose byte 18 alone says WAL reads alike on both arms, so no end-to-end test
-/// can see that half; this one does.
+/// whose byte 18 alone says WAL prints the same on both arms whenever the copy
+/// can be made, and none of the end-to-end tests here tells the arms apart;
+/// this one does.
 #[test]
 fn header_says_wal_reads_either_version_byte() {
     for (len, write_version, read_version, want) in [

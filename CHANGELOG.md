@@ -49,7 +49,7 @@ name is passed as before.
   after the index has been built. Two inputs.
 - SQLite's errors quote the name it was given, so for a relative name they
   now show `./` in front of it. Two inputs, exit 1 on both versions: `inspect
-  s.db`, whose absolute path (730 bytes) is past SQLite's 512-byte limit, said
+  s.db`, whose absolute path (730 bytes) is longer than SQLite accepts, said
   `unable to open database file: s.db` and now says `./s.db`; `create --out
   ro/x.db` into a read-only directory said `unable to open database: ro/x.db`
   and now says `./ro/x.db`, under the same `VACUUM INTO 'ro/x.db'` line.
@@ -80,13 +80,20 @@ inputs, one changed.
   overwritten, and a compressed `--out` is replaced and gets a `.blake3` beside
   it.
 - `--out ""` is refused only after the whole index has been built.
-- `inspect` cannot read a raw snapshot whose absolute path is longer than
-  SQLite's 512-byte limit, as in 0.181.0 (measured on a 730-byte path named
-  relatively).
+- `inspect` cannot read a raw snapshot in rollback mode whose absolute path
+  is longer than 504 bytes, as in 0.181.0: SQLite refuses a path whose
+  `-journal` would not fit in its 512 bytes. Measured at 504 bytes (read),
+  505 and 730 (refused), named relatively. A snapshot in WAL mode at 730 bytes
+  reads, because it is read through a copy.
+- `create --out x.db.zst` fails when the path of TMPDIR is not valid UTF-8
+  (`VACUUM INTO '<TMPDIR>/…/compacted.db'`, exit 1), as in 0.181.0. A raw
+  `--out x.db` under the same TMPDIR is written.
 - On Windows, `:` in a file name separates a file from one of its NTFS
   streams. `create --out file:x.db` wrote `x.db` there; it now hands SQLite
-  `.\file:x.db`, which names a stream `x.db` of a file called `file`. Read from
-  the Rust and SQLite sources, not run: there is no Windows machine here.
+  `.\file:x.db`, which names a stream `x.db` of a file called `file`. `--out
+  :memory:` reaches SQLite as `.\:memory:`, a name Windows cannot hold as a
+  file, so the file named `:memory:` above is what Linux writes. Read from the
+  Rust and SQLite sources, not run: there is no Windows machine here.
 
 ## 0.181.0
 
