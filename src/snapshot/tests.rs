@@ -641,10 +641,28 @@ fn inspect_counts_another_index_versions_snapshot_alike_on_every_arm() {
         let zst = dir.path().join("snapshot.db.zst");
         let raw = std::fs::read(&in_place).unwrap();
         std::fs::write(&zst, zstd::encode_all(&raw[..], 3).unwrap()).unwrap();
-        // A hot journal is what makes the in-place read fail and fall back to
-        // a staged copy, the third place a copy is opened.
+        // A journal SQLite calls hot is what makes the in-place read-only open
+        // fail and fall back to a staged copy, the third place a copy is
+        // opened. One whose first header rolls nothing back, so the copy —
+        // which does not take the journal (`stage_copy`) — holds the same
+        // snapshot the other three arms read.
         let fallback = dir.path().join("fallback.db");
-        hot_journal_pair(&in_place, &fallback);
+        std::fs::copy(&in_place, &fallback).unwrap();
+        std::fs::write(
+            format!("{}-journal", fallback.display()),
+            hot_looking_journal(None),
+        )
+        .unwrap();
+        let read_only_in_place =
+            Connection::open_with_flags(&fallback, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .and_then(|c| {
+                    c.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0))
+                });
+        assert!(
+            read_only_in_place.is_err(),
+            "precondition: this arm needs an in-place read-only open that fails, got \
+             {read_only_in_place:?}"
+        );
 
         for (arm, file, write_version) in [
             ("in place", &in_place, Some(1u8)),
@@ -991,121 +1009,199 @@ fn hot_journal_pair(committed: &std::path::Path, db: &std::path::Path) -> std::p
     journal
 }
 
-/// D#630 (0.180.0 pre-tag review R2). A non-WAL file with a hot journal cannot
-/// be read in place read-only (SQLite must roll the journal back first, and a
-/// read-only connection may not write), so `inspect` falls back to a writable
-/// copy. That copy was the main file alone: the journal stayed behind, the copy
-/// kept the unfinished transaction's pages, and `inspect` printed "database
-/// disk image is malformed", or the unfinished transaction's values with exit
-/// 0 (which one depends on the pages written), where `sqlite3` reads the last
-/// commit. The test
-/// this replaces passed only because its transaction never reached the main
-/// file. Three ways in: the read-only fallback (non-WAL), the WAL arm (a crash
-/// while switching a file to WAL leaves the header saying WAL beside a hot
-/// journal, and SQLite rolls that back first too), and a link, whose journal
-/// SQLite looks for beside the TARGET.
+/// A journal SQLite calls hot — it starts with the journal magic, so
+/// `hasHotJournal` says yes — whose first header rolls nothing back: the zeros
+/// after the magic fail `readJournalHdr`'s page- and sector-size checks, which
+/// returns SQLITE_DONE. With `names` set it also carries the trailer SQLite
+/// reads a SUPER-JOURNAL path out of (`readSuperJournal`): the name, then its
+/// length and the sum of its bytes as big-endian u32s, then the magic again, in
+/// the last `16 + len` bytes of the file.
+fn hot_looking_journal(names: Option<&std::path::Path>) -> Vec<u8> {
+    const MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+    let mut journal = MAGIC.to_vec();
+    journal.resize(512, 0);
+    if let Some(path) = names {
+        let name = path.to_str().expect("test path is UTF-8").as_bytes();
+        let cksum = name
+            .iter()
+            .fold(0u32, |sum, b| sum.wrapping_add(u32::from(*b)));
+        journal.extend_from_slice(name);
+        journal.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        journal.extend_from_slice(&cksum.to_be_bytes());
+        journal.extend_from_slice(&MAGIC);
+    }
+    journal
+}
+
+/// Everything in `dir`, by name and bytes, to compare before against after.
+fn files_in(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut all: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            let bytes = std::fs::read(e.path()).unwrap_or_default();
+            (e.file_name().to_string_lossy().into_owned(), bytes)
+        })
+        .collect();
+    all.sort();
+    all
+}
+
+/// What `inspect` says about `file`, with the path taken out of an error so
+/// that two copies of the same bytes in different directories compare equal.
+fn inspect_outcome(file: &std::path::Path) -> Result<String, String> {
+    crate::snapshot::inspect(file)
+        .map(|m| m.tool_version)
+        .map_err(|e| format!("{e:#}").replace(&file.display().to_string(), "<file>"))
+}
+
+/// D#630 (0.180.0 pre-tag review R2) staged the `-journal` with the file so
+/// that SQLite would roll it back, and 0.181.0's R3 WITHDREW it (D#646):
+/// rolling a journal back also deletes the file a path inside the journal names
+/// (`stage_copy`, and the test below). So a hot pair reads as the main file
+/// alone reads — the unfinished transaction's values, or a malformed-image
+/// refusal — which is what 0.180.0 and earlier did, where `sqlite3` reads the
+/// last commit. What is pinned here is that the journal beside the file changes
+/// NOTHING about the answer, and that the pair is left as it was. Three ways
+/// in: the read-only fallback (non-WAL), the WAL arm (a crash while switching a
+/// file to WAL leaves the header saying WAL beside a hot journal), and a link,
+/// whose journal SQLite looks for beside the TARGET.
 #[test]
-fn inspect_rolls_back_a_hot_journal_as_sqlite_does() {
+fn inspect_reads_a_hot_journal_pair_as_the_main_file_alone() {
     let committed_dir = TempDir::new().unwrap();
     let committed = committed_dir.path().join("committed.db");
     raw_snapshot_fixture(&committed, "delete", 1);
     let dir = TempDir::new().unwrap();
-    let hot = dir.path().join("hot.db");
+    let hot = dir.path().join("snapshot.db");
     let journal = hot_journal_pair(&committed, &hot);
-    let flipped = dir.path().join("flipped.db");
+    let flipped_dir = TempDir::new().unwrap();
+    let flipped = flipped_dir.path().join("snapshot.db");
     let mut header_says_wal = std::fs::read(&hot).unwrap();
     header_says_wal[18] = 2;
     header_says_wal[19] = 2;
     std::fs::write(&flipped, &header_says_wal).unwrap();
-    std::fs::copy(&journal, dir.path().join("flipped.db-journal")).unwrap();
+    std::fs::copy(&journal, flipped_dir.path().join("snapshot.db-journal")).unwrap();
 
-    let files = |dir: &std::path::Path| {
-        let mut all: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| {
-                let e = e.unwrap();
-                let bytes = std::fs::read(e.path()).unwrap();
-                (e.file_name().to_string_lossy().into_owned(), bytes)
-            })
-            .collect();
-        all.sort();
-        all
+    // The same main file with no journal beside it: what `inspect` must answer
+    // for the pair too.
+    let alone = |bytes: &[u8]| {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("snapshot.db");
+        std::fs::write(&file, bytes).unwrap();
+        let outcome = inspect_outcome(&file);
+        (dir, outcome)
     };
-    let check = |name: &str, file: &std::path::Path| {
-        let meta = crate::snapshot::inspect(file).unwrap_or_else(|e| panic!("{name}: {e:#}"));
-        assert_eq!(
-            meta.tool_version, "9.9.9",
-            "{name}: read the unfinished transaction instead of the last commit"
-        );
-    };
+    let (_hot_alone_dir, hot_alone) = alone(&std::fs::read(&hot).unwrap());
+    let (_flipped_alone_dir, flipped_alone) = alone(&header_says_wal);
+    assert_ne!(
+        hot_alone.as_deref(),
+        Ok("9.9.9"),
+        "precondition: the main file alone must not read as the last commit, or this \
+         fixture proves nothing"
+    );
 
     #[cfg(unix)]
+    let link_dir = TempDir::new().unwrap();
+    #[cfg(unix)]
     let link = {
-        let link = dir.path().join("link.db");
+        let link = link_dir.path().join("link.db");
         std::os::unix::fs::symlink(&hot, &link).unwrap();
         link
     };
-    let before = files(dir.path());
-    check("non-WAL", &hot);
-    check("header says WAL", &flipped);
+    let before = (files_in(dir.path()), files_in(flipped_dir.path()));
+    assert_eq!(inspect_outcome(&hot), hot_alone, "non-WAL");
+    assert_eq!(inspect_outcome(&flipped), flipped_alone, "header says WAL");
     #[cfg(unix)]
-    check("link", &link);
     assert_eq!(
-        files(dir.path()),
+        inspect_outcome(&link).map_err(|e| e.replace(&hot.display().to_string(), "<file>")),
+        hot_alone,
+        "link"
+    );
+    assert_eq!(
+        (files_in(dir.path()), files_in(flipped_dir.path())),
         before,
         "inspect rolled back, or otherwise touched, the files it was pointed at"
     );
 }
 
-/// The same hot-journal pairs, read-only. Rolling back happens in the staged
-/// copy, and `fs::copy` carried the source's 0444 over to it, so SQLite could
-/// not write the copy and `inspect` failed with "attempt to write a readonly
-/// database" where the 0644 pair read the last commit. The journal is 0444 too:
-/// SQLite opens a hot journal read-write to roll it back.
+/// 0444, on each arm. The staged copy is a new file rather than an `fs::copy`,
+/// which carries the source's mode over, and the reader open writes the copy:
+/// a 0444 snapshot failed with "attempt to write a readonly database". The hot
+/// pairs are here too — the journal is not copied any more, so the read-only
+/// fallback has nothing to roll back, and the answer must be the 0644 answer.
 #[cfg(unix)]
 #[test]
-fn inspect_rolls_back_a_hot_journal_beside_a_read_only_snapshot() {
+fn inspect_reads_a_read_only_snapshot_on_every_arm() {
     use std::os::unix::fs::PermissionsExt;
 
     let committed_dir = TempDir::new().unwrap();
     let committed = committed_dir.path().join("committed.db");
     raw_snapshot_fixture(&committed, "delete", 1);
-    let dir = TempDir::new().unwrap();
-    let hot = dir.path().join("hot.db");
-    let journal = hot_journal_pair(&committed, &hot);
-    let flipped = dir.path().join("flipped.db");
-    let mut header_says_wal = std::fs::read(&hot).unwrap();
-    header_says_wal[18] = 2;
-    header_says_wal[19] = 2;
-    std::fs::write(&flipped, &header_says_wal).unwrap();
-    let flipped_journal = dir.path().join("flipped.db-journal");
-    std::fs::copy(&journal, &flipped_journal).unwrap();
-    for f in [&hot, &journal, &flipped, &flipped_journal] {
-        std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o444)).unwrap();
-    }
-    let before: Vec<_> = [&hot, &journal, &flipped, &flipped_journal]
-        .iter()
-        .map(|f| std::fs::read(f).unwrap())
-        .collect();
 
-    for (name, file) in [("non-WAL", &hot), ("header says WAL", &flipped)] {
-        let meta = crate::snapshot::inspect(file).unwrap_or_else(|e| panic!("{name}: {e:#}"));
-        assert_eq!(
-            meta.tool_version, "9.9.9",
-            "{name}: read the unfinished transaction instead of the last commit"
-        );
+    // Shapes that read as a clean snapshot whatever their mode: the three arms
+    // that stage a copy, and the in-place arm.
+    for (arm, mode, write_version) in [
+        ("WAL staging", "wal", 2u8),
+        ("in place", "delete", 1u8),
+        ("compressed", "delete", 1u8),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let raw = dir.path().join("snapshot.db");
+        raw_snapshot_fixture(&raw, mode, write_version);
+        let file = if arm == "compressed" {
+            let zst = dir.path().join("snapshot.db.zst");
+            std::fs::write(
+                &zst,
+                zstd::encode_all(&std::fs::read(&raw).unwrap()[..], 1).unwrap(),
+            )
+            .unwrap();
+            zst
+        } else {
+            raw.clone()
+        };
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let got = inspect_outcome(&file);
+        assert_eq!(got.as_deref(), Ok("9.9.9"), "{arm} at 0444");
     }
-    let after: Vec<_> = [&hot, &journal, &flipped, &flipped_journal]
-        .iter()
-        .map(|f| std::fs::read(f).unwrap())
-        .collect();
-    assert!(before == after, "inspect changed a file it was pointed at");
+
+    // A hot pair at 0444 answers what the same pair answers at 0644.
+    for (name, write_version) in [("non-WAL", 1u8), ("header says WAL", 2u8)] {
+        let mut outcomes = Vec::new();
+        let mut kept = Vec::new();
+        for mode in [0o644, 0o444] {
+            let dir = TempDir::new().unwrap();
+            let hot = dir.path().join("snapshot.db");
+            let journal = hot_journal_pair(&committed, &hot);
+            if write_version == 2 {
+                let mut bytes = std::fs::read(&hot).unwrap();
+                bytes[18] = 2;
+                bytes[19] = 2;
+                std::fs::write(&hot, &bytes).unwrap();
+            }
+            for f in [&hot, &journal] {
+                std::fs::set_permissions(f, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+            let before = files_in(dir.path());
+            outcomes.push(inspect_outcome(&hot));
+            assert_eq!(
+                files_in(dir.path()),
+                before,
+                "{name} at {mode:o}: inspect changed a file it was pointed at"
+            );
+            kept.push(dir);
+        }
+        assert_eq!(
+            outcomes[1], outcomes[0],
+            "{name}: 0444 answered differently from 0644"
+        );
+        drop(kept);
+    }
 }
 
-/// The WAL arm stages a `-journal` with the file now (D#630), and 0.180.0 read
-/// a WAL-mode snapshot whatever sat at that name. A directory there must not
-/// turn into a copy error, nor a FIFO into a copy that blocks forever, so only
-/// a regular file is staged. The non-WAL arm blocked on the FIFO without any
+/// Whatever sits at `<file>-journal`, `inspect` reads the snapshot and leaves
+/// that file alone: the copy takes the main file only (`stage_copy`), and a
+/// directory or a FIFO there must not turn into a copy error or a copy that
+/// blocks forever. The non-WAL arm blocked on the FIFO without any
 /// copy (D#636): opening in place, SQLite's hot-journal probe opens
 /// `<file>-journal`, and opening a FIFO waits for a writer; 0.180.0 was killed
 /// by `timeout 10` (rc=124). Through a link too: SQLite opens the journal beside
@@ -1248,49 +1344,125 @@ fn inspect_reads_a_non_wal_file_past_a_stray_wal() {
     }
 }
 
-/// The staged copy takes a `-journal` only when SQLite would roll something back
-/// from it: non-empty and starting with SQLite's journal magic. SQLite calls a
-/// journal hot when its first byte is not 0, then plays nothing back from one
-/// whose first header lacks the magic, so without it the file reads as the main
-/// file alone either way. Copying such a journal cost a write as large as it is
-/// (pre-tag review: 1 GiB beside a WAL-mode snapshot, first byte 0 and then
-/// first byte 1, was copied into TMPDIR, and under a 256 MiB file-size limit
-/// inspect died of SIGXFSZ and left the copy behind, where 0.180.0 exited 0).
+/// The staged copy is the main database file and nothing else: not the
+/// `-journal`, whose rollback deletes a path the journal itself names and can
+/// grow the copy past any limit (`stage_copy`), and not the `-wal`, so the WAL
+/// arm reports the last checkpoint. Whatever sits at either name, the staged
+/// directory holds one file.
 #[test]
-fn stage_copy_takes_a_journal_only_when_it_has_something_to_roll_back() {
+fn stage_copy_takes_the_main_file_alone() {
     let committed_dir = TempDir::new().unwrap();
     let committed = committed_dir.path().join("committed.db");
     raw_snapshot_fixture(&committed, "delete", 1);
-    let dir = TempDir::new().unwrap();
-    let hot = dir.path().join("hot.db");
-    hot_journal_pair(&committed, &hot);
-    let mut no_magic = vec![0u8; 64 * 1024];
-    no_magic[0] = 1;
-    let shapes: [(&str, Option<Vec<u8>>, bool); 4] = [
-        ("hot", None, true),
-        ("first byte 0", Some(vec![0u8; 64 * 1024]), false),
-        ("first byte 1, no magic", Some(no_magic), false),
-        ("empty", Some(Vec::new()), false),
+    let victim_dir = TempDir::new().unwrap();
+    let victim = victim_dir.path().join("victim");
+    std::fs::write(&victim, b"not a super-journal").unwrap();
+
+    let shapes: [(&str, &str, Vec<u8>); 4] = [
+        ("hot journal", "-journal", Vec::new()),
+        (
+            "journal naming a file",
+            "-journal",
+            hot_looking_journal(Some(&victim)),
+        ),
+        ("journal of zeros", "-journal", vec![0u8; 64 * 1024]),
+        ("stray wal", "-wal", vec![1u8; 4096]),
     ];
-    for (name, journal_bytes, copied) in shapes {
-        let file = match journal_bytes {
-            None => hot.clone(),
-            Some(bytes) => {
-                let file = dir
-                    .path()
-                    .join(format!("{}.db", name.replace([' ', ','], "_")));
-                std::fs::copy(&committed, &file).unwrap();
-                std::fs::write(format!("{}-journal", file.display()), bytes).unwrap();
-                file
-            }
-        };
+    for (name, suffix, side_bytes) in shapes {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("fixture.db");
+        let side = dir.path().join(format!("fixture.db{suffix}"));
+        if name == "hot journal" {
+            hot_journal_pair(&committed, &file);
+        } else {
+            std::fs::copy(&committed, &file).unwrap();
+            std::fs::write(&side, &side_bytes).unwrap();
+        }
+        let before = files_in(dir.path());
+
         let into = TempDir::new().unwrap();
         let staged = super::stage_copy(&file, into.path()).unwrap();
-        let journal = into.path().join("snapshot.db-journal");
         assert_eq!(staged, into.path().join("snapshot.db"), "{name}");
-        assert_eq!(journal.exists(), copied, "{name}: journal copied?");
-        let meta = crate::snapshot::inspect(&file).unwrap_or_else(|e| panic!("{name}: {e:#}"));
-        assert_eq!(meta.tool_version, "9.9.9", "{name}");
+        assert_eq!(
+            files_in(into.path())
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect::<Vec<_>>(),
+            ["snapshot.db"],
+            "{name}: the staged directory holds more than the main file"
+        );
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            std::fs::read(&file).unwrap(),
+            "{name}: the copy is not the main file byte for byte"
+        );
+        assert_eq!(
+            files_in(dir.path()),
+            before,
+            "{name}: stage_copy touched the files it read"
+        );
+        assert!(victim.exists(), "{name}: stage_copy deleted the named file");
+    }
+}
+
+/// 0.181.0 pre-tag review R3 (D#646). Staging the `-journal` so that SQLite
+/// could roll it back (D#630) handed `inspect` a delete: `pager_playback` reads
+/// a super-journal path out of the journal (sqlite3.c:61755) and
+/// `pager_delsuper` deletes the file that path names (61912 -> 61542). The
+/// bytes at `<file>-journal` are nobody's promise — they are whatever sits
+/// beside the file the user named — so those bytes chose which file went. The
+/// journal is not staged any anymore; the control proves the fixture really
+/// does delete through this SQLite, so a green test is not a fixture that
+/// disarmed itself.
+#[test]
+fn inspect_does_not_delete_a_file_a_journal_names() {
+    for (header, write_version) in [("rollback", 1u8), ("wal", 2u8)] {
+        let dir = TempDir::new().unwrap();
+        let raw = dir.path().join("snapshot.db");
+        raw_snapshot_fixture(&raw, "delete", 1);
+        if write_version == 2 {
+            let mut bytes = std::fs::read(&raw).unwrap();
+            bytes[18] = 2;
+            bytes[19] = 2;
+            std::fs::write(&raw, &bytes).unwrap();
+        }
+        // Outside `dir`, so that the residue check below stays about the pair.
+        let victim_dir = TempDir::new().unwrap();
+        let victim = victim_dir.path().join("victim");
+        let plant_victim = || std::fs::write(&victim, b"not a super-journal").unwrap();
+        plant_victim();
+        let journal = dir.path().join("snapshot.db-journal");
+        std::fs::write(&journal, hot_looking_journal(Some(&victim))).unwrap();
+
+        // Control: the pair as the withdrawn staging opened it — a writable
+        // copy with the journal beside it — deletes the victim.
+        {
+            let control_dir = TempDir::new().unwrap();
+            let control = control_dir.path().join("snapshot.db");
+            std::fs::copy(&raw, &control).unwrap();
+            std::fs::copy(&journal, control_dir.path().join("snapshot.db-journal")).unwrap();
+            let _ = Connection::open(&control)
+                .and_then(|c| c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)));
+            assert!(
+                !victim.exists(),
+                "{header}: control did not fire — this journal does not name a file SQLite \
+                 deletes, so the assertion below would pass on any code"
+            );
+            plant_victim();
+        }
+
+        let before = files_in(dir.path());
+        let got = inspect_outcome(&raw);
+        assert!(
+            victim.exists(),
+            "{header}: inspect deleted the file the journal named"
+        );
+        assert_eq!(got.as_deref(), Ok("9.9.9"), "{header}");
+        assert_eq!(
+            files_in(dir.path()),
+            before,
+            "{header}: inspect changed the pair it was pointed at"
+        );
     }
 }
 
@@ -1330,54 +1502,50 @@ fn inspect_says_a_newer_schema_is_newer_on_every_arm() {
     }
 }
 
-/// A `-journal` inspect cannot read is refused, as `sqlite3` refuses it
-/// ("unable to open database file"): it may hold what the main file needs to
-/// read as its last commit. The refusal names the file, so the user knows which
-/// one to fix; the first version said only "stage snapshot journal for inspect:
-/// Permission denied" (pre-tag review). An EMPTY one is no journal to SQLite
-/// (`unixAccess` counts a regular file as there only when it has bytes), so it
-/// is read past, unreadable or not, as 0.180.0 and `sqlite3` read past it.
+/// A `-journal` `inspect` cannot read is read PAST, as 0.180.0 read past it:
+/// the staged copy does not open the journal at all (`stage_copy`), and the
+/// in-place arm, where SQLite's own probe opens it and so calls it hot, falls
+/// back to that copy. 0.181.0 briefly refused these pairs, naming the journal,
+/// which `sqlite3` also does ("unable to open database file") — withdrawn with
+/// the rollback (D#646). Three shapes, because SQLite treats them differently
+/// and `inspect` must not: an empty one is no journal to it at all
+/// (`unixAccess` counts a regular file as there only when it has bytes), a
+/// non-empty one it cannot open it calls hot (`hasHotJournal`), and one
+/// starting with the journal magic is the real thing.
 #[cfg(unix)]
 #[test]
-fn inspect_names_a_journal_it_cannot_read() {
+fn inspect_reads_past_a_journal_it_cannot_read() {
     use std::os::unix::fs::PermissionsExt;
 
-    for (mode, write_version) in [("delete", 1u8), ("wal", 2u8)] {
-        let dir = TempDir::new().unwrap();
-        let raw = dir.path().join("snapshot.db");
-        raw_snapshot_fixture(&raw, mode, write_version);
-        let journal = dir.path().join("snapshot.db-journal");
-        std::fs::write(&journal, []).unwrap();
-        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let got = crate::snapshot::inspect(&raw).map(|m| m.tool_version);
-        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(
-            got.map_err(|e| format!("{e:#}")).as_deref(),
-            Ok("9.9.9"),
-            "{mode}: an empty journal is none"
-        );
-    }
-    for (mode, write_version) in [("delete", 1u8), ("wal", 2u8)] {
-        let dir = TempDir::new().unwrap();
-        let raw = dir.path().join("snapshot.db");
-        raw_snapshot_fixture(&raw, mode, write_version);
-        let journal = dir.path().join("snapshot.db-journal");
-        std::fs::write(&journal, [7u8; 512]).unwrap();
-        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o000)).unwrap();
-        if std::fs::File::open(&journal).is_ok() {
-            eprintln!("running as root: mode 000 does not stop a read, nothing to test");
-            return;
+    for (shape, bytes) in [
+        ("empty", Vec::new()),
+        ("non-empty", vec![7u8; 512]),
+        ("hot", hot_looking_journal(None)),
+    ] {
+        for (mode, write_version) in [("delete", 1u8), ("wal", 2u8)] {
+            let dir = TempDir::new().unwrap();
+            let raw = dir.path().join("snapshot.db");
+            raw_snapshot_fixture(&raw, mode, write_version);
+            let journal = dir.path().join("snapshot.db-journal");
+            std::fs::write(&journal, &bytes).unwrap();
+            std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let readable_as_root = std::fs::File::open(&journal).is_ok();
+            let got = crate::snapshot::inspect(&raw).map(|m| m.tool_version);
+            let left = std::fs::metadata(&journal).unwrap();
+            std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let case = format!("{shape} {mode} (unreadable: {})", !readable_as_root);
+            assert_eq!(
+                got.map_err(|e| format!("{e:#}")).as_deref(),
+                Ok("9.9.9"),
+                "{case}"
+            );
+            assert_eq!(left.len() as usize, bytes.len(), "{case}: the journal grew");
+            assert_eq!(
+                std::fs::read(&journal).unwrap(),
+                bytes,
+                "{case}: inspect changed the journal"
+            );
         }
-        let err = crate::snapshot::inspect(&raw).map(|m| m.tool_version);
-        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let msg = format!("{:#}", err.expect_err(mode));
-        // The path SQLite would open, links resolved: on macOS the temp dir is
-        // reached through /var -> /private/var.
-        let named = format!("{}-journal", std::fs::canonicalize(&raw).unwrap().display());
-        assert!(
-            msg.contains(&named),
-            "{mode}: the refusal must name {named}: {msg}"
-        );
     }
 }
 

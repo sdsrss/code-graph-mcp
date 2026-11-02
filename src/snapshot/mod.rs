@@ -259,9 +259,10 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
         // read-only connection cannot clean them up on close. Measured — two
         // files left behind, on a command whose whole job is to look. Staging
         // also preserves the semantics this arm has always had: the copy takes
-        // the main database file and not its `-wal`, so `inspect` reports the
-        // last checkpointed state and never disturbs a live index. It does take
-        // a `-journal` (see `stage_copy`).
+        // the main database file and neither its `-wal` nor its `-journal`, so
+        // `inspect` reports the last checkpointed state and never disturbs a
+        // live index (see `stage_copy` for why the `-journal` half of D#630 was
+        // withdrawn).
         //
         // The split costs nothing in practice: `snapshot create` emits through
         // `VACUUM INTO`, and its output is `journal_mode = delete` (measured on
@@ -352,13 +353,14 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     // `snapshot create` — cannot be opened read-only at all, because SQLite must
     // roll the journal back first and a read-only connection may not write.
     // `unwrap_or(0)` swallowed that and reported the file corrupt. The fallback
-    // below opens a writable copy, where the rollback can happen, and only
-    // because the copy carries the journal: without it the copy keeps whatever
-    // pages the unfinished transaction already wrote, and reads as "database
-    // disk image is malformed" or as uncommitted values (D#630). An earlier
-    // version of this comment said the bare copy "reads it perfectly"; the test
-    // behind that claim passed only because its transaction had not yet reached
-    // the main file.
+    // below opens a writable copy of the main file, where nothing has to be
+    // rolled back because the journal is not there. The user's own pair is left
+    // exactly as it was, and what the copy reads is whatever the main file
+    // alone says: the last commit if the dead transaction never reached it, the
+    // unfinished values or "database disk image is malformed" if it did, where
+    // `sqlite3` would read the last commit in every case. Copying the journal
+    // so that SQLite could roll it back was tried for 0.181.0 and withdrawn at
+    // the pre-tag review — it deletes a path the journal names (`stage_copy`).
     //
     // This is the same misdiagnosis the WAL split exists to prevent — telling a
     // user their snapshot is corrupt when the real problem is that we chose an
@@ -429,30 +431,43 @@ fn invalid_snapshot(file: &Path) -> anyhow::Error {
     )
 }
 
-/// Copy `file` into `dir` for a writable open, with its rollback journal. A hot
-/// `-journal` records what an unfinished transaction overwrote, and SQLite
-/// rolls it back before it reads; a copy without it reads that transaction's
-/// pages (D#630). Only a regular file at [`side_file_of`] `-journal` is
-/// copied: a directory is no journal, and copying a FIFO would block. And only
-/// one SQLite would roll something back from. An empty one SQLite treats as
-/// absent (`unixAccess`). It calls a journal hot when its first byte is not 0
-/// (`hasHotJournal`), and then plays nothing back from one whose first header
-/// does not start with its journal magic (`readJournalHdr` returns
-/// SQLITE_DONE), so without the magic the copy reads as the main file alone
-/// either way. Copying such a journal cost a write as large as it is (pre-tag
-/// review: 1 GiB, first byte 0 and then first byte 1, and under a file-size
-/// limit a SIGXFSZ that left the copy behind). A journal that does carry the
-/// magic is copied whole: how much it holds is the dead transaction's, not
-/// bounded by the snapshot's size. A non-empty journal that cannot be read is
-/// refused, naming it, as `sqlite3` refuses it. The `-wal` is deliberately left
-/// behind (see the WAL arm).
+/// Copy `file` into `dir` for a writable open. The copy is the main database
+/// file alone: whatever sits at `-journal` or `-wal` beside the original stays
+/// there, and neither is read.
 ///
-/// Both copies are new files rather than `fs::copy`s, which carry the source's
-/// mode over: rolling a hot journal back writes the copy and opens the journal
-/// read-write, so a 0444 pair failed with "attempt to write a readonly
-/// database" where the same pair at 0644 read the last commit.
+/// The `-journal` half of this was tried and WITHDRAWN at the 0.181.0 pre-tag
+/// review (D#630, D#646). A hot `-journal` holds what an unfinished
+/// transaction overwrote, and a copy without it reads that transaction's pages
+/// where `sqlite3` reads the last commit — but taking the journal along is what
+/// makes SQLite roll it back, and rolling back is not confined to the two files
+/// involved. `pager_playback` reads a SUPER-JOURNAL PATH out of the journal
+/// (sqlite3.c:61755) and `pager_delsuper` DELETES the file that path names when
+/// the playback ends (61912 -> 61542). So a `-journal` holds a path for
+/// whoever opens it to delete, and `inspect` is pointed at bytes nobody has
+/// vouched for yet — the same reason the decompression cap exists above.
+/// Measured on a 568-byte `-journal` (the journal magic, zeros, and a trailer
+/// naming another file) beside a 184,320-byte snapshot: `inspect` printed the
+/// snapshot's metadata, exited 0, and deleted the named file. With a FIFO at
+/// that path it blocked instead, 30 s to a SIGKILL, leaving the copy in TMPDIR.
+/// And the page count in the journal's own header drives `pager_truncate`
+/// (61817), so an 8,192-byte journal grew the staged copy to 8,589,934,592
+/// bytes of apparent size, which is SIGXFSZ (exit 153) under a file-size limit.
+/// `sqlite3` does all three on the same pairs, because it is opening a database
+/// to use it. `inspect` is reading a file to describe it, and a command that
+/// describes a file deletes nothing.
+///
+/// A hot journal is therefore read past, as in 0.180.0 and before: such a
+/// snapshot reads as its own pages say — the unfinished transaction's values,
+/// or "database disk image is malformed" — and the CHANGELOG says so under Not
+/// covered. What is kept from D#630 is the cheap half: the FIFO and the
+/// unreadable `-journal` no longer hang or refuse the read (D#636), because
+/// this copy does not open either one.
+///
+/// The copy is a new file rather than an `fs::copy`, which carries the source's
+/// mode over: the reader open still migrates and bootstraps the copy, so a 0444
+/// snapshot failed with "attempt to write a readonly database" where the same
+/// bytes at 0644 read fine.
 fn stage_copy(file: &Path, dir: &Path) -> Result<std::path::PathBuf> {
-    use std::io::Read;
     fn copy_writable(from: &Path, to: &Path) -> std::io::Result<u64> {
         let mut src = std::fs::File::open(from)?;
         let mut dst = std::fs::OpenOptions::new()
@@ -464,23 +479,8 @@ fn stage_copy(file: &Path, dir: &Path) -> Result<std::path::PathBuf> {
     let staged = dir.join("snapshot.db");
     copy_writable(file, &staged)
         .with_context(|| format!("stage a copy of '{}' for inspect", file.display()))?;
-    let journal = side_file_of(file, "-journal");
-    if std::fs::metadata(&journal).is_ok_and(|m| m.is_file() && m.len() > 0) {
-        let context = || format!("stage '{}' for inspect", journal.display());
-        let mut head = Vec::with_capacity(JOURNAL_MAGIC.len());
-        std::fs::File::open(&journal)
-            .and_then(|f| f.take(JOURNAL_MAGIC.len() as u64).read_to_end(&mut head))
-            .with_context(context)?;
-        if head == JOURNAL_MAGIC {
-            copy_writable(&journal, &with_suffix(&staged, "-journal")).with_context(context)?;
-        }
-    }
     Ok(staged)
 }
-
-/// The first eight bytes of every rollback journal header SQLite writes
-/// (`aJournalMagic` in sqlite3.c).
-const JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
 
 fn with_suffix(db: &Path, suffix: &str) -> std::path::PathBuf {
     let mut name = db.as_os_str().to_owned();
