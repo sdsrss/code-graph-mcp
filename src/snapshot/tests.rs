@@ -867,6 +867,64 @@ fn inspect_leaves_no_side_files_beside_the_file_it_reads() {
     }
 }
 
+/// D#639: SQLite opens a database in WAL mode when header byte 19, the read
+/// version, is 2 (`lockBtree`: `page1[19]==2`); byte 18 is the write version.
+/// SQLite always writes the two together, so only a crafted header splits them,
+/// and 1/2 took the in-place arm and left a `-wal` and a `-shm` beside the file.
+/// 2/1 is here because the predicate it passes through is the one that changed.
+#[test]
+fn inspect_keys_wal_mode_on_the_header_byte_sqlite_reads() {
+    for (write_version, read_version) in [(1u8, 2u8), (2, 1)] {
+        let shape = format!("bytes 18/19 = {write_version}/{read_version}");
+        let dir = TempDir::new().unwrap();
+        let raw = dir.path().join("snapshot.db");
+        raw_snapshot_fixture(&raw, "delete", 1);
+        let mut bytes = std::fs::read(&raw).unwrap();
+        bytes[18] = write_version;
+        bytes[19] = read_version;
+        std::fs::write(&raw, &bytes).unwrap();
+
+        // Control: a plain read-only open of the same bytes elsewhere does mint
+        // a `-shm` when byte 19 says WAL, so the residue check below is not
+        // passing because SQLite stopped caring about this header.
+        if read_version == 2 {
+            let ctl = TempDir::new().unwrap();
+            let copy = ctl.path().join("snapshot.db");
+            std::fs::write(&copy, &bytes).unwrap();
+            {
+                let c =
+                    Connection::open_with_flags(&copy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                        .unwrap();
+                c.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap();
+            }
+            assert!(
+                ctl.path().join("snapshot.db-shm").exists(),
+                "control: a read-only open of {shape} no longer creates a -shm"
+            );
+        }
+
+        let meta = crate::snapshot::inspect(&raw).unwrap();
+        assert_eq!(meta.tool_version, "9.9.9", "{shape}");
+        assert_eq!(
+            std::fs::read(&raw).unwrap(),
+            bytes,
+            "{shape}: inspect modified the file it was only pointed at"
+        );
+        let residue: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "snapshot.db")
+            .collect();
+        assert!(
+            residue.is_empty(),
+            "{shape}: inspect left files beside the snapshot: {residue:?}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn inspect_reads_a_wal_mode_raw_db_from_a_read_only_directory() {

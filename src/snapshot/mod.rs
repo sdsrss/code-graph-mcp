@@ -181,13 +181,16 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     // Anything under 16 bytes cannot be either format, so it is refused below
     // through the same message rather than given a partial-magic special case.
     //
-    // 20 bytes rather than 16 because the raw arm also needs byte 18, the SQLite
-    // header's "file format write version" (1 = rollback journal, 2 = WAL). A
-    // file of 16..=18 bytes is too short to carry byte 18 and so reads as
-    // non-WAL; 19 and 20 byte files do carry it and can read as WAL. Harmless
-    // either way — nothing that short survives the checks below — but stated
-    // exactly, because an earlier version of this comment said "16..20 reads as
-    // non-WAL" and that is false for two of those five sizes.
+    // 20 bytes rather than 16 because the raw arm also needs bytes 18 and 19, the
+    // SQLite header's file format write and read versions (1 = rollback journal,
+    // 2 = WAL). SQLite opens the WAL when byte 19 is 2 (`lockBtree`), and always
+    // writes the two bytes together; a header that splits them is crafted, and
+    // 1/2 read in place left a `-wal` and a `-shm` beside the file (D#639). So
+    // either byte saying WAL takes the copy: byte 19 because that is what SQLite
+    // acts on, byte 18 so that no header leaves the copy arm it took before. A
+    // file of 16..=18 bytes carries neither byte and reads as non-WAL; a 19-byte
+    // file carries byte 18 only. Harmless either way — nothing that short
+    // survives the checks below.
     let mut head = [0u8; 20];
     let head: &[u8] = if file_size_bytes >= 16 {
         use std::io::Read;
@@ -208,7 +211,7 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
     } else {
         &[]
     };
-    let wal_mode = head.len() >= 19 && head[18] == 2;
+    let wal_mode = head.get(18) == Some(&2) || head.get(19) == Some(&2);
 
     // zstd magic = 0x28 0xB5 0x2F 0xFD; SQLite = "SQLite format 3\0".
     //
