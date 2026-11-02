@@ -342,6 +342,117 @@ fn cli_snapshot_create_writes_a_relative_out_under_a_non_utf8_directory() {
     );
 }
 
+/// `snapshot create --out <out>` for `repo`, a raw (uncompressed) snapshot.
+#[cfg(unix)]
+fn create_raw_snapshot(repo: &std::path::Path, out: &std::path::Path) {
+    let status = Command::new(cli_bin())
+        .args(["snapshot", "create", "--out"])
+        .arg(out)
+        .arg("--quiet")
+        .arg("--root")
+        .arg(repo)
+        .status()
+        .unwrap();
+    assert!(status.success(), "create failed");
+}
+
+/// D#666 (M13): a rollback-mode raw snapshot, which is what `create` writes, is
+/// read where it is, not through a copy in TMPDIR. With TMPDIR naming a
+/// directory that does not exist no copy can be made, so the WAL-mode twin of
+/// the same snapshot is refused on `inspect tempdir`: the control that shows
+/// TMPDIR reached the binary. Unix only: `std::env::temp_dir` reads TMPDIR there.
+#[cfg(unix)]
+#[test]
+fn cli_snapshot_inspect_reads_a_rollback_mode_raw_file_in_place() {
+    let repo = init_git_repo();
+    let dir = TempDir::new().unwrap();
+    let rollback = dir.path().join("rollback.db");
+    create_raw_snapshot(repo.path(), &rollback);
+    let header = std::fs::read(&rollback).unwrap();
+    assert_eq!(header[18..20], [1, 1], "fixture: create wrote a WAL header");
+    let wal = dir.path().join("wal.db");
+    std::fs::copy(&rollback, &wal).unwrap();
+    {
+        let c = rusqlite::Connection::open(&wal).unwrap();
+        let mode: String = c
+            .query_row("PRAGMA journal_mode = wal", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal", "fixture: wal.db is not in WAL mode");
+    }
+
+    let no_tmp = dir.path().join("no-such-tmpdir");
+    let inspect = |file: &std::path::Path| {
+        Command::new(cli_bin())
+            .env("TMPDIR", &no_tmp)
+            .args(["snapshot", "inspect"])
+            .arg(file)
+            .output()
+            .unwrap()
+    };
+    let control = inspect(&wal);
+    let control_err = String::from_utf8_lossy(&control.stderr);
+    assert!(
+        !control.status.success() && control_err.contains("inspect tempdir"),
+        "control: a WAL-mode file read without TMPDIR (exit {:?}): {control_err}",
+        control.status.code()
+    );
+
+    let out = inspect(&rollback);
+    assert!(
+        out.status.success(),
+        "a rollback-mode raw snapshot was read through a copy: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(json["schema_version"].as_i64().unwrap() > 0);
+    assert!(!no_tmp.exists(), "inspect created TMPDIR");
+}
+
+/// D#666 (M8): SQLite's errors quote the name it was handed, and `inspect`
+/// hands it a relative name as typed with `./` in front (`sqlite_file_name`),
+/// not made absolute. The 0.182.0 CHANGELOG quotes that text for the input
+/// that reaches it: a relative name whose absolute path is longer than SQLite
+/// takes (its `-journal` name over 512 bytes, so the file's over 504), which
+/// fails to open on every version.
+#[cfg(unix)]
+#[test]
+fn cli_snapshot_inspect_error_quotes_a_relative_name_with_dot_slash() {
+    let repo = init_git_repo();
+    let dir = TempDir::new().unwrap();
+    let snap = dir.path().join("snap.db");
+    create_raw_snapshot(repo.path(), &snap);
+    // Measured on the canonical path, which is what SQLite builds from getcwd.
+    let mut deep = std::fs::canonicalize(dir.path()).unwrap();
+    while deep.join("s.db").as_os_str().len() <= 520 {
+        deep.push("d".repeat(200));
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::copy(&snap, deep.join("s.db")).unwrap();
+
+    let short = Command::new(cli_bin())
+        .args(["snapshot", "inspect"])
+        .arg(&snap)
+        .output()
+        .unwrap();
+    assert!(
+        short.status.success(),
+        "control: the same bytes at a short path did not read: {}",
+        String::from_utf8_lossy(&short.stderr)
+    );
+
+    let out = Command::new(cli_bin())
+        .current_dir(&deep)
+        .args(["snapshot", "inspect", "s.db"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a path over 504 bytes opened");
+    assert!(
+        stderr.contains("unable to open database file: ./s.db"),
+        "the error does not quote ./s.db: {stderr}"
+    );
+}
+
 // clap-migrated (audit #4 Step 4): `snapshot` is now a nested #[command(subcommand)].
 // clap owns --help for the parent and each sub, plus no-subcommand /
 // unknown-subcommand rejection (exit 2), replacing the hand-rolled args[2]/args[3]

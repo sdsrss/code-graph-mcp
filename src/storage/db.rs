@@ -1048,19 +1048,26 @@ mod tests {
 
     /// The three relative names SQLite reads as something other than a file
     /// become paths in the current directory; an absolute name is untouched.
-    #[cfg(unix)]
+    /// Compared as the string SQLite is handed, on every platform: this test was
+    /// Unix-only, so Windows' `.\` prefix was never run (D#666).
     #[test]
     fn sqlite_file_name_makes_every_special_name_a_path() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let absolute = if cfg!(windows) {
+            r"C:\abs\x.db"
+        } else {
+            "/abs/file:x.db"
+        };
         for (given, want) in [
-            ("file:x.db", "./file:x.db"),
-            (":memory:", "./:memory:"),
-            ("", "./"),
-            ("x.db", "./x.db"),
-            ("/abs/file:x.db", "/abs/file:x.db"),
+            ("file:x.db", format!(".{sep}file:x.db")),
+            (":memory:", format!(".{sep}:memory:")),
+            ("", format!(".{sep}")),
+            ("x.db", format!(".{sep}x.db")),
+            (absolute, absolute.to_string()),
         ] {
             assert_eq!(
-                sqlite_file_name(Path::new(given)),
-                Path::new(want),
+                sqlite_file_name(Path::new(given)).as_os_str(),
+                std::ffi::OsStr::new(&want),
                 "{given:?}"
             );
         }
