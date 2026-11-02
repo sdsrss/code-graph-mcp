@@ -3,23 +3,28 @@
 ## 0.182.0
 
 **Upgrading: nothing to do** (`INDEX_VERSION` stays at 124). Only `snapshot
-inspect` and `snapshot create --out` change: for a file name that begins with
-`file:`, and for a SQLite header whose bytes 18 and 19 disagree.
+inspect` and `snapshot create --out` change: for the file names SQLite reads
+as something other than a file (`file:…`, `:memory:`, the empty name), in
+SQLite's error text for a relative name, and for a SQLite header whose bytes
+18 and 19 disagree.
 To pin the binary back: `npm i -g @sdsrs/code-graph@0.181.0`
 (or, from source, `cargo install --locked --git
 https://github.com/sdsrss/code-graph-mcp --tag v0.181.0 --features
 embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
 `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
 
-Measured on 17 inputs, the 0.181.0 release binary against this one. Eight
-changed; the other nine print, exit and leave the same files on both.
+Measured on 28 inputs, the 0.181.0 release binary against this one. Thirteen
+changed; the other fifteen print, exit and leave the same files on both.
 
-### A file name that begins with `file:` names that file
+### A file name SQLite reads as something else names that file
 
-The SQLite built into this binary reads a file name that begins with `file:`
-as a URI, whatever the caller asks for, so a relative `file:x.db` meant
-`x.db`. Where the two commands gave SQLite the name as typed, they now give it
-the absolute path.
+SQLite reads three kinds of name as something other than a file: `:memory:`
+(a database in memory), the empty name (a temporary database), and, because
+the SQLite built into this binary accepts URIs whatever the caller asks for,
+any name that begins with `file:`, so `file:x.db` meant `x.db`. Where the two
+commands gave SQLite a relative name as typed, they now put `./` in front of
+it, which makes each of these a file in the current directory. An absolute
+name is passed as before.
 
 - `snapshot inspect file:x.db` read `x.db`. With no `x.db` beside it, it
   exited 1 with `unable to open database file: file:x.db`; with another
@@ -27,17 +32,34 @@ the absolute path.
   in WAL mode and a `-wal` beside it, it printed the value in that `-wal` and
   left an `x.db-shm` behind. It now prints `file:x.db`'s metadata in all three
   (exit 0) and leaves no file behind. Three inputs.
+- `snapshot inspect :memory:`, on a snapshot named `:memory:`, read an empty
+  database in memory and refused it as `not a valid code-graph snapshot`
+  (exit 1). It now prints the snapshot (exit 0). One input.
 - `snapshot create --out file:x.db` wrote `x.db` (exit 0). Where `x.db`
-  already existed it exited 1 (`VACUUM INTO 'file:x.db'`) and left `x.db` as it
-  was; `--out file:sub/x.db` beside a directory `file:sub` exited 1 the same
-  way. All three now write the file they were given (exit 0). Where
-  `file:x.db` itself already existed, `create` wrote `x.db` and exited 0; it now
-  exits 1 with `output file already exists`, as it does for any `--out` that
-  exists. Four inputs.
-- Unchanged: `./file:x.db` and the absolute path, given to `inspect`; a
-  `file:x.db` in WAL mode and a compressed `file:y.db.zst`, given to `inspect`;
-  and `--out ./file:x.db` and `--out file:x.db.zst`, given to `create`. Each of
-  these already read or wrote the named file. Six inputs.
+  already held a database it exited 1 (`VACUUM INTO 'file:x.db'`, `output file
+  already exists`) and left `x.db` as it was; `--out file:sub/x.db` beside a
+  directory `file:sub` exited 1 (`unable to open database: file:sub/x.db`).
+  All three now write the file they were given (exit 0). Where `file:x.db`
+  itself already held a database, `create` wrote `x.db` and exited 0; it now
+  exits 1 with `output file already exists`, as `--out x.db` does when `x.db`
+  holds one. Four inputs.
+- `snapshot create --out :memory:` exited 0 having written nothing; it now
+  writes a file named `:memory:` (exit 0). `--out ""` exited 0 having written
+  nothing; it now exits 1 (`VACUUM INTO ''`, `unable to open database: ./`),
+  after the index has been built. Two inputs.
+- SQLite's errors quote the name it was given, so for a relative name they
+  now show `./` in front of it. Two inputs, exit 1 on both versions: `inspect
+  s.db`, whose absolute path (730 bytes) is past SQLite's 512-byte limit, said
+  `unable to open database file: s.db` and now says `./s.db`; `create --out
+  ro/x.db` into a read-only directory said `unable to open database: ro/x.db`
+  and now says `./ro/x.db`, under the same `VACUUM INTO 'ro/x.db'` line.
+- Unchanged, twelve inputs. Given to `inspect`: `./file:x.db`, the absolute
+  path, a `file:x.db` in WAL mode, a compressed `file:y.db.zst`, and a relative
+  name in a directory whose name is not UTF-8. Given to `create --out`:
+  `./file:x.db`, `file:x.db.zst`, a relative name in a directory whose name is
+  not UTF-8 (with and without a sibling directory whose name is its U+FFFD
+  spelling), and a file already at `--out` that holds a database, is empty, or
+  is a `.db.zst`.
 
 ### A header that says WAL in byte 19 leaves no side files
 
@@ -53,6 +75,18 @@ inputs, one changed.
 - Of the items under 0.181.0's Not covered, the `file:` name and the 1/2
   header are fixed above. The other items listed there are not addressed by
   this release.
+- `create --out` over an existing file, as in 0.181.0: a raw `--out` that
+  holds a database is refused (`output file already exists`), an empty one is
+  overwritten, and a compressed `--out` is replaced and gets a `.blake3` beside
+  it.
+- `--out ""` is refused only after the whole index has been built.
+- `inspect` cannot read a raw snapshot whose absolute path is longer than
+  SQLite's 512-byte limit, as in 0.181.0 (measured on a 730-byte path named
+  relatively).
+- On Windows, `:` in a file name separates a file from one of its NTFS
+  streams. `create --out file:x.db` wrote `x.db` there; it now hands SQLite
+  `.\file:x.db`, which names a stream `x.db` of a file called `file`. Read from
+  the Rust and SQLite sources, not run: there is no Windows machine here.
 
 ## 0.181.0
 
