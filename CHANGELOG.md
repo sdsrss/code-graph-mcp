@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.182.0
+
+**Upgrading: nothing to do** (`INDEX_VERSION` stays at 124). Only `snapshot
+inspect` and `snapshot create --out` change: for a file name that begins with
+`file:`, and for a SQLite header whose bytes 18 and 19 disagree.
+To pin the binary back: `npm i -g @sdsrs/code-graph@0.181.0`
+(or, from source, `cargo install --locked --git
+https://github.com/sdsrss/code-graph-mcp --tag v0.181.0 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+Measured on 17 inputs, the 0.181.0 release binary against this one. Eight
+changed; the other nine print, exit and leave the same files on both.
+
+### A file name that begins with `file:` names that file
+
+The SQLite built into this binary reads a file name that begins with `file:`
+as a URI, whatever the caller asks for, so a relative `file:x.db` meant
+`x.db`. Where the two commands gave SQLite the name as typed, they now give it
+the absolute path.
+
+- `snapshot inspect file:x.db` read `x.db`. With no `x.db` beside it, it
+  exited 1 with `unable to open database file: file:x.db`; with another
+  snapshot at `x.db` it printed that snapshot's metadata (exit 0); with `x.db`
+  in WAL mode and a `-wal` beside it, it printed the value in that `-wal` and
+  left an `x.db-shm` behind. It now prints `file:x.db`'s metadata in all three
+  (exit 0) and leaves no file behind. Three inputs.
+- `snapshot create --out file:x.db` wrote `x.db` (exit 0). Where `x.db`
+  already existed it exited 1 (`VACUUM INTO 'file:x.db'`) and left `x.db` as it
+  was; `--out file:sub/x.db` beside a directory `file:sub` exited 1 the same
+  way. All three now write the file they were given (exit 0). Where
+  `file:x.db` itself already existed, `create` wrote `x.db` and exited 0; it now
+  exits 1 with `output file already exists`, as it does for any `--out` that
+  exists. Four inputs.
+- Unchanged: `./file:x.db` and the absolute path, given to `inspect`; a
+  `file:x.db` in WAL mode and a compressed `file:y.db.zst`, given to `inspect`;
+  and `--out ./file:x.db` and `--out file:x.db.zst`, given to `create`. Each of
+  these already read or wrote the named file. Six inputs.
+
+### A header that says WAL in byte 19 leaves no side files
+
+SQLite opens a database's WAL when byte 19 of its header is 2; `inspect`
+looked at byte 18. SQLite writes the two bytes together, so only a header
+edited by hand splits them. Bytes 18/19 = 1/2 made `inspect` leave a `-wal`
+and a `-shm` beside the file; it now leaves neither, and prints what it
+printed (exit 0). Headers 2/1, 1/1 and 2/2 print and leave what they did. Four
+inputs, one changed.
+
+### Not covered
+
+- Of the items under 0.181.0's Not covered, the `file:` name and the 1/2
+  header are fixed above. The other items listed there are not addressed by
+  this release.
+
 ## 0.181.0
 
 **Upgrading: nothing to do** (`INDEX_VERSION` stays at 124). Only `snapshot
