@@ -873,8 +873,6 @@ fn extract_python_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
         // whenever the type can't be proven — never emits a wrong-type edge.
         let metadata = super::python::infer_python_super_type(&node, source)
             .map(|ty| serde_json::json!({ "q": "super", "v": ty }).to_string())
-            // `C.m()` on the file's own class binds like `super()` (D#370).
-            .or_else(|| super::member::python_class_call_meta(node, source))
             .or_else(|| {
                 super::infer_python_call_receiver_type(&node, source)
                     .map(|ty| serialize_rtype_metadata(&ty))
