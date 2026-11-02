@@ -1,0 +1,33 @@
+k_alias_patch D
+k_annassign D
+k_assign D
+k_async_for D
+k_aug ERR TypeError
+k_chain D
+k_dict_splat_kw C
+k_dunder_import D
+k_except_star D
+k_exec D
+k_for D
+k_global_fn D
+k_globals_item D
+k_globals_update D
+k_listpat D
+k_locals D
+k_match_as D
+k_match_cap D
+k_match_kw D
+k_match_list D
+k_match_pos D
+k_paren D
+k_paren_patch D
+k_setattr_cls D
+k_setattr_mod D
+k_starred_for D
+k_sysmod_attr D
+k_tuple1 D
+k_type_alias ERR AttributeError
+k_vars D
+k_walrus D
+k_walrus_comp D
+k_with D
