@@ -208,6 +208,76 @@ fn cli_snapshot_inspect_missing_file_exits_nonzero() {
     assert!(!output.status.success());
 }
 
+/// D#638: the bundled SQLite is built with `SQLITE_USE_URI`, so a name that
+/// begins with `file:` is parsed as a URI whatever the open flags say, and
+/// `inspect file:x.db` read `x.db`. Unix only: `:` cannot be in a Windows name.
+#[cfg(unix)]
+#[test]
+fn cli_snapshot_inspect_reads_a_file_whose_name_begins_with_file_colon() {
+    let repo = init_git_repo();
+    let snap = repo.path().join("snap.db");
+    let status = Command::new(cli_bin())
+        .args(["snapshot", "create", "--out"])
+        .arg(&snap)
+        .arg("--quiet")
+        .arg("--root")
+        .arg(repo.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "create failed");
+
+    let dir = TempDir::new().unwrap();
+    let named = dir.path().join("file:x.db");
+    let other = dir.path().join("x.db");
+    std::fs::copy(&snap, &named).unwrap();
+    std::fs::copy(&snap, &other).unwrap();
+    {
+        let c = rusqlite::Connection::open(&other).unwrap();
+        let changed = c
+            .execute(
+                "UPDATE meta SET value = 'not-this-file' WHERE key = 'snapshot_source_commit'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "fixture: x.db has no source commit to change");
+    }
+    let other_bytes = std::fs::read(&other).unwrap();
+
+    let inspect = |cwd: &std::path::Path, arg: &std::ffi::OsStr| {
+        let out = Command::new(cli_bin())
+            .current_dir(cwd)
+            .args(["snapshot", "inspect"])
+            .arg(arg)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "inspect {arg:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    // Controls: named absolutely, neither path is a URI, and the two files
+    // read differently, so equality below names the file that was read.
+    let by_absolute = inspect(repo.path(), named.as_os_str());
+    let other_json = inspect(repo.path(), other.as_os_str());
+    assert_eq!(other_json["source_commit"], "not-this-file");
+    assert_ne!(by_absolute["source_commit"], "not-this-file");
+
+    let by_name = inspect(dir.path(), std::ffi::OsStr::new("file:x.db"));
+    assert_eq!(
+        by_name, by_absolute,
+        "inspect file:x.db did not read the file it was named"
+    );
+    assert_eq!(std::fs::read(&other).unwrap(), other_bytes, "x.db changed");
+    let mut names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["file:x.db", "x.db"], "inspect left side files");
+}
+
 // clap-migrated (audit #4 Step 4): `snapshot` is now a nested #[command(subcommand)].
 // clap owns --help for the parent and each sub, plus no-subcommand /
 // unknown-subcommand rejection (exit 2), replacing the hand-rolled args[2]/args[3]

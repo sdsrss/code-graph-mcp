@@ -107,10 +107,14 @@ impl Database {
     /// let the copy's INDEX_VERSION sweep zero the counts (0.180.0 review R2).
     pub(crate) fn open_readonly_named(path: &Path) -> Result<Self> {
         register_sqlite_vec();
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )?;
+        // A path, never a URI. The bundled SQLite is compiled with
+        // SQLITE_USE_URI (libsqlite3-sys build.rs), so it parses any name that
+        // begins with `file:` as a URI whatever the open flags say, and
+        // `snapshot inspect file:x.db` read `x.db` (D#638). An absolute path
+        // cannot begin with `file:`. `absolute` resolves no links; SQLite still
+        // does that itself, as it did before.
+        let path = std::path::absolute(path)?;
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         // PRAGMA query_only is belt-and-suspenders on top of the flag —
         // any accidental write attempt errors out at the SQL layer.
         conn.execute_batch(
