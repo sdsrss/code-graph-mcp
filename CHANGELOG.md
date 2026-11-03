@@ -1,5 +1,78 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 125 → 126
+because some Python call edges are no longer created (below). The MCP server
+rebuilds the index when it starts; from the command line,
+`code-graph-mcp reindex` does. To pin the binary back:
+`npm i -g @sdsrs/code-graph@0.183.0` (or, from source, `cargo install
+--locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.183.0
+--features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0; the older
+binary rebuilds its own index once too.
+
+### Python: a call through an imported name no longer binds the caller's own definition
+
+`logging.FileHandler.emit(self, record)` in `logging/handlers.py`,
+`codecs.IncrementalEncoder.__init__(self, errors)` in `encodings/utf_16.py`,
+or `C.m()` after `from ext import C` name a definition of another module.
+When the imported module was part of the project, such a call resolved like a
+bare call, so it bound every same-named definition of the caller's own file:
+in the standard library, `callgraph --direction callees` on
+`BaseRotatingHandler.emit` listed the 8 other `emit` methods of
+`logging/handlers.py` (`SocketHandler.emit`, `SMTPHandler.emit`, …); now it
+lists none of them. The call no longer binds into the caller's file when all
+of these hold:
+
+- Every binding of the call's first name in the file is an import (`import
+  ext`, `import ext as e`, `import pkg.ext`, `from ext import C`, under `try`
+  or not), and the file only reads attributes rooted at it: `getattr(ext, …)`,
+  `f(ext)`, `class D(ext.Base)`, annotations, default values (`def f(x=ext.X)`),
+  `ext.tbl[0] = 1`, and so on.
+- The caller's file cannot itself be that module: its path, as dotted
+  segments, neither is the module's name nor ends with it (`lib/ext.py` and
+  `ext/__init__.py` may be `ext`, so their calls through `ext` resolve as
+  before).
+
+Nothing is bound in place of the dropped edge; a call whose first name has no
+same-named definition in the caller's file resolves as before. Everything else
+resolves as before too: a name the file also binds some other way (an
+assignment, a parameter, `def`, `class`, a loop or `with … as` target,
+`global`, `del`, a match capture), a file that writes an attribute rooted at
+the name (`ext.go = go`, `del ext.go`, `ext.sub.go += 1`), and a direct
+`ext.go()` call on a name that holds one plain-imported module everywhere in
+the file (since 0.176.0 it binds what `from ext import go` would).
+
+Measured against 0.183.0: the Python standard library loses 497 call edges
+and flask 7, all same-file; hono, leveldb, cobra and gin keep every edge, and
+no edge is added or relabelled on any of the six. On the standard library the
+SCIP oracle's default floor (`extracted` + `inferred`) goes from 10,996 of
+14,329 judged edges correct (76.7%) to 10,971 of 13,879 (79.0%): 2,908 wrong
+edges instead of 3,333. The 25 correct pairs it loses, and the 5 gold calls
+its recall loses, are all explicit base-class calls (`logging.Handler.close(self)`,
+`Widget.destroy(self)`) that the oracle credits to a subclass override in the
+caller's file; Python runs the base class's method there. 54 standard-library
+definitions whose only recorded callers were such calls now show no caller.
+A full standard-library index took 1.8–2.9% more CPU time (three interleaved
+batches of five runs).
+
+### Not covered
+
+- A name rebound or patched at run time: `setattr(ext, "go", go)`,
+  `globals()["ext"] = …`, `vars(ext)["go"] = go`, `sys.modules`, `exec`. On
+  5,995 generated files run under CPython, every call the new rule stopped
+  binding while Python ran the file's own `go` used one of the first three.
+- A module that hands the caller's own definition back, such as
+  `os.path.join` called inside `posixpath.py`.
+- A direct `ext.go()` call on a name that holds one plain-imported module
+  everywhere in the file, where `from ext import go` would find nothing, keeps
+  its bind into the caller's file (15 wrong edges at the default floor in the
+  standard library).
+- A file that uses the name somewhere the parser does not recognise as a read
+  keeps every call through it as before, for example `with ext.lock:`,
+  `yield ext.x`, `[ext.x for _ in y]` and `case ext.CONST:`.
+
 ## 0.183.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 124 → 125

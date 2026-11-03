@@ -1,6 +1,6 @@
 # D#700(2b)：Python 模块限定调用不再绑到调用方自己的文件（2026-11-02）
 
-状态：实现中。父项：待办 D#700（D#370 在 0.183.0 之后的剩余部分）。
+状态：已提交 `3fc7cdee`（main，未推送），盲评进行中。父项：待办 D#700（D#370 在 0.183.0 之后的剩余部分）。
 
 ## 背景
 
@@ -78,3 +78,27 @@
 
 - RED：解析器表驱动测试 `a_python_module_call_marks_a_root_the_file_rebinds` 在实现前失败（`module assignment: {"q":"module","v":"m"}`）；索引测试 `a_python_module_call_does_not_bind_the_callers_own_definition` 实现前多出 `app.py.go`、`app.py.m` 两条边。
 - 变异（每个都确认测试实际跑了、不是编译失败）：去掉 `rb` 判断、自路径的 `==` 腿、`.V` 后缀腿、属性链写入检查、`attr` 豁免，都被抓到；属性链检查的第一次变异编译不过（未使用函数），改写成 `false && …` 后两个测试失败。
+- 默认参数值读取：先加 3 个解析器形态（RED：`parameter defaults: {"q":"module","rb":1,"v":"m"}`），再实现；两个变异（去掉这条读取、不要求是 `value` 字段）都被抓到。
+- 全量 `cargo test --no-fail-fast`：2,382 通过、0 失败、7 忽略；clippy 两种特性组合通过；pre-commit 通过。
+- 默认参数值（`def f(x=m.X)`）算读取（第二步加入，只用于本规则，不改 `C.m()` 共用的清单）：标准库里 `logging/handlers.py` 的 `flushLevel=logging.ERROR`、`tempfile.py` 的 `unlink=_os.unlink`、`zipfile` 的 `whence=os.SEEK_SET` 原先让整文件的调用都保守地保留旧解析（logging/handlers.py 一个文件 149 条边）。用切分法定位：把 6 个仍带 `rb` 的文件拆成 835 段分别建索引，带 `rb` 的 6 段里 3 段是默认参数，另 3 段是真实的重新绑定或修改（`gzip = None`、`warnings.showwarning = …`、类体绑定）。
+- 二进制（都从提交的树 `git archive` 构建，release，默认特性）：BASE `2866280f` md5 `b5d409c8…`，HEAD `3fc7cdee` md5 `8616574d…`；对比用的 0.183.0 发布版 md5 `a5641033…` 与源码构建在 0.183.0 发版时已核对过边集逐条相同。
+- 生成器（`tasks/d700-kit`，CPython 3.14 判定）：
+  - 种子 1：2,999 个用例，declined-ok 1,168，kept-correct 538，kept-wrong 992，无同文件边 251，WRONG 50，ADDED 0；
+  - 种子 2：2,996 个用例，declined-ok 1,149，kept-correct 550，kept-wrong 978，无同文件边 266，WRONG 53，ADDED 0；
+  - 103 个 WRONG 都含 `setattr`、`globals()[…] =` 或 `vars(…)[…] =`（已知不覆盖）；只含绑定、属性写入或读取的用例 WRONG 为 0。
+- 语料差分（BASE = 0.183.0 发布版，HEAD = `8616574d`）：
+  - 标准库删 497 条边，全是同文件 extracted 调用，新增 0，改置信度 0；
+  - flask 删 7 条，同上；
+  - hono、leveldb、cobra、gin 逐条相同。
+- 标准库 oracle 默认层：10,996/14,329（76.7%）→ 10,971/13,879（79.0%），错边 3,333 → 2,908（−425）。
+  - 判对的 pair 少 25 个：logging/handlers.py 的 `logging.FileHandler.emit(self, record)` 16 个、`logging.Handler.close(self)` 8 个、tkinter/dialog.py 的 `Widget.destroy(self)` 1 个。三处都是显式基类调用，Python 执行的是基类方法，oracle 因子类覆盖记为正确（已知的记分误差）。
+  - flask 的 oracle 数字不变（那 7 条在测试文件里，oracle 判定不了）。
+- 增量与全量（`parity.py`，d370g 的 88 个场景加本项新增的 5 个，BASE 和 HEAD 各跑一遍）：186 行里 182 行相等。不相等的 2 个场景在两个二进制上的差异逐字相同，与本项无关：
+  - `p15`：D#370 时已记录的老问题；
+  - `q03`：新出现 `src/ext/__init__.py` 时，`lib/ext.py` 的 `import ext` 这条 imports 边只在全量时连上，是本项之前就有的增量缺口。
+- 对抗输入（约 1 MiB，交替各 3 次，取 CPU 中位数）：
+  - 大量出现：0.845 → 0.901 s（+6.7%）；
+  - 括号：1.016 → 1.077 s（+6.0%）；
+  - 写入：0.469 → 0.504 s（+7.5%）；
+  - 默认参数：2.399 → 2.270 s（−5.4%）；
+  - 26 万段属性链：0.238 → 0.310 s（+30%），RSS 89 → 117 MB。长度增到 1.5 倍时 HEAD 为 ×1.45，BASE 为 ×1.42，线性。
