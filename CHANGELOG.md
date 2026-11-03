@@ -48,8 +48,9 @@ the name (`ext.go = go`, `del ext.go`, `ext.sub.go += 1`), and a direct
 the file (since 0.176.0 it binds what `from ext import go` would).
 
 Measured against 0.183.0: the Python standard library loses 517 call edges
-(497 caller–callee pairs) and flask 7, all same-file; hono, leveldb, cobra and
-gin keep every edge, and no edge is added or relabelled on any of the six. On the standard library the
+(497 caller–callee pairs), nltk 3.9.2 170 (158) and flask 7, all same-file;
+hono, leveldb, cobra and gin keep every edge, and no edge is added or
+relabelled on any of the seven. On the standard library the
 SCIP oracle's default floor (`extracted` + `inferred`) goes from 10,996 of
 14,329 judged edges correct (76.7%) to 10,971 of 13,879 (79.0%): 2,908 wrong
 edges instead of 3,333. The 25 correct pairs it loses, and the 5 gold calls
@@ -57,16 +58,17 @@ its recall loses, are all explicit base-class calls (`logging.Handler.close(self
 `Widget.destroy(self)`) that the oracle credits to a subclass override in the
 caller's file; Python runs the base class's method there. 54 standard-library
 definitions whose only recorded callers were such calls now show no caller.
-A full standard-library index took 1.8–2.9% more CPU time (three interleaved
+A full standard-library index took 2.2–2.9% more CPU time (two interleaved
 batches of five runs).
 
 ### Not covered
 
 - A name rebound or patched at run time: `setattr(ext, "go", go)`,
   `globals()["ext"] = …`, `vars(ext)["go"] = go`, `ext.__dict__["go"] = go`,
-  `mock.patch`, `sys.modules`, `exec`. On 5,995 generated files run under
-  CPython, every call the new rule stopped binding while Python ran the
-  file's own `go` used one of the first three.
+  `mock.patch`, `sys.modules`, `exec`. On 8,989 generated files run under
+  CPython (a third of the last 2,994 inside a package, importing it), every
+  call the new rule stopped binding while Python ran the file's own `go` used
+  one of the first three.
 - A module that hands the caller's own definition back: `os.path.join`
   called inside `posixpath.py`, or nltk's `chunk/util.py` calling
   `nltk.chunk.tagstr2tree`, which `nltk/chunk/__init__.py` imports from it.
