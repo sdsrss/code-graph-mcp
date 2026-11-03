@@ -1,0 +1,80 @@
+# D#700(2b)：Python 模块限定调用不再绑到调用方自己的文件（2026-11-02）
+
+状态：实现中。父项：待办 D#700（D#370 在 0.183.0 之后的剩余部分）。
+
+## 背景
+
+用户要求：对 0.183.0 之后的遗留工作给出有依据的建议并执行。开工前用 SCIP oracle 在 0.183.0（`~/.cache/code-graph/bin` 的发布二进制，md5 `a5641033…`）上重测，工作目录 `/var/tmp/d700`：
+
+- 标准库默认层（extracted + inferred）10,996/14,329（76.7%），错 3,333，与发版记录相同。
+- 按调用形态分（`tasks/d370g-kit/tools/classify.py`），模块限定调用绑进调用方自己文件的几类（`ext/module*/same/*`）合计错 478、判对 35。
+- 判对的逐条看过源码，都不是这次调用的真实目标：
+  - `logging.FileHandler.emit(self, record)` 绑到 handlers.py 的 8 个同名 `emit`，oracle 因覆盖关系记为正确，Python 执行的是 `logging/__init__.py` 的那个。
+  - 其余的同一对（调用方, 被调方）另有一行边，来自裸调用、`super()` 或类调用。edges 的唯一键含 metadata，那一行不受影响。
+- 其他候选：
+  - Go 外部包限定调用：gin 45、cobra 3，全是标准库包。下一项，单独做。
+  - 同文件未定型 `x.m()`：错 1,305 / 对 795，不能只收窄，留在待办。
+  - 跨文件未定型成员调用：错 406 / 对 48，同上。
+
+## 语言事实
+
+`R.a.b.m()` 中 `R` 是名字时，运行时取 `R` 在该作用域的绑定。Python 语言参考 §4.2.1 列出了能绑定名字的结构：
+
+- 形参、`def`、`class`、赋值目标（含增量赋值和带注解的赋值）、`for` 目标、`with … as`、`except … as`；
+- 海象赋值、`match` 的捕获和 `as` 模式、`import`、`type`、类型参数、`del`、`global`/`nonlocal`。
+
+如果文件里 `R` 的绑定只有 import（含 `from … import`；`import *` 绑定的也是导入对象），`R` 就是别的模块里的对象，`R.….m` 在那个模块的命名空间里查找。这时目标是调用方文件自己的定义只有三种可能：
+
+- 调用方本身就是模块 V；
+- V 经循环的重新导出指回调用方；
+- 文件给 `R` 的某个属性赋值，例如 `R.m = 本地函数`。
+
+## 规则
+
+- 解析器（`relations/member.rs`）：模块限定调用 `{"q":"module","v":V}` 的根名字 `R`，只要有一次出现既不在 import 语句里，也不是允许清单里的读取（`py_class_name_is_read`，0.183.0 的同一份清单），或者以 `R` 起头的属性链处在非读取位置（赋值、`del` 等的目标），就给调用加 `"rb":1`。没有这个键表示"只由 import 绑定、没被修改"，所以常见调用的 metadata 不变。
+- 解析结果（`pipeline/index_files.rs` 批内默认链）：调用带 `{"q":"module"}` 且没有 `"rb"`，按名字只找到本文件的目标，且调用方路径不可能是模块 V（点分路径不等于 V，也不以 `.V` 结尾）时，丢弃这次调用：不连边，也不转去跨文件解析。其余情况与 0.183.0 相同。
+- 带 `"attr"` 的直接调用 `P.X()`（D#518）不在本规则内：Phase 2d-attr 要以调用按名字连出的边为起点，把它改指向模块里的 `X` 并剪掉其余边。批内一旦丢掉这条边，它就没有起点，正确的边也连不上（实现时由索引测试发现）。模块属性能解析时，同文件那条边本来就会被剪掉；解析不到时保持原样（标准库 `module.attr/same` 15 错）。
+- 新边集 ⊆ 旧边集：只去掉同文件绑定，不新增。
+
+## 接受与拒绝的形态
+
+不再绑本文件（规则生效）：
+
+- `import V` / `import V as R` / `import V.x`（绑定 `V`）/ `from P import V`，之后 `R.f()`、`R.x.f()`；
+- `from V import C`，之后 `C.m()`；
+- `R` 的其他出现都是读取：`getattr(R, …)`、`f(R)`、`isinstance(x, R.T)`、`class D(R.Base)`、注解、`except R.E`、`with R.cm()` 等。
+
+保持 0.183.0 的解析（不生效）：
+
+- `R` 在任何作用域另有绑定：`def R`、`class R`、`R = …`、形参、`for R`、`with … as R`、`except … as R`、海象、`del R`、`global R`、match 捕获、`type R`；
+- `try: from _x import C` / `except ImportError: class C: …`（本地兜底定义）；
+- `R.x = …`、`R.x.m = …`、`del R.x`、`R.x += …` 等写入以 `R` 起头的属性链；
+- 调用方点分路径等于 V 或以 `.V` 结尾（可能就是模块 V 自己）；
+- 允许清单之外的位置。
+
+已知不覆盖（写进 CHANGELOG）：
+
+- `setattr(R, 'm', f)`、`globals()`、`sys.modules` 改写；
+- V 循环地重新导出调用方的定义，例如 `posixpath.py` 里调用 `os.path.join`。
+
+## 决策
+
+- 标记例外（`"rb"`）而不是标记常见情况：已有测试和下游按完整字符串比较 `{"q":"module",…}`，常见调用的 metadata 不变，改动面最小。
+- 在结果上收窄，不在候选池上收窄（见记忆 "Narrow the result, not the pool"）：同文件目标被拒后不转去跨文件解析，否则会新增未经检验的边。
+- 路径判断用后缀匹配，不用模块映射：只依赖调用方自己的路径，增量和全量的结果一致；比按映射判断更保守。
+- 复用 `py_class_name_is_read`，不另写读取清单（该清单已对 CPython 做过生成式校验）。
+- `INDEX_VERSION` 125 → 126。
+
+## 验证计划
+
+1. 解析器表驱动测试和索引测试先写，确认失败。
+2. 生成器：按"绑定形式 × 作用域 × 属性写入 × 路径"组合生成文件，用 CPython 跑出每个调用实际执行的函数。要求规则拒绝的调用在 CPython 下都不执行本文件的定义，且 HEAD 边集 ⊆ BASE 边集。
+3. 六个语料差分：只少不多；oracle 数字；逐条看"丢失的正确边"。
+4. 增量与全量一致（parity 场景）；全量索引耗时交替对比。
+5. 全量测试、clippy（两个特性组合）、fmt。
+6. 新开子代理盲评。
+
+## 验证记录
+
+- RED：解析器表驱动测试 `a_python_module_call_marks_a_root_the_file_rebinds` 在实现前失败（`module assignment: {"q":"module","v":"m"}`）；索引测试 `a_python_module_call_does_not_bind_the_callers_own_definition` 实现前多出 `app.py.go`、`app.py.m` 两条边。
+- 变异（每个都确认测试实际跑了、不是编译失败）：去掉 `rb` 判断、自路径的 `==` 腿、`.V` 后缀腿、属性链写入检查、`attr` 豁免，都被抓到；属性链检查的第一次变异编译不过（未使用函数），改写成 `false && …` 后两个测试失败。

@@ -4212,6 +4212,44 @@ pub(super) fn is_package_bound(metadata: Option<&str>) -> bool {
         .is_some_and(|v| v.get("q").and_then(|q| q.as_str()) == Some(crate::domain::CALL_Q_PACKAGE))
 }
 
+/// Whether a Python call through an imported name (`{"q":"module","v":V}`,
+/// parser `member::python_module_call_meta`) cannot run a definition of the
+/// caller's own file (D#700): the parser saw the name bound by imports only,
+/// its attributes only read (no `"rb"`), and the caller is module `V` under no
+/// import root — its dotted path is neither `V` nor ends with `.V`. The batch
+/// arm drops such a call's same-file candidates and binds nothing in their
+/// place; with no same-file candidate the call resolves as before.
+///
+/// A `P.X()` call (`"attr"`, D#518) is left to `bind_module_attr_calls`, which
+/// re-points the call's by-name edges at what the module's `X` is and prunes
+/// the rest: without an edge to start from it binds nothing.
+pub(super) fn module_call_skips_own_file(metadata: Option<&str>, rel_path: &str) -> bool {
+    // Every same-file bind of every language asks: parse only module calls.
+    let Some(meta) = metadata
+        .filter(|m| m.contains(r#""q":"module""#))
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+    else {
+        return false;
+    };
+    if meta.get("q").and_then(|q| q.as_str()) != Some("module")
+        || meta.get("rb").is_some()
+        || meta.get("attr").is_some()
+    {
+        return false;
+    }
+    let Some(module) = meta.get("v").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let Some(stem) = rel_path
+        .strip_suffix("/__init__.py")
+        .or_else(|| rel_path.strip_suffix(".py"))
+    else {
+        return false;
+    };
+    let dotted = stem.replace('/', ".");
+    dotted != module && !dotted.ends_with(&format!(".{module}"))
+}
+
 /// Candidates a call can reach given its metadata: a member call on an object
 /// (`CalleeMeta::Member`, or `RecvType` — a receiver of known class) cannot reach
 /// a free function; every other call keeps them all. One helper so the batch,

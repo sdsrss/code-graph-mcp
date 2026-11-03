@@ -14754,3 +14754,88 @@ fn a_big_run_rebinds_a_module_attribute_call_of_an_earlier_batch() {
         assert_incremental_graph_matches_rebuild(&before, &after);
     }
 }
+
+// D#700(2b): a Python call through an imported name (`{"q":"module"}`) names a
+// definition of another module. Bound by its name, it took the caller's own
+// same-named definition (`logging.FileHandler.emit(self, r)` in
+// `logging/handlers.py` bound all 8 `emit`s of that file). Unless the file
+// also binds the name otherwise (`"rb"`) or may itself be the module, such a
+// call no longer binds into its own file, and binds nothing else instead.
+#[test]
+fn a_python_module_call_does_not_bind_the_callers_own_definition() {
+    let files: &[(&str, &str)] = &[
+        (
+            "ext.py",
+            "def go():\n    pass\n\ndef helper():\n    pass\n\nclass C:\n    def m(self):\n        pass\n",
+        ),
+        (
+            "app.py",
+            "import ext\nfrom ext import C\n\ndef go():\n    pass\n\ndef gone():\n    pass\n\n\
+             class Local:\n    def m(self):\n        pass\n\n\
+             def main():\n    ext.go()\n    ext.sub.go()\n    C.m(None)\n    ext.sub.helper()\n    ext.gone()\n",
+        ),
+        (
+            "rebound.py",
+            "import ext\n\ndef go():\n    pass\n\ndef main():\n    ext = make()\n    ext.go()\n",
+        ),
+        (
+            "patched.py",
+            "import ext\n\ndef go():\n    pass\n\next.go = go\n\ndef main():\n    ext.sub.go()\n",
+        ),
+        (
+            "lib/selfmod.py",
+            "import selfmod\n\ndef go():\n    pass\n\ndef main():\n    selfmod.sub.go()\n",
+        ),
+        (
+            "pkg/__init__.py",
+            "import pkg\n\ndef go():\n    pass\n\ndef main():\n    pkg.sub.go()\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let rows: Vec<String> = graph_rows(&db)
+        .into_iter()
+        .filter(|r| r.contains(".main --calls"))
+        .collect();
+    let want = [
+        // Through ext: ext's own definitions only (D#518 binds `ext.go()`).
+        // A `P.X()` call is D#518's: a module without `X` leaves its by-name bind.
+        r#"app.py.main --calls[extracted]{"attr":"gone","q":"module","v":"ext"}--> app.py.gone"#,
+        r#"app.py.main --calls[inferred]{"attr":"go","q":"module","v":"ext"}--> ext.py.go"#,
+        r#"app.py.main --calls[inferred]{"q":"module","v":"ext"}--> ext.py.helper"#,
+        // The rebound name and the patched module keep the same-file bind.
+        r#"lib/selfmod.py.main --calls[extracted]{"q":"module","v":"selfmod"}--> lib/selfmod.py.go"#,
+        r#"patched.py.main --calls[extracted]{"q":"module","rb":1,"v":"ext"}--> patched.py.go"#,
+        // A package may name itself.
+        r#"pkg/__init__.py.main --calls[extracted]{"q":"module","v":"pkg"}--> pkg/__init__.py.go"#,
+        r#"rebound.py.main --calls[extracted]{"q":"module","rb":1,"v":"ext"}--> rebound.py.go"#,
+    ];
+    assert_eq!(rows, want);
+}
+
+// The rule reads only the caller's file and path, so an edit that adds or
+// removes the other binding, a file that makes the module the project's, or a
+// move that makes the caller the module, leaves what a rebuild leaves.
+#[test]
+fn a_python_module_call_into_its_own_file_matches_a_rebuild_incrementally() {
+    let app = "import ext\n\ndef go():\n    pass\n\ndef main():\n    ext.sub.go()\n";
+    let app_rebound =
+        "import ext\n\ndef go():\n    pass\n\ndef main():\n    ext = make()\n    ext.sub.go()\n";
+    let ext = ("ext.py", "def go():\n    pass\n");
+    // The other binding appears, then goes.
+    assert_incremental_graph_matches_rebuild(
+        &[ext, ("app.py", app)],
+        &[("app.py", Some(app_rebound))],
+    );
+    assert_incremental_graph_matches_rebuild(
+        &[ext, ("app.py", app_rebound)],
+        &[("app.py", Some(app))],
+    );
+    // The module becomes the project's, then stops being it.
+    assert_incremental_graph_matches_rebuild(&[("app.py", app)], &[(ext.0, Some(ext.1))]);
+    assert_incremental_graph_matches_rebuild(&[ext, ("app.py", app)], &[(ext.0, None)]);
+    // The caller moves to the module's own path.
+    assert_incremental_graph_matches_rebuild(
+        &[("app.py", app)],
+        &[("app.py", None), ("lib/ext.py", Some(app))],
+    );
+}

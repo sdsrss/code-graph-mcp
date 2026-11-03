@@ -2464,6 +2464,17 @@ fn resolve_batch_relations(
             // repo at BATCH_SIZE 25: `test_db` bound three src/graph/*
             // twins instead of the path-closest helpers.rs one).
             let target_ids = if !same_file_targets.is_empty() {
+                // `ext.go()` names ext's `go`, never this file's (D#700). The
+                // deferred pass needs no twin: a call reaches it only with no
+                // same-file candidate, and a file's nodes are all in its batch.
+                if rel.relation == REL_CALLS
+                    && super::resolve::module_call_skips_own_file(
+                        rel.metadata.as_deref(),
+                        &pf.rel_path,
+                    )
+                {
+                    continue;
+                }
                 cpp_implicit_this_members(&pf.language, rel, same_file_targets, &local_qualified)
             } else if rel.relation == REL_CALLS
                 && is_cross_file_call_noise(&rel.target_name, source_lang)

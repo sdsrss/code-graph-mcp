@@ -51,6 +51,10 @@ thread_local! {
     /// Python names that hold one module everywhere in the file, and that
     /// module ([`py_module_names`]). Per file: reset by `reset_import_bound`.
     static PY_MODULE_NAMES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// Python import-bound names the file also binds some other way, or
+    /// writes an attribute chain of ([`py_rebound_imports`]). Per file: reset
+    /// by `reset_import_bound`.
+    static PY_REBOUND_IMPORTS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     /// The file's Python classes for `C.m()` calls ([`py_class_names`]). Per
     /// file: reset by `reset_import_bound`.
     static PY_CLASSES: RefCell<PyClasses> = RefCell::new(PyClasses::default());
@@ -70,12 +74,16 @@ pub(super) fn reset_import_bound(root: tree_sitter::Node, source: &str, family: 
     if matches!(family, "javascript" | "typescript" | "tsx") {
         collect_renamed(root, source, &mut renamed, 0);
     }
-    let modules = if family == "python" && names.values().any(Option::is_some) {
-        py_module_names(root, source, &names)
+    let (modules, rebound) = if family == "python" && names.values().any(Option::is_some) {
+        (
+            py_module_names(root, source, &names),
+            py_rebound_imports(root, source, &names),
+        )
     } else {
-        HashMap::new()
+        (HashMap::new(), HashSet::new())
     };
     PY_MODULE_NAMES.with(|m| *m.borrow_mut() = modules);
+    PY_REBOUND_IMPORTS.with(|r| *r.borrow_mut() = rebound);
     let classes = if family == "python" {
         py_class_names(root, source)
     } else {
@@ -1024,6 +1032,10 @@ pub(super) fn python_untyped_receiver_meta(
 /// file ([`PY_MODULE_NAMES`]) also names the attribute (`"attr":"X"`), and is
 /// recorded for a synthetic import of `X` from that module (D#518): the call
 /// then binds what `from M import X` would, through the same import machinery.
+///
+/// `"rb":1` (D#700) marks a name the file also binds otherwise, or writes an
+/// attribute chain of ([`PY_REBOUND_IMPORTS`]): only such a call may run one of
+/// the file's own definitions, so only it keeps a same-file bind elsewhere.
 pub(super) fn python_module_call_meta(call: tree_sitter::Node, source: &str) -> Option<String> {
     let function = call.child_by_field_name("function")?;
     if function.kind() != "attribute" {
@@ -1039,14 +1051,20 @@ pub(super) fn python_module_call_meta(call: tree_sitter::Node, source: &str) -> 
     }
     let name = node_text(&root, source);
     let module = IMPORT_BOUND.with(|b| b.borrow().get(name).cloned())??;
+    let rebound = PY_REBOUND_IMPORTS.with(|r| r.borrow().contains(name));
     let attr = function
         .child_by_field_name("attribute")
         .filter(|a| object.kind() == "identifier" && a.kind() == "identifier")
         .map(|a| node_text(&a, source).to_string())
         .filter(|_| PY_MODULE_NAMES.with(|m| m.borrow().get(name) == Some(&module)));
+    let mut meta = serde_json::json!({ "q": "module", "v": module });
+    if rebound {
+        meta["rb"] = 1.into();
+    }
     let Some(attr) = attr else {
-        return Some(serde_json::json!({ "q": "module", "v": module }).to_string());
+        return Some(meta.to_string());
     };
+    meta["attr"] = attr.clone().into();
     PY_ATTR_IMPORTS.with(|a| {
         let mut a = a.borrow_mut();
         let key = (module.clone(), attr.clone());
@@ -1054,7 +1072,7 @@ pub(super) fn python_module_call_meta(call: tree_sitter::Node, source: &str) -> 
             a.push(key);
         }
     });
-    Some(serde_json::json!({ "q": "module", "v": module, "attr": attr }).to_string())
+    Some(meta.to_string())
 }
 
 /// The (module, attribute) pairs of the file's `P.X()` calls, for the
@@ -1116,6 +1134,112 @@ fn py_module_names(
             ancestors.pop();
         }
     }
+}
+
+/// The names of `bound` (the file's import bindings) that a call through them
+/// may NOT resolve away from the file (D#700): some occurrence of the name is
+/// neither inside an import statement nor a read ([`py_class_name_is_read`],
+/// the allow-list `C.m()` uses), or an attribute chain rooted at the name sits
+/// where no read does (`m.f = g`, `del m.f`, `m.a.f += 1`, `for m.i in …`).
+/// Every name binding Python has — a parameter, `def`, `class`, any assignment
+/// or loop target, `as`, walrus, `del`, `global`, a match capture, `type` — is
+/// no read, so a name left out is one only imports bind, whose attributes the
+/// file only reads.
+///
+/// One cursor walk, no recursion: a deep expression cannot overflow it.
+fn py_rebound_imports(
+    root: tree_sitter::Node,
+    source: &str,
+    bound: &HashMap<String, Option<String>>,
+) -> HashSet<String> {
+    let no_classes: HashSet<usize> = HashSet::new();
+    let mut rebound: HashSet<String> = HashSet::new();
+    // `tops[i]`: the index of the nearest ancestor at or above `i` that is no
+    // container, as `py_class_name_is_read` expects.
+    let mut ancestors: Vec<tree_sitter::Node> = Vec::new();
+    let mut tops: Vec<usize> = Vec::new();
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if node.kind() == "identifier" {
+            let name = node_text(&node, source);
+            if bound.contains_key(name)
+                && !rebound.contains(name)
+                && !py_in_import(&ancestors)
+                && (!py_import_name_is_read(node, &ancestors, &tops, &no_classes)
+                    || py_attribute_chain_written(node, &ancestors, &tops, &no_classes))
+            {
+                rebound.insert(name.to_string());
+            }
+        }
+        if cursor.goto_first_child() {
+            let i = ancestors.len();
+            tops.push(if py_is_container(node.kind()) && i > 0 {
+                tops[i - 1]
+            } else {
+                i
+            });
+            ancestors.push(node);
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return rebound;
+            }
+            ancestors.pop();
+            tops.pop();
+        }
+    }
+}
+
+/// Whether the attribute chain `node` (a read name) is the object of — through
+/// parentheses, `(m).a.f` — ends where no read is, as a target (D#700).
+fn py_attribute_chain_written(
+    node: tree_sitter::Node,
+    ancestors: &[tree_sitter::Node],
+    tops: &[usize],
+    no_classes: &HashSet<usize>,
+) -> bool {
+    let (mut at, mut object, mut chained) = (ancestors.len(), node, false);
+    while let Some(&parent) = at.checked_sub(1).map(|i| &ancestors[i]) {
+        match parent.kind() {
+            "parenthesized_expression" => {}
+            "attribute" if is_node(parent.child_by_field_name("object"), object) => {
+                chained = true;
+            }
+            _ => break,
+        }
+        at -= 1;
+        object = parent;
+    }
+    chained && !py_import_name_is_read(object, &ancestors[..at], &tops[..at], no_classes)
+}
+
+/// [`py_class_name_is_read`], plus a parameter's default value (`def f(x=m.X)`,
+/// evaluated where the `def` runs): only for [`py_rebound_imports`], so the
+/// `C.m()` rule keeps its own list. The parameter's name is a binding.
+fn py_import_name_is_read(
+    node: tree_sitter::Node,
+    ancestors: &[tree_sitter::Node],
+    tops: &[usize],
+    no_classes: &HashSet<usize>,
+) -> bool {
+    if py_class_name_is_read(node, ancestors, tops, no_classes) {
+        return true;
+    }
+    let (mut child, mut at) = (node, ancestors.len());
+    if at > 0 && py_is_container(ancestors[at - 1].kind()) {
+        at = tops[at - 1] + 1;
+        child = ancestors[at];
+    }
+    at.checked_sub(1)
+        .map(|i| ancestors[i])
+        .is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                "default_parameter" | "typed_default_parameter"
+            ) && is_node(parent.child_by_field_name("value"), child)
+        })
 }
 
 /// What one identifier occurrence does to its name, for [`py_module_names`].

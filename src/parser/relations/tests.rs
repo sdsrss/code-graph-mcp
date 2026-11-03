@@ -8755,3 +8755,115 @@ fn a_call_on_a_python_module_name_names_the_module_attribute() {
         });
     assert!(from_import.is_some(), "{:?}", call_meta(mixed, "python"));
 }
+
+/// D#700(2b): a call through an imported name (`{"q":"module"}`) carries
+/// `"rb":1` when the file binds that name some other way, or writes an
+/// attribute chain rooted at it: only then may the call run one of the file's
+/// own definitions. A name only imports bind, and only read otherwise, keeps
+/// the metadata it had.
+#[test]
+fn a_python_module_call_marks_a_root_the_file_rebinds() {
+    // Each shape calls `go` through the name `m` (or `C`).
+    let kept: &[(&str, &str)] = &[
+        ("import", "import m\n\ndef f():\n    m.go()\n"),
+        ("import, deep", "import m\n\ndef f():\n    m.sub.go()\n"),
+        ("import as", "import pkg.mod as m\n\ndef f():\n    m.go()\n"),
+        ("import dotted", "import m.sub\n\ndef f():\n    m.sub.go()\n"),
+        ("from-import", "from ext import m\n\ndef f():\n    m.go()\n"),
+        (
+            "from-import class, base",
+            "from s import C\n\nclass H(C):\n    def __init__(self):\n        C.go(self)\n",
+        ),
+        (
+            "value reads",
+            "import m\nflag = getattr(m, 'X', 0)\nok = hasattr(m, 'Y')\nh(m)\nk = [m, (m,)]\n\
+             if m is None or not m:\n    pass\n\ndef f():\n    m.go()\n",
+        ),
+        (
+            "annotations",
+            "import m\n\ndef f(x: m.T, y: m.T = None) -> m.T:\n    z: m.T = m.go()\n",
+        ),
+        (
+            "except and with read",
+            "import m\ntry:\n    pass\nexcept m.Error as e:\n    pass\nwith m.cm() as c:\n    m.go()\n",
+        ),
+        (
+            "two imports",
+            "try:\n    import m\nexcept ImportError:\n    import n as m\nm.go()\n",
+        ),
+        ("keyword and attribute named m", "import m\no.m(m=1)\nm.go()\n"),
+        (
+            "attribute read, subscript write",
+            "import m\nm.tbl[0] = 1\nx = m.a.b\nm.go()\n",
+        ),
+        ("decorator", "import m\n\n@m.deco\ndef f():\n    m.go()\n"),
+        (
+            "parameter defaults",
+            "import m\n\ndef f(a=m.X, b: int = m.Y, *, c=(m.Z, m), d=m):\n    m.go()\n\nh = lambda e=m.W: 0\n",
+        ),
+    ];
+    for (shape, src) in kept {
+        let calls = call_meta(src, "python");
+        let meta = meta_of(&calls, "go").unwrap_or_else(|| panic!("{shape}: {calls:?}"));
+        assert!(meta.contains(r#""q":"module""#), "{shape}: {meta}");
+        assert!(!meta.contains(r#""rb""#), "{shape}: {meta}");
+    }
+    let marked: &[(&str, &str)] = &[
+        ("module assignment", "import m\nm = None\nm.go()\n"),
+        (
+            "local assignment",
+            "import m\n\ndef f():\n    m = g()\n    m.go()\n",
+        ),
+        ("parameter", "import m\n\ndef f(m):\n    m.go()\n"),
+        ("keyword-only parameter", "import m\n\ndef f(*, m=1):\n    m.go()\n"),
+        ("typed default parameter", "import m\n\ndef f(m: int = 1):\n    m.go()\n"),
+        ("parameter defaulting to itself", "import m\n\ndef f(m=m):\n    m.go()\n"),
+        ("lambda parameter", "import m\nh = lambda m: m.go()\n"),
+        ("def", "import m\n\ndef m():\n    pass\n\nm.go()\n"),
+        ("nested def", "import m\n\ndef f():\n    def m():\n        pass\n    m.go()\n"),
+        (
+            "fallback class",
+            "try:\n    from _x import m\nexcept ImportError:\n    class m:\n        def go(self):\n            pass\nm.go(1)\n",
+        ),
+        ("class body", "import m\n\nclass K:\n    m = 1\n\nm.go()\n"),
+        ("for target", "import m\nfor m in xs:\n    m.go()\n"),
+        ("comprehension", "import m\nr = [m.go() for m in xs]\n"),
+        ("tuple target", "import m\na, m = 1, 2\nm.go()\n"),
+        ("star target", "import m\na, *m = xs\nm.go()\n"),
+        ("augmented", "import m\nm += 1\nm.go()\n"),
+        ("annotated, no value", "import m\nm: int\nm.go()\n"),
+        ("with as", "import m\nwith g() as m:\n    m.go()\n"),
+        (
+            "except as",
+            "import m\ntry:\n    pass\nexcept E as m:\n    m.go()\n",
+        ),
+        ("walrus", "import m\nif (m := g()):\n    m.go()\n"),
+        ("del", "import m\ndel m\nm.go()\n"),
+        ("global", "import m\n\ndef f():\n    global m\n    m.go()\n"),
+        (
+            "match capture",
+            "import m\nmatch x:\n    case m:\n        m.go()\n",
+        ),
+        (
+            "match as",
+            "import m\nmatch x:\n    case [1] as m:\n        m.go()\n",
+        ),
+        ("attribute assignment", "import m\n\ndef go():\n    pass\n\nm.go = go\nm.go()\n"),
+        ("deep attribute assignment", "import m\nm.sub.go = h\nm.sub.go()\n"),
+        ("attribute del", "import m\ndel m.go\nm.go()\n"),
+        ("attribute augmented", "import m\nm.n += 1\nm.go()\n"),
+        ("attribute tuple target", "import m\nm.a, b = 1, 2\nm.go()\n"),
+        ("attribute for target", "import m\nfor m.i in xs:\n    m.go()\n"),
+        ("attribute with target", "import m\nwith g() as m.c:\n    m.go()\n"),
+        (
+            "parenthesized attribute",
+            "import m\n(m).go = h\nm.go()\n",
+        ),
+    ];
+    for (shape, src) in marked {
+        let calls = call_meta(src, "python");
+        let meta = meta_of(&calls, "go").unwrap_or_else(|| panic!("{shape}: {calls:?}"));
+        assert!(meta.contains(r#""q":"module""#), "{shape}: {meta}");
+        assert!(meta.contains(r#""rb":1"#), "{shape}: {meta}");
+    }
+}

@@ -2,8 +2,9 @@
 
 The scripts, parity scenarios and review case files of `/var/tmp/d370`, kept
 for the redesign before that directory was deleted. The first design was
-withdrawn after three review rounds (its code is on branch
-`d370g-py-class-call`); the redesign (185f4ce8 and the 0.183.0 pre-tag review
+withdrawn after three review rounds (its code is in main's history at
+`67c81055`, reverted by `db332515`; the branch that pointed there was deleted
+2026-11-02); the redesign (185f4ce8 and the 0.183.0 pre-tag review
 repairs) was checked first against CPython with `enum/`, for release 0.183.0. The spec with every review round is
 `tasks/specs/d370g-py-class-qualified-call.md`.
 
