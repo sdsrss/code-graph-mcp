@@ -1,6 +1,6 @@
 # D#714：解析精度（同文件同名定义、内置方法名、barrel 导入）（2026-11-03）
 
-状态：A3 已实现（2026-11-03，待提交，见"A3 实现"）；A4 模拟中；A2 剩余未做。来源：`docs/plugin-usage-audit-2026-11-03.md` A2–A4，待办 D#714。
+状态：A3 已提交（a82c3b54）；A4 已实现（Python 内置值类型方法名 → `ambiguous`，见"A4 实现"）；A2 剩余实现中。来源：`docs/plugin-usage-audit-2026-11-03.md` A2–A4，待办 D#714。
 
 ## A3：同一文件里多个同名定义，调用会连到每一个
 
@@ -55,6 +55,24 @@
 
 - 审计：daagu inferred 层错边 225/245 是这一类（`dict.update`、`Path.exists` 绑到项目里唯一的 `update`/`exists` 方法）。
 - 记忆 `feedback_simulate_a_relabel_per_language_first`、`feedback_narrow_the_result_not_the_pool`：先按语言列出内置类型的方法名表，用 judged dump 模拟"去掉这条边"对每种语言精度和召回的影响，再改；改结果不改候选池。
+
+### A4 模拟与决定（2026-11-03）
+
+- 模拟（A3 之后的 judged dump 加上索引里的边元数据；只看 `inferred` 层、接收者无类型的成员调用 `q:member` 或 `ur`）：
+
+| 表 | daagu 后端 | nltk | stdlib | cloudinit（留出） | JS 5 个项目 |
+|---|---|---|---|---|---|
+| 全部内置类型方法名 | 去掉 223，对 5（`start`） | 去掉 219，对 206（`items`/`values`/`keys`/`sort`…） | 去掉 377，对 1 | 去掉 98，对 2（`items`） | 去掉 23，对 1 |
+| 按原则选：`str`、集合运算、`pathlib.Path`、`re`、`datetime`，不含映射/序列/文件协议名和 `match`/`start`/`end` | 129，对 0 | 2，对 0 | 376，对 0 | 0 | 不做 |
+
+- 决定：
+  - 不删边，改标签（Phase 2e 标成 `ambiguous`）：还能用 `--min-confidence ambiguous` 看到；同 D#162 的做法。
+  - 表按原则定，不按数据挑：从三个语料里挑"从没对过的名字"得到 41 个，在留出的 cloudinit 上一条都碰不到，说明不了什么。
+  - 映射/序列/文件协议名不进表：nltk 的 `FreqDist.items()` 等是项目自己实现的（对 206 条），cloudinit 的 `items` 却错 96/98，取决于项目。daagu 的 80 条 `dict.update` 因此留着。
+  - 只改 Phase 2e 已经重新判定的边（跨文件 + Python `ur`）：同文件 `extracted` 的这类边在 stdlib 里一半对（35 错 34 对，`pathlib` 调自己的 `joinpath`）。
+  - JS 不做：数组/Map 方法名已经在噪声表里，剩下的只有 `toString` 21 条、`search` 1 条，收益小。
+- 实测（BEFORE = a82c3b54 的源码树，AFTER = 工作树）与模拟完全一致：daagu `inferred` 7879/8126 → 7879/7997，默认下限精度 98.04% → 98.86%；stdlib 1469/2342 → 1469/1966，79.64% → 81.87%；nltk 1829/1984 → 1829/1982；cloudinit、claude-mem-lite、hono 不变；召回全部不变。
+- 测试 `a_python_builtin_method_name_on_an_untyped_receiver_is_ambiguous`：`q:member`、`ur`、Python 限定三个条件各自回退都会让测试变红。INDEX_VERSION 130。
 
 ## A2 的剩余部分：非噪声名字经 barrel 的导入边
 

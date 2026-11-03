@@ -2715,6 +2715,25 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
     const TS_TYPE_CALL: &str = "(e.relation = ?1
                   AND tgt.type IN ('interface', 'type')
                   AND tf.language IN ('typescript', 'tsx'))";
+    // A Python call on a receiver the source leaves untyped (`q` member, or a
+    // D10B `ur` mark) whose name is a method of a built-in value type
+    // (`path.exists()`, D#714 A4): `ambiguous` even when the project defines one
+    // method of that name, since the receiver is as likely the built-in. Only
+    // the edges this pass reconsiders: a same-file member call of such a name
+    // keeps `extracted` (the standard library's `pathlib` calling its own
+    // `joinpath` was right 34 times of 69).
+    let py_builtin_names = crate::domain::PY_BUILTIN_VALUE_METHODS
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let py_builtin_call = format!(
+        "(e.relation = ?1
+                  AND tf.language = 'python'
+                  AND (json_extract(e.metadata, '$.q') = 'member'
+                       OR json_extract(e.metadata, '$.ur') IS NOT NULL)
+                  AND tgt.name IN ({py_builtin_names}))"
+    );
     // The classification itself — one expression, spent by every driver below.
     // `nc` is the same-name/same-language count; `e`, `src`, `tgt` are the edge
     // and its two endpoints. Kept as one string because a scoped copy that
@@ -2724,6 +2743,7 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
     let conf_case = format!(
         "CASE
                  WHEN {TS_TYPE_CALL} THEN ?3
+                 WHEN {py_builtin_call} THEN ?3
                  WHEN nc.cnt > 1
                       -- ... UNLESS the caller's file explicitly imports THIS exact
                       -- target. An import binds the bare name to one node, so the

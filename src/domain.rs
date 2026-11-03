@@ -416,7 +416,7 @@ pub fn normalize_relation(input: &str) -> Option<&'static str> {
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 129; // v129 (2026-11-03, D#714 A3): a bare call in JS/TS, Python or Rust (`app()`) among same-named definitions of its own file binds only the lexical ones its scope sees (the innermost function, named or anonymous, around the definition contains the call), and of those the innermost: `app()` in one `describe` callback binds that callback's `const app`, a local `const ok` shadows a top-level `function ok`; methods and members stay candidates, and a call that sees none keeps every candidate. // v128 (2026-11-03, D#720): a TypeScript call with type arguments under `await`, `!`, `typeof` or `delete` (`await get<T>(url)`, which tree-sitter-typescript parses as a call whose callee is `await_expression(get)`) records the call it spells, as the same call without the operator does. // Older entries (v127 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
+pub const INDEX_VERSION: i32 = 130; // v130 (2026-11-03, D#714 A4): a Python call on a receiver the source leaves untyped (`q` member or a D10B `ur` mark) whose name is a method of `str`, set algebra, `pathlib.Path`, `re` or `datetime` (`domain::PY_BUILTIN_VALUE_METHODS`, e.g. `path.exists()`) is labelled `ambiguous` by Phase 2e even when the project defines one method of that name; same-file member calls keep `extracted`. // v129 (2026-11-03, D#714 A3): a bare call in JS/TS, Python or Rust (`app()`) among same-named definitions of its own file binds only the lexical ones its scope sees (the innermost function, named or anonymous, around the definition contains the call), and of those the innermost: `app()` in one `describe` callback binds that callback's `const app`, a local `const ok` shadows a top-level `function ok`; methods and members stay candidates, and a call that sees none keeps every candidate. // Older entries (v128 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
 
 // -- Pending-call buffer bound --
 // A `pending_unresolved_calls` row survives this many resolution sweeps before
@@ -1321,6 +1321,118 @@ pub const CROSS_FILE_CALL_NOISE: &[&str] = &[
 // ECMAScript builtins still in the noise set (`push`/`pop`/`get`/`map`/`filter`/
 // `join`/`read`/`write`...) stay dropped because the receiver type is unknown.
 pub const JS_CALL_NOISE_EXEMPT: &[&str] = &["insert", "remove", "contains"];
+
+/// Methods of Python's `str`, set algebra, `pathlib.Path`, `re` and `datetime`
+/// (D#714 A4). A call of one on a receiver the source leaves untyped
+/// (`path.exists()`, `name.startswith()`) that binds the project's only method
+/// of that name is labelled `ambiguous`: the receiver is as likely the
+/// built-in. Measured by the SCIP oracle on a Python backend, nltk, the
+/// standard library and cloud-init: 507 such `inferred` edges, none right.
+/// The mapping, sequence and file protocol names (`items`, `get`, `update`,
+/// `append`, `sort`, `read`, `seek`) are left out because project classes
+/// implement them: nltk's `FreqDist.items()` was right 70 times out of 71.
+/// So are `match`, `start` and `end`, common project method names.
+pub const PY_BUILTIN_VALUE_METHODS: &[&str] = &[
+    // str
+    "capitalize",
+    "casefold",
+    "center",
+    "encode",
+    "endswith",
+    "expandtabs",
+    "find",
+    "format_map",
+    "isalnum",
+    "isalpha",
+    "isascii",
+    "isdecimal",
+    "isdigit",
+    "isidentifier",
+    "islower",
+    "isnumeric",
+    "isprintable",
+    "isspace",
+    "istitle",
+    "isupper",
+    "ljust",
+    "lower",
+    "lstrip",
+    "maketrans",
+    "partition",
+    "removeprefix",
+    "removesuffix",
+    "rfind",
+    "rindex",
+    "rjust",
+    "rpartition",
+    "rsplit",
+    "rstrip",
+    "splitlines",
+    "startswith",
+    "strip",
+    "swapcase",
+    "title",
+    "translate",
+    "upper",
+    "zfill",
+    // set algebra
+    "difference",
+    "difference_update",
+    "intersection",
+    "intersection_update",
+    "isdisjoint",
+    "issubset",
+    "issuperset",
+    "symmetric_difference",
+    "symmetric_difference_update",
+    "union",
+    // pathlib.Path
+    "as_posix",
+    "as_uri",
+    "chmod",
+    "exists",
+    "expanduser",
+    "glob",
+    "is_absolute",
+    "is_dir",
+    "is_file",
+    "is_mount",
+    "is_symlink",
+    "iterdir",
+    "joinpath",
+    "lstat",
+    "mkdir",
+    "read_bytes",
+    "read_text",
+    "readlink",
+    "relative_to",
+    "rglob",
+    "rmdir",
+    "samefile",
+    "symlink_to",
+    "touch",
+    "unlink",
+    "with_name",
+    "with_stem",
+    "with_suffix",
+    "write_bytes",
+    "write_text",
+    // re
+    "search",
+    "fullmatch",
+    "findall",
+    "finditer",
+    "sub",
+    "subn",
+    "groupdict",
+    // datetime
+    "astimezone",
+    "isoformat",
+    "strftime",
+    "timestamp",
+    "weekday",
+    "isoweekday",
+];
 
 /// Whether a cross-file `calls` target name should be dropped as stdlib noise
 /// for a given source language.

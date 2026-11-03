@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 129
-because JavaScript and TypeScript call edges are added and same-file call
-edges are dropped (below). The MCP server
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 130
+because JavaScript and TypeScript call edges are added, same-file call edges
+are dropped and some Python call edges are labelled `ambiguous` (below). The MCP server
 rebuilds the index when it starts; from the command line,
 `code-graph-mcp reindex` does. To pin the binary back:
 `npm i -g @sdsrs/code-graph@0.184.0`, then delete
@@ -117,6 +117,38 @@ did not move; 43 call edges are gone, each from a function to a helper of the
 same name that another function defines for itself (`fn walk` inside several
 test functions of `tests/hardening.rs`, `const norm` in two functions of
 `pre-grep-guide.js`).
+
+### change: `path.exists()` on an untyped receiver is `ambiguous`
+
+A Python call on a receiver the source does not type (`path.exists()` where
+`path` is a parameter, `self.root.exists()`) binds the project's only method
+of that name, labelled `inferred`, so `callgraph` and `impact` listed every
+`path.exists()` in the project as a caller of a storage class's `exists`.
+When the name is a method of `str`, of set algebra, of `pathlib.Path`, of `re`
+or of `datetime` (`startswith`, `union`, `exists`, `mkdir`, `search`,
+`isoformat`, …), the receiver is as likely the built-in, and such an edge is
+now `ambiguous`: below the default confidence floor, shown with
+`--min-confidence ambiguous`. Names of the mapping, sequence and file
+protocols (`items`, `get`, `update`, `append`, `sort`, `read`, `seek`), which
+project classes implement, keep `inferred`, and so do `match`, `start` and
+`end`. A call on a receiver of known class keeps its label, and so does a
+same-file call the confidence pass leaves `extracted` (one through a
+parameter or local); other languages are unchanged.
+
+SCIP oracle, before and after, on the same copy of each project:
+
+| Project | Edges relabelled | Of them right | Precision at the default floor |
+|---|---|---|---|
+| a Python backend | 129 | 0 | 98.0% → 98.9% |
+| the Python 3.14 standard library | 376 | 0 | 79.6% → 81.9% |
+| nltk 3.9.2 | 2 | 0 | 89.3% → 89.3% |
+| cloud-init | 0 | 0 | unchanged |
+
+Recall at the default floor is unchanged on all four. Before the list was
+chosen, every built-in method name was tried: nltk lost 206 right edges
+that way, 170 of them calls of its own classes' `items()`, `keys()` and
+`values()`, while cloud-init's `items` was wrong 96 times out of 98. Whether
+those names are a built-in's depends on the project, so they are left out.
 
 ### change: a directory overview goes to the agent that read five files of it
 

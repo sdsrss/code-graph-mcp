@@ -15229,3 +15229,62 @@ fn a_scoped_same_file_bind_survives_an_incremental_run() {
     );
     assert_incremental_matches_rebuild(&tree, &[("u.js", Some(&format!("{user}// touched\n")))]);
 }
+
+/// D#714 A4: a Python call on a receiver the source leaves untyped, whose name
+/// is a method of `str`, `set`, `pathlib.Path`, `re` or `datetime`
+/// (`path.exists()`), is `ambiguous` when it binds the project's only method
+/// of that name: the receiver is as likely the built-in. A name of the
+/// mapping, sequence or file protocols (`items`, `append`, `read`), which
+/// project classes implement, and a receiver of known class keep `inferred`.
+#[test]
+fn a_python_builtin_method_name_on_an_untyped_receiver_is_ambiguous() {
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "app/storage.py",
+            "class Storage:\n    def exists(self, key):\n        return True\n\n\
+             \x20   def items(self):\n        return []\n\n\
+             \x20   def startswith(self, p):\n        return False\n",
+        ),
+        (
+            "app/use.py",
+            "from app.storage import Storage\n\n\n\
+             def untyped(path, store, name):\n    path.exists()\n    store.items()\n    name.startswith('x')\n\n\n\
+             def typed():\n    s = Storage()\n    s.exists('k')\n\n\n\
+             class Job:\n    def run(self):\n        self.root.exists()\n",
+        ),
+        (
+            "web/storage.js",
+            "export class Store {\n  startswith(p) { return false; }\n}\n",
+        ),
+        (
+            "web/use.js",
+            "export function untypedJs(name) {\n  name.startswith('x');\n}\n",
+        ),
+    ]);
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT ns.name || ' -> ' || nt.name || ' ' || COALESCE(e.confidence, '-') FROM edges e \
+             JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON nt.id = e.target_id \
+             JOIN files fs ON fs.id = ns.file_id \
+             WHERE e.relation = 'calls' AND fs.path IN ('app/use.py', 'web/use.js') \
+               AND nt.name <> 'Storage' ORDER BY 1",
+        )
+        .unwrap();
+    let got: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(
+        got,
+        [
+            "run -> exists ambiguous",
+            "typed -> exists inferred",
+            "untyped -> exists ambiguous",
+            "untyped -> items inferred",
+            "untyped -> startswith ambiguous",
+            "untypedJs -> startswith inferred",
+        ]
+    );
+}
