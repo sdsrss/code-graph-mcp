@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.184.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 125 → 126
 because some Python call edges are no longer created (below). The MCP server
