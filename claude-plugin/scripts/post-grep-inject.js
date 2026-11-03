@@ -192,14 +192,43 @@ function grepFoundPattern(output, rawPattern) {
   // ids are pure `[A-Za-z_]\w*` tokens (no regex metachars) → safe to embed in \b…\b.
   const wordRes = ids.map((id) => new RegExp(`\\b${id}\\b`));
   return output.split('\n').some((line) => {
-    // Decide hit-shape from a bounded prefix (ReDoS guard — see HIT_SHAPE_SCAN_MAX).
-    // A `-l` bare path is short, so a line longer than the cap is never one.
-    const head = line.length > HIT_SHAPE_SCAN_MAX ? line.slice(0, HIT_SHAPE_SCAN_MAX) : line;
-    const hitShaped = GREP_HIT_LINE.test(head)
-      || (line.length <= HIT_SHAPE_SCAN_MAX && BARE_PATH_LINE.test(line));
-    if (!hitShaped) return false;
+    if (!isGrepHitLine(line)) return false;
     return wordRes.some((re) => re.test(line));  // \b…\b is linear — safe on the full line
   });
+}
+
+/** Whether one stdout line has a grep hit's shape (see GREP_HIT_LINE). */
+function isGrepHitLine(line) {
+  // Decide hit-shape from a bounded prefix (ReDoS guard — see HIT_SHAPE_SCAN_MAX).
+  // A `-l` bare path is short, so a line longer than the cap is never one.
+  const head = line.length > HIT_SHAPE_SCAN_MAX ? line.slice(0, HIT_SHAPE_SCAN_MAX) : line;
+  return GREP_HIT_LINE.test(head)
+    || (line.length <= HIT_SHAPE_SCAN_MAX && BARE_PATH_LINE.test(line));
+}
+
+/**
+ * Did the command's own output carry grep hits at all, whatever they matched?
+ * False for unreadable output (unknown) and for output with no hit-shaped line,
+ * such as a sibling `echo` after a grep that matched nothing.
+ */
+function grepShowedHits(output) {
+  return typeof output === 'string' && output.split('\n').some(isGrepHitLine);
+}
+
+// `code-graph-mcp grep` puts `  → <kind> <name> (lines a-b)` under each hit it
+// can place; a hit line itself starts with its path, never with spaces.
+const CONTAINER_LINE = /^ {2}→ (\S+) /gm;
+
+/**
+ * Whether a grep answer places at least one hit inside a function, class or
+ * other node below the file. `→ module <file>` and a `-l` list (no annotation)
+ * say nothing the grep's own hits did not (P2-1).
+ */
+function hasAstContext(text) {
+  for (const m of String(text || '').matchAll(CONTAINER_LINE)) {
+    if (m[1] !== 'module') return true;
+  }
+  return false;
 }
 
 // Short header so the model recognizes this as cg's parallel structural view of
@@ -519,6 +548,20 @@ function runMain() {
     binaryCacheOk: !grepListsBinaryMatches(segment),
   })) return;
 
+  // P2-1 — in era E (0.178.0 to 2026-11-03, neutral projects) 15 of 21 grep-mode
+  // injects placed no hit below file level (10 `-l` lists, 5 all `→ module`),
+  // each after a grep whose own hits were on screen. When the model's output
+  // shows grep hits, such an answer is skipped and recorded like the
+  // redundancy skip; after a grep that printed none, the hits are the news.
+  if (answeredMode === 'grep' && !hasAstContext(answer.text)
+      && grepShowedHits(extractGrepOutput(input))) {
+    recordRecommendation(root, {
+      hook: 'grep', action: 'observe', reason: 'no-ast-context',
+      ...(pattern ? { pattern } : {}),
+    });
+    return;
+  }
+
   // B11: `scope:'outside'` marks a pointer in place of the tree; `mode` stays
   // `callgraph`, the one the funnel aggregator buckets.
   const rootFile = answeredMode === 'callgraph' ? definitionFile(answer.text) : null;
@@ -545,6 +588,8 @@ module.exports = {
   extractCallgraphSymbols,
   extractGrepOutput,
   grepFoundPattern,
+  grepShowedHits,
+  hasAstContext,
   buildInjectText,
   definitionFile,
   searchCovers,

@@ -50,10 +50,9 @@ const COOLDOWNS = {
   overview:  5 * 60 * 1000, // 5min — module structure rarely changes mid-session
   callgraph: 60 * 1000,     // 1min
   search:    60 * 1000,     // 1min
-  symptom:   10 * 60 * 1000, // 10min — Phase E meta-advisory hint, low value to repeat
 };
 
-// Project-scoped (see cwdHash in tmp-dir.js). There are only five flag names
+// Project-scoped (see cwdHash in tmp-dir.js). There are only four flag names
 // here, so an un-scoped flag was effectively a machine-wide mute: one `impact`
 // push in any repo silenced the next 30s of impact pushes in every other repo,
 // and `overview` did it for five minutes.
@@ -360,50 +359,7 @@ function detectIntents(msg) {
   };
 }
 
-// Phase E: symptom-driven fallback. The 7d audit + TriggerRate hard-oracle
-// baseline (60%) show the failure mode "user phrases a problem without giving
-// a symbol/path/file — Claude defaults to bash grep". The 4 existing channels
-// (intent / qualified symbol / file path / any symbol) all miss on these
-// prompts. SYMPTOM_PATTERNS catches the bug-flavored prompts so we can emit
-// ONE-LINE prose hint (no CLI execution — different from the other 4 paths
-// that inject results). Keeps noise low while planting the routing seed.
-const SYMPTOM_PATTERNS = [
-  // English symptom / failure-mode markers
-  /\bbug\b/i,
-  /\bcrash(?:ed|ing|es)?\b/i,
-  /\bbroken\b/i,
-  /\bnot work(?:ing)?\b/i,
-  /\bdoesn'?t work\b/i,
-  /\bfail(?:ed|ing|s|ure)?\b/i,
-  /\bwhy (?:does|is|are|isn'?t|doesn'?t|won'?t)/i,
-  /\bmissing\b/i,
-  // Chinese symptom / failure markers
-  /有\s?bug/i,
-  /又挂/,
-  /又失败/,
-  /挂了/,
-  /失败了/,
-  /卡死/,
-  /卡住/,
-  /不准/,
-  /不对/,
-  /缺失/,
-  /丢失/,
-  /没响应/,
-  /出错/,
-  /报错/,
-  /为什么/,
-  /怎么(?:修|解决)/,
-  /哪里[\s\S]{0,5}(?:错|有问题|不对)/, // 哪里写错 / 哪里出错 / 哪里有问题 / 哪里报错了
-  /出了什么问题/,
-];
-
-function hasSymptom(msg) {
-  if (!msg || typeof msg !== 'string') return false;
-  return SYMPTOM_PATTERNS.some(p => p.test(msg));
-}
-
-function determineQueryType(intents, symbols, filePaths, isCoolingDownFn, message = '') {
+function determineQueryType(intents, symbols, filePaths, isCoolingDownFn) {
   const hasStrict = symbols.symbols.length > 0 && !symbols.lowConfidence;
   const hasQualified = symbols.symbols.some(s => s.includes('::'));
   const hasAny = intents.impact || intents.modify || intents.implement || intents.understand || intents.callgraph || intents.search;
@@ -428,13 +384,11 @@ function determineQueryType(intents, symbols, filePaths, isCoolingDownFn, messag
   if ((intents.search || intents.implement || hasQualified) && hasStrict && !cd('search', sym)) return { type: 'search', symbol: sym };
   if ((intents.understand || !hasAny) && hasStrict && !cd('search', sym)) return { type: 'search', symbol: sym };
 
-  // Phase E fallback: nothing actionable above, but message has symptom phrasing.
-  // Emit ONE-LINE prose hint (no CLI execution). Default-empty `message` keeps
-  // backward-compat for callers that don't pass it (legacy `analyze` helpers).
-  if (message && hasSymptom(message) && !cd('symptom')) {
-    return { type: 'symptom-hint' };
-  }
-
+  // No anchor, no query. A prompt with failure words and nothing else used to
+  // get a `[code-graph:hint]` line pointing at search/module_overview; in era E
+  // it fired 9 times outside this plugin's own repos, and none of the 130 tool
+  // calls in the 15 after each used code-graph (P2-1,
+  // tasks/specs/p2-zero-effect-injections.md).
   return null;
 }
 
@@ -526,20 +480,9 @@ function runMain() {
   const intents = detectIntents(message);
   // Key the cooldowns on the resolved project root, not the raw shell cwd, so a
   // `cd` into a subdir does not read as a different project and re-fire.
-  const query = determineQueryType(intents, symbols, filePaths, (type, key) => isCoolingDown(type, cwd, key), message);
+  const query = determineQueryType(intents, symbols, filePaths, (type, key) => isCoolingDown(type, cwd, key));
 
   if (!query) return;
-
-  // Phase E: symptom-hint is prose-only (no CLI execution). Emit + cooldown
-  // before the result-fetching paths so it can short-circuit cleanly.
-  if (query.type === 'symptom-hint') {
-    markCooldown('symptom', cwd);
-    process.stdout.write(
-      '[code-graph:hint] indexed repo — for vague-symptom prompts, try `code-graph-mcp search "<symptom words>"` ' +
-      'or `module_overview <suspected-dir>` to surface candidate code structurally. Skip if not searching code.\n'
-    );
-    return;
-  }
 
   // A partial index answers wrongly, not just briefly (D5). Return before the
   // cooldown so the same question is answered once the build is done.
@@ -631,4 +574,4 @@ if (require.main === module) {
   runMain();
 }
 
-module.exports = { ambiguityContext, COOLDOWNS, shouldSkip, extractFilePaths, extractSymbols, detectIntents, scoreIntent, INTENT_PATTERNS, INTENT_THRESHOLD, determineQueryType, computeQuietHooks, STOP_WORDS, PLAIN_WORD_EXCLUDE, hasSymptom, SYMPTOM_PATTERNS, buildRunEnv, childBudgetMs, CHILD_TIMEOUT_MS };
+module.exports = { ambiguityContext, COOLDOWNS, shouldSkip, extractFilePaths, extractSymbols, detectIntents, scoreIntent, INTENT_PATTERNS, INTENT_THRESHOLD, determineQueryType, computeQuietHooks, STOP_WORDS, PLAIN_WORD_EXCLUDE, buildRunEnv, childBudgetMs, CHILD_TIMEOUT_MS };

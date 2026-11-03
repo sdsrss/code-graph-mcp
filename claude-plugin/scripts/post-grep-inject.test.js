@@ -68,6 +68,8 @@ const {
   isInjectDisabled,
   buildInjectText,
   commandHash,
+  hasAstContext,
+  grepShowedHits,
 } = require('./post-grep-inject');
 
 // ── grep-response gate ──────────────────────────────────────────────
@@ -322,6 +324,34 @@ test('isInjectDisabled: CODE_GRAPH_NO_INJECT=1 → disabled; default not', () =>
   assert.equal(isInjectDisabled({ CODE_GRAPH_NO_INJECT: '1' }), true);
   assert.equal(isInjectDisabled({ CODE_GRAPH_NO_INJECT: '0' }), false);
   assert.equal(isInjectDisabled({}), false);
+});
+
+// ── P2-1: a grep answer with no containing function or class ─────────
+// Era E (0.178.0 to 2026-11-03), neutral projects: 15 of 21 grep-mode injects
+// carried no node a hit sits in — 10 were `grep -l` file lists (no annotation at
+// all), 5 annotated every hit `→ module <file>` — and every one followed a grep
+// whose own output was there. Such an answer is skipped when the model's grep
+// printed hits; a grep that printed none, or output the hook cannot read, still
+// gets it.
+
+test('hasAstContext: a hit inside a function or class is context; module or none is not', () => {
+  const mod = 'src/a.js:3  const x = 1;\n  → module src/a.js (lines 1-40)';
+  const fn = 'src/a.js:9  return x;\n  → fn load (lines 8-12)';
+  assert.equal(hasAstContext(mod), false);
+  assert.equal(hasAstContext('src/a.js\nsrc/b.js'), false, 'a -l file list');
+  assert.equal(hasAstContext(`${mod}\n${fn}`), true, 'one hit in a function is enough');
+  assert.equal(hasAstContext('m.py:4  x = 1\n  → class Config (lines 2-9) [stale]'), true);
+  assert.equal(hasAstContext('src/a.js:3  →  module x\n'), false, 'an arrow in the hit text is not an annotation');
+  assert.equal(hasAstContext(''), false);
+});
+
+test('grepShowedHits: true only for output with a grep-hit-shaped line', () => {
+  assert.equal(grepShowedHits(null), false, 'unreadable output: unknown');
+  assert.equal(grepShowedHits(''), false);
+  assert.equal(grepShowedHits('===\n'), false, 'only an echo landed');
+  assert.equal(grepShowedHits('src/a.js:3:  const other = 1'), true);
+  assert.equal(grepShowedHits('54:  const c = r.checks.find(x => x)'), true, 'single-file -n');
+  assert.equal(grepShowedHits('tests/a.test.js\ntests/b.test.js'), true, 'grep -l');
 });
 
 // ── e2e: real spawn with stub binary (mirrors pre-grep-guide harness) ──
@@ -812,6 +842,57 @@ test('e2e: grep-response gate — grep found NOTHING → inject (cg answer is ad
     const out = JSON.parse(res.stdout);
     assert.match(out.hookSpecificOutput.additionalContext, new RegExp(uniq),
       'a grep that found nothing must still get the additive cg answer');
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e P2-1: a module-only answer after a grep that printed hits → no inject, recorded', () => {
+  const uniq = `ModOnly${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('src/a.js:3  const k = "' + process.argv[3] + '";\\n  → module src/a.js (lines 1-9)\\n');`);
+  const cmd = `echo "x" && grep -rn "${uniq}" src/`;
+  try {
+    // The model's grep printed a hit the gate cannot tie to the pattern (a cut,
+    // an awk, a -l list): the hits are on screen, and the answer adds no node.
+    const res = runHook(cmd, fixture, {}, undefined, 'src/a.js:3:  const k = "…"');
+    assert.equal(res.status, 0);
+    assert.equal(res.stdout.trim(), '', 'an answer with no containing node adds nothing to the grep');
+    const rec = JSON.parse(fs.readFileSync(
+      path.join(fixture.dir, '.code-graph', 'recommendations.jsonl'), 'utf8').trim().split('\n').pop());
+    assert.equal(rec.hook, 'grep');
+    assert.equal(rec.action, 'observe', 'excluded from the recommendation total, like the redundancy skip');
+    assert.equal(rec.reason, 'no-ast-context');
+    assert.equal(rec.pattern, uniq);
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e P2-1: one hit inside a function → the whole answer, as before', () => {
+  const uniq = `FnHit${Date.now()}`;
+  const answer = 'src/a.js:3  const k = 1;\n  → module src/a.js (lines 1-9)\n' +
+    'src/a.js:6  return k;\n  → fn load (lines 5-7)';
+  const fixture = e2eFixture(`process.stdout.write(${JSON.stringify(answer + '\n')});`);
+  const cmd = `echo "x" && grep -rn "${uniq}" src/`;
+  try {
+    const res = runHook(cmd, fixture, {}, undefined, 'src/a.js:3:  const k = 1;');
+    const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
+    assert.equal(ctx, buildInjectText({ status: 'hits', text: answer, truncated: false }, 'grep'));
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e P2-1: a module-only answer after a grep that printed nothing → inject, as before', () => {
+  const uniq = `ModMiss${Date.now()}`;
+  const fixture = e2eFixture(
+    `process.stdout.write('src/a.js:3  const k = "' + process.argv[3] + '";\\n  → module src/a.js (lines 1-9)\\n');`);
+  const cmd = `echo "===" && grep -rn "${uniq}" src/`;
+  try {
+    const res = runHook(cmd, fixture, {}, undefined, '===\n');
+    assert.match(JSON.parse(res.stdout).hookSpecificOutput.additionalContext, new RegExp(uniq),
+      'the grep missed: the hits themselves are the news');
   } finally {
     cleanupFixture(fixture, cmd);
   }

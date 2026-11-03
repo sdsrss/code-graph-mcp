@@ -2,13 +2,16 @@
 
 ## Unreleased
 
-**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 131
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 132
 because JavaScript and TypeScript call and import edges are added or moved,
 same-file call edges are dropped and some Python call edges are labelled
 `ambiguous` (below). The MCP server
 rebuilds the index when it starts; from the command line,
-`code-graph-mcp reindex` does. To pin the binary back:
-`npm i -g @sdsrs/code-graph@0.184.0`, then delete
+`code-graph-mcp reindex` does. Two plugin hook outputs no longer appear: the
+prompt hook's `[code-graph:hint]` line, and the grep hook's "AST-aware view"
+when it places no hit inside a function or class (last section); there is
+nothing to do about either. To pin the binary back, which also brings both
+back: `npm i -g @sdsrs/code-graph@0.184.0`, then delete
 `~/.cache/code-graph/bin/code-graph-mcp` and set
 `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
 
@@ -221,6 +224,32 @@ handshake:
 
 An existing index is compacted the next time its MCP server starts. The file
 watcher still starts at the first tool call.
+
+### change: two hook outputs that went unused are gone
+
+- **The prompt hook's `[code-graph:hint]` line.** A prompt with words such as
+  `bug`, `fail`, `why does`, 报错 or 不对 and no symbol or file path got a line
+  suggesting `code-graph-mcp search` or `module_overview`. From 0.178.0 to
+  2026-11-03 it fired 13 times in the maintainer's sessions, 9 of them on a
+  pasted report. After the 9 fires outside this plugin's own repositories,
+  none of the next 15 tool calls (130 in all) used code-graph. Such a prompt
+  now gets nothing; a prompt that names a symbol or a path is answered as
+  before.
+- **The grep hook's "AST-aware view" when it places no hit in a function or
+  class.** After a compound grep whose output does not show the pattern, the
+  hook ran `code-graph-mcp grep` and added its hits, each with the node it
+  sits in. In the same period and projects, 15 of its 21 grep answers placed
+  no hit below the file: 10 were the file list of a `grep -l`, 5 marked every
+  hit `→ module <file>`, and none followed an empty output.
+  Such an answer is now skipped when the command's output shows a grep hit (a
+  line starting `path:` or `NN:`, or a bare path as `-l` prints it). After a
+  grep that printed no hit, or when the hook cannot read the output, it is
+  added as before, and so is an answer with one hit inside a function or
+  class. Replayed over those 21 answers, 14 are skipped; the 6 with a
+  function or class stay, and so does 1 whose output had no such line. A skip is recorded in
+  `.code-graph/recommendations.jsonl` as `"action":"observe"` with
+  `"reason":"no-ast-context"`, as the skip of a grep that already showed the
+  pattern is.
 
 ## 0.184.0
 

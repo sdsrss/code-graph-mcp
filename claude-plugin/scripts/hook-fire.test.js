@@ -26,7 +26,7 @@ test.after(() => {
   try { fs.rmSync(HOME_SANDBOX, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
-const { verifyHooksFire } = require('./lifecycle');
+const { verifyHooksFire, defaultHookFireProbes } = require('./lifecycle');
 const { hookFireWarning, analyzeHookDark } = require('./session-init');
 
 // `CLAUDE_CONFIG_DIR` is dropped from THIS process before anything runs.
@@ -60,21 +60,46 @@ test('verifyHooksFire: the grep hook actually engages (emits a decision)', () =>
     'pre-grep-guide produced no output on an engaging grep payload — the firing path did not engage');
 });
 
-// The sibling of the assertion above, and the one that was missing. `ok` is
-// `exit === 0`, and a hook that reads a field the host does not send exits 0 in
-// silence — so this probe reported the UserPromptSubmit surface healthy for its
-// entire dead lifetime while `emitted` sat right there in the same result object,
-// recorded and unread. The payload was never the problem: `hookFirePayload('')`
-// has always returned `{prompt:…}`, the shape Claude Code really sends
-// (audit 2026-08-29 JS-01).
-test('verifyHooksFire: the UserPromptSubmit hook actually engages (emits context)', () => {
-  const { results } = verifyHooksFire();
-  const upc = results.find(r => /user-prompt-context/.test(r.script));
-  assert.ok(upc, 'no user-prompt-context hook probe found');
-  assert.ok(upc.emitted,
-    'user-prompt-context produced no output on a real UserPromptSubmit payload — ' +
-    'the injection surface is dark, and exit 0 does not say so');
-});
+// The sibling of the assertion above. `ok` is `exit === 0`, and a hook that
+// reads a field the host does not send exits 0 in silence: this probe reported
+// the UserPromptSubmit surface healthy for its entire dead lifetime (audit
+// 2026-08-29 JS-01). What used to stand here asserted `emitted` under this
+// file's HOME sandbox, which has no install manifest, so the hook printed its
+// restart notice and returned before reading stdin: the output it saw was
+// never about the payload. P2-1 then removed the one binary-free injection
+// (`[code-graph:hint]`, 9 fires, 0 code-graph calls after them in era E), so the real probe now
+// proves load + exit 0, like the Stop and SubagentStart probes. This test runs
+// it in a HOME that has a manifest and a stub binary: the probe's prompt must
+// resolve to no query (the doctor probe never runs the CLI), and a prompt with
+// an anchor, in the same HOME, must reach the stub, so the silence is the
+// prompt's and not the sandbox's.
+test('verifyHooksFire: the UserPromptSubmit probe sends `prompt` and stays off the CLI path',
+  { skip: process.platform === 'win32' && 'POSIX shell stub' }, (t) => {
+    const probe = defaultHookFireProbes().find(p => /user-prompt-context/.test(p.script));
+    assert.ok(probe, 'no user-prompt-context hook probe found');
+    assert.equal(typeof probe.payload.prompt, 'string', 'the probe must send the field Claude Code sends');
+    assert.ok(probe.payload.prompt.trim());
+
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-hookfire-upc-'));
+    t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+    const cache = path.join(home, '.cache', 'code-graph');
+    fs.mkdirSync(path.join(cache, 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(cache, 'install-manifest.json'), '{"version":"9.9.9","config":{}}');
+    const stub = path.join(cache, 'bin', 'code-graph-mcp');
+    fs.writeFileSync(stub, '#!/bin/sh\necho "callers: alpha beta"\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(cache, 'binary-path'), stub);
+    const env = { HOME: home, USERPROFILE: home };
+
+    const [real] = verifyHooksFire({ hooks: [probe], env }).results;
+    assert.equal(real.ok, true, `code=${real.code} err=${real.error}`);
+    assert.equal(real.emitted, false,
+      'the probe prompt reached an emitting path: pick a prompt that resolves to no query');
+
+    const anchored = { ...probe, payload: { prompt: 'impact of refactoring parse_code function' } };
+    const [control] = verifyHooksFire({ hooks: [anchored], env }).results;
+    assert.equal(control.emitted, true,
+      'an anchored prompt did not reach the stub in this HOME, so the silence above proves nothing');
+  });
 
 test('verifyHooksFire: reports a broken hook script (teeth)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-hookfire-teeth-'));
