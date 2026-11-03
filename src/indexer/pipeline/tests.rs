@@ -15175,6 +15175,13 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
             &["g@2 -> f@1", "g@2 -> f@4"],
         ),
         (
+            "js: a const in a for head is the loop's",
+            "a.js",
+            "function f() { return 1; }\nfunction g() {\n  for (const f = () => 2; ;) {\n    f();\n    break;\n  }\n  \
+             return f();\n}\n",
+            &["g@2 -> f@1", "g@2 -> f@3"],
+        ),
+        (
             "js: a var in a block is the function's",
             "a.js",
             "function k() {}\nfunction h(x) {\n  if (x) {\n    var k = () => 1;\n  }\n  return k();\n}\n",

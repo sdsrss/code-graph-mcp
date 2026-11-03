@@ -125,7 +125,13 @@ pub(crate) fn lexical_scope(def: &tree_sitter::Node, language: &str) -> Option<L
 /// [`lexical_scope_kinds`] (a function's own body is its function's scope).
 fn is_nested_block(n: &tree_sitter::Node, language: &str, functions: &[&str]) -> bool {
     let blocks: &[&str] = match language {
-        "javascript" | "typescript" | "tsx" => &["statement_block", "switch_body"],
+        // A `for (const f = …;;)` / `for (const x of …)` head binds in the loop.
+        "javascript" | "typescript" | "tsx" => &[
+            "statement_block",
+            "switch_body",
+            "for_statement",
+            "for_in_statement",
+        ],
         "rust" => &["block"],
         _ => return false,
     };

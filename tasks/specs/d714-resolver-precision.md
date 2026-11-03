@@ -36,7 +36,7 @@
 - 决定：
   - 不用"类也算作用域"：Python 方法里 `h()` 看不到类里的 `h`，Java/C++ 的隐式 `this` 能调到继承来的成员，按类算会删掉对的边。所以只覆盖 JS/TS、Python、Rust，且成员候选不参与。
   - Rust 的 `mod` 不算作用域：`use super::a::h` 能从兄弟模块引入，按 mod 算会删掉对的边。
-  - JS 块作用域按函数算（更宽，只会少删）。
+  - ~~JS 块作用域按函数算（更宽，只会少删）。~~ 0.185.0 预发评审 M3 证伪：块内定义被当成整个函数可见，块外的调用就绑到块内定义、丢掉它真正调用的外层定义，删得更多。改为：嵌套块（不是函数自己的函数体）里的 JS `const`/`let` 声明和 Rust 项，作用域取那个块；嵌套块里的 JS `function` 声明返回 None，不参与收窄（非严格模式下块执行后也绑到外层函数）；`var` 仍取函数。`for (const f = …)` 循环头的声明后来也按循环算（v134）。
   - Python 的 `async_function_definition` 分支在 tree-sitter-python 0.23 里走不到（`async def` 解析成 `function_definition`），不在那里加代码。
 - 测试：`a_bare_call_binds_the_same_file_definition_its_scope_sees`（14 行，正例 + 保持不变的行）、`a_same_name_member_is_left_to_the_other_rules`（6 行，改前的输出）、`a_scoped_same_file_bind_survives_an_incremental_run`。13 个单点回退里 10 个各让至少一行变红；没杀掉的 3 个：Python `async_function_definition` 分支（走不到，已删）、"一个都不可见时去掉全部"（被延迟阶段按名字重新绑定兜住）、Rust `impl` 成员判断（Rust 裸调用的形状规则已经先把关联函数排除了）。
 - 实测（SCIP oracle，BEFORE = 1bcf622f，AFTER = 工作树，同一副本，`tasks/d714-resolver-precision/oracle_ab_lang.sh`），召回全部不变：
@@ -91,3 +91,10 @@
 ## 相关
 
 - D#720：TypeScript `await f<T>(x)` 不产生调用关系。daagu 前端在 D#712 之后余下 40 条漏报，oracle 列出的 38 条全是这种写法。
+
+## 0.185.0 预发评审第 1 轮（2026-11-03）
+
+- H1（已修）：只改 barrel 时导入方不重抽，增量和重建永久不一致（评审 s1/s2/s7/s12/s13）。修法照 Python 的 D#370(a)：`index_files` 记下本轮 JS/TS 文件的重导出行（名字、规格、q、目标文件），扇出时比较，导入了变动名字（或该文件 `export *` 集合变动）的文件重抽，逐轮传播。测试 `a_barrel_only_edit_rebinds_its_importers_as_a_rebuild_does`（5 种编辑）。
+- M2（已修）：重导出遍历的上限从"总共访问 8 个文件"改为"8 层深"。测试 `a_wide_export_star_barrel_is_followed_past_eight_sources`。
+- M3（已修）：见上面"块作用域"一条。A3 表格新增 5 行。
+- LOW 处理：JS 变异存活补测试并验证能杀（grep 模式守卫、`^ {2}` 锚点）；D#713 只有 agent_id 的读者补断言；两处注释更正；其余写进 CHANGELOG 的"未覆盖"或收窄说法（D#720 的 `1 + await f<T>()`，A4 的构造器接收者，改名重导出不跟进，Python `global`，grep 跳过把 `echo`/版本号行当命中，启动修复遇并发写不重试）。
