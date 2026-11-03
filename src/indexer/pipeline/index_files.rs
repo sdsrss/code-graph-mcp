@@ -2850,11 +2850,13 @@ Restart every code-graph server on this project so they run one version.",
     let has_work = !files.is_empty() || !delete_paths.is_empty();
     // What this run's Python files re-export, before it rewrites them: the
     // caller's fan-out re-extracts the importers of any that moved (D#370(a)).
+    // The same for its JS/TS files (pre-tag review of 0.185.0, H1).
     if has_work {
         super::resolve::snapshot_python_reexports(
             db.conn(),
             files.iter().chain(delete_paths.iter()),
         )?;
+        super::resolve::snapshot_js_reexports(db.conn(), files.iter().chain(delete_paths.iter()))?;
     }
     // This run's token in the in-flight marker, held until its last graph phase
     // has run (`super::in_flight`; retired near the end of this function). An

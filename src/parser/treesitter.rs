@@ -88,6 +88,13 @@ fn lexical_scope_kinds(
 /// `fn`): the innermost function around it, or the file. None when the first
 /// container met going up is a class, impl, trait or object literal (a member
 /// is no name a bare call reaches), and for every other language.
+///
+/// A nested block (one that is not a function's own body) met first scopes
+/// what binds in it (pre-tag review of 0.185.0, M3): a JS/TS `const`/`let`
+/// declarator and a Rust item get that block. A JS/TS `function` declaration
+/// there gets None, so it narrows nothing: sloppy code also binds it in the
+/// enclosing function once the block has run. A `var` declarator goes on up
+/// to its function.
 pub(crate) fn lexical_scope(def: &tree_sitter::Node, language: &str) -> Option<LexicalScope> {
     let (functions, members) = lexical_scope_kinds(language)?;
     let mut cur = def.parent();
@@ -98,9 +105,31 @@ pub(crate) fn lexical_scope(def: &tree_sitter::Node, language: &str) -> Option<L
         if members.contains(&n.kind()) {
             return None;
         }
+        if is_nested_block(&n, language, functions) {
+            match language {
+                "rust" => return Some(LexicalScope::Within(n.start_byte(), n.end_byte())),
+                _ if def.kind() == "variable_declarator" => {
+                    if def.parent().map(|p| p.kind()) == Some("lexical_declaration") {
+                        return Some(LexicalScope::Within(n.start_byte(), n.end_byte()));
+                    }
+                }
+                _ => return None,
+            }
+        }
         cur = n.parent();
     }
     Some(LexicalScope::File)
+}
+
+/// A block scope of JS/TS or Rust that is not the body of a function kind of
+/// [`lexical_scope_kinds`] (a function's own body is its function's scope).
+fn is_nested_block(n: &tree_sitter::Node, language: &str, functions: &[&str]) -> bool {
+    let blocks: &[&str] = match language {
+        "javascript" | "typescript" | "tsx" => &["statement_block", "switch_body"],
+        "rust" => &["block"],
+        _ => return false,
+    };
+    blocks.contains(&n.kind()) && !n.parent().is_some_and(|p| functions.contains(&p.kind()))
 }
 
 /// D#714: where a bare call in a language [`lexical_scope`] covers starts,

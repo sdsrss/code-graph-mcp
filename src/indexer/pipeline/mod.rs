@@ -856,12 +856,15 @@ fn fan_out_to_new_duplicate_definitions(
         db.conn(),
         &resolve::collect_rust_crates(project_root),
     )?;
-    // Importers of a Python module whose re-exports the run moved (D#370(a)).
+    // Importers of a Python module whose re-exports the run moved (D#370(a)),
+    // and of a JS/TS file whose re-exports it moved (0.185.0 review, H1).
     let reexported = resolve::importers_of_python_reexport_drift(db.conn())?;
+    let js_reexported = resolve::importers_of_js_reexport_drift(db.conn())?;
     let callers: Vec<String> = typed
         .iter()
         .chain(bare.iter())
         .chain(reexported.iter())
+        .chain(js_reexported.iter())
         .cloned()
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -872,11 +875,12 @@ fn fan_out_to_new_duplicate_definitions(
     tracing::info!(
         "[index] fan-out round: re-extracting {} caller file(s): {} bare-name caller(s) reached \
          by a new same-name definition, {} typed caller(s) of a changed class structure, {} \
-         importer(s) of a moved Python re-export",
+         importer(s) of a moved Python re-export, {} of a moved JS/TS re-export",
         callers.len(),
         bare.len(),
         typed.len(),
-        reexported.len()
+        reexported.len(),
+        js_reexported.len()
     );
     // Same reason round one captures it: re-indexing these files replaces their
     // node ids, so the context strings of nodes in OTHER files that point at
@@ -892,12 +896,15 @@ fn fan_out_to_new_duplicate_definitions(
     // describes for the bare-name half.
     let mut pulled = callers.len();
     for _ in 0..REEXPORT_FANOUT_ROUNDS {
-        let more = resolve::importers_of_python_reexport_drift(db.conn())?;
+        let mut more = resolve::importers_of_python_reexport_drift(db.conn())?;
+        more.extend(resolve::importers_of_js_reexport_drift(db.conn())?);
+        more.sort_unstable();
+        more.dedup();
         if more.is_empty() {
             break;
         }
         tracing::info!(
-            "[index] fan-out round: re-extracting {} importer(s) of a moved Python re-export",
+            "[index] fan-out round: re-extracting {} importer(s) of a moved re-export",
             more.len()
         );
         let dirty = collect_dirty_node_ids(db, &more)?;

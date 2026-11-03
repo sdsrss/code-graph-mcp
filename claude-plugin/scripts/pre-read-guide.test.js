@@ -343,8 +343,8 @@ test('D5: no fan-out hint while the startup index is being written, and the dir 
 
 // D#713: the count is per session. Keyed on the project alone, every session
 // and worktree of it added to one count, and the overview went to whichever
-// read crossed it: in the 2026-11-03 audit, 7 of 27 overviews reached the
-// session that had fanned out.
+// read crossed it: replaying two weeks of reads, 7 of 19 overviews went to a
+// context that had not read five files of the directory itself.
 test('trackReadAndMaybeHint: another session\'s reads do not add up (D#713)', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-sessions-'));
   const stub = path.join(root, 'stub.js');
@@ -373,6 +373,8 @@ test('trackReadAndMaybeHint: another session\'s reads do not add up (D#713)', ()
 test('readerOf: the session, and the subagent within it (D#713)', () => {
   assert.equal(readerOf({ session_id: 'sess-A' }), 'sess-A');
   assert.equal(readerOf({ session_id: 'sess-A', agent_id: 'a1' }), 'sess-A/a1');
+  // An agent with no session is a reader of its own, not the project's count.
+  assert.equal(readerOf({ agent_id: 'a1' }), '/a1');
   assert.equal(readerOf({}), null);
   assert.equal(readerOf(null), null);
   assert.notEqual(statePath('/p', 'sess-A/a1'), statePath('/p', 'sess-A'));

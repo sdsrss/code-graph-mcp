@@ -1315,8 +1315,10 @@ function hookFirePayload(matcher, event = '') {
       return { tool_name: 'Edit', tool_input: { file_path: 'src/example.rs', old_string: 'a', new_string: 'b' } };
     case '': // UserPromptSubmit
       // A prompt that resolves to no query, so the probe never runs the CLI.
-      // Every path of this hook that emits runs the CLI since P2-1 removed the
-      // binary-free `[code-graph:hint]` line this probe used to engage, so like
+      // Every query path of this hook that emits runs the CLI since P2-1
+      // removed the binary-free `[code-graph:hint]` line this probe used to
+      // engage (the restart notice of an install with no manifest still
+      // emits, before the prompt is read), so like
       // the Stop and SubagentStart probes it proves load + exit 0; the field it
       // reads is pinned by user-prompt-context.test.js with a stub binary. Field
       // name is `prompt`: this constructor has always had it right, while the

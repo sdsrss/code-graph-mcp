@@ -342,6 +342,8 @@ test('hasAstContext: a hit inside a function or class is context; module or none
   assert.equal(hasAstContext(`${mod}\n${fn}`), true, 'one hit in a function is enough');
   assert.equal(hasAstContext('m.py:4  x = 1\n  → class Config (lines 2-9) [stale]'), true);
   assert.equal(hasAstContext('src/a.js:3  →  module x\n'), false, 'an arrow in the hit text is not an annotation');
+  assert.equal(hasAstContext('src/a.js:3  const s = "  → fn load (lines 1-2)";\n  → module src/a.js (lines 1-9)'),
+    false, 'an annotation-shaped string inside a hit is not one');
   assert.equal(hasAstContext(''), false);
 });
 
@@ -879,6 +881,21 @@ test('e2e P2-1: one hit inside a function → the whole answer, as before', () =
     const res = runHook(cmd, fixture, {}, undefined, 'src/a.js:3:  const k = 1;');
     const ctx = JSON.parse(res.stdout).hookSpecificOutput.additionalContext;
     assert.equal(ctx, buildInjectText({ status: 'hits', text: answer, truncated: false }, 'grep'));
+  } finally {
+    cleanupFixture(fixture, cmd);
+  }
+});
+
+test('e2e P2-1: a call-graph answer is not a grep answer — no skip after a grep that printed hits', () => {
+  const uniq = `CgKeep${Date.now()}`;
+  const fixture = e2eFixture(
+    `const sub = process.argv[2], arg = process.argv[3];\n` +
+    `if (sub === 'callgraph') { process.stdout.write(arg + '\\n  \\u2190 called by: someCaller (src/x.rs:3)\\n'); process.exit(0); }\n` +
+    `process.stdout.write('src/foo.rs:7  fn ' + arg + '()\\n  → module src/foo.rs (lines 1-9)\\n');`);
+  const cmd = `echo "x" && grep -rn "${uniq}" src/`;
+  try {
+    const res = runHook(cmd, fixture, {}, undefined, 'src/foo.rs:7:  other');
+    assert.match(JSON.parse(res.stdout).hookSpecificOutput.additionalContext, /Cross-file call graph/);
   } finally {
     cleanupFixture(fixture, cmd);
   }

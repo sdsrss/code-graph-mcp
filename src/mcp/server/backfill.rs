@@ -191,8 +191,8 @@ impl McpServer {
     }
     /// Claim the `embedding_in_progress` flag and run [`Self::run_unembedded_backfill`]
     /// to completion, releasing the flag on return — and on unwind, via the drop guard
-    /// (release builds use `panic = "abort"`, where a panic ends the process and resets
-    /// the in-memory flag regardless). No-ops if a backfill is already running. Blocks
+    /// (the release profile keeps the default `panic = "unwind"`; see Cargo.toml). No-ops
+    /// if a backfill is already running. Blocks
     /// the caller, so it must be
     /// invoked on a background thread (the embedding thread, or the startup-index
     /// thread once its own work is committed and the indexing flag is clear).

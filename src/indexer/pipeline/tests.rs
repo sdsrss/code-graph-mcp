@@ -15148,6 +15148,44 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
             "#[cfg(unix)]\nfn h() {}\n#[cfg(windows)]\nfn h() {}\nfn c() {\n    h();\n}\n",
             &["c@5 -> h@2", "c@5 -> h@4"],
         ),
+        // Pre-tag review of 0.185.0, M3: a block-scoped definition is seen only
+        // inside its block. A JS `const`/`let` and a Rust item in a nested
+        // block get that block; a JS `function` declaration in a nested block
+        // (hoisted out of it in sloppy code) narrows nothing; a `var` keeps
+        // its function.
+        (
+            "js: a block-local const does not shadow outside its block",
+            "a.js",
+            "function send(x) { return x; }\nfunction handler(req) {\n  if (req.a) {\n    \
+             const send = (y) => y;\n    send(1);\n  }\n  return send(2);\n}\n",
+            &["handler@2 -> send@1", "handler@2 -> send@4"],
+        ),
+        (
+            "ts: a const in a catch block",
+            "a.ts",
+            "function send(x: number): number { return x; }\nfunction h(): number {\n  try {\n    \
+             return 1;\n  } catch {\n    const send = (y: number): number => y;\n    send(1);\n  }\n  \
+             return send(2);\n}\n",
+            &["h@2 -> send@1", "h@2 -> send@6"],
+        ),
+        (
+            "js: a function declaration in a block narrows nothing",
+            "a.js",
+            "function f() {}\nfunction g(x) {\n  if (x) {\n    function f() {}\n    f();\n  }\n  f();\n}\n",
+            &["g@2 -> f@1", "g@2 -> f@4"],
+        ),
+        (
+            "js: a var in a block is the function's",
+            "a.js",
+            "function k() {}\nfunction h(x) {\n  if (x) {\n    var k = () => 1;\n  }\n  return k();\n}\n",
+            &["h@2 -> k@4"],
+        ),
+        (
+            "rs: an item in a nested block",
+            "src/lib.rs",
+            "fn h() {}\nfn a(x: bool) {\n    if x {\n        fn h() {}\n        h();\n    }\n    h();\n}\n",
+            &["a@2 -> h@1", "a@2 -> h@4"],
+        ),
         // A JS/TS bare call never reaches a class or object member, so once it
         // sees a lexical definition a same-named method is no candidate either.
         (
@@ -15375,6 +15413,164 @@ fn d714_barrel_edges(db: &Database) -> Vec<String> {
                 && !e.contains("--contains-->")
         })
         .collect()
+}
+
+/// Pre-tag review of 0.185.0, H1: an edit of a barrel alone (no definition
+/// added or removed anywhere) moves what its importers bind, as a rebuild
+/// shows. The importers were never re-extracted, so they kept the old target
+/// for good.
+#[test]
+fn a_barrel_only_edit_rebinds_its_importers_as_a_rebuild_does() {
+    let crud = (
+        "crud.js",
+        "export function init() { return 1; }\nexport function get() { return 1; }\n",
+    );
+    let crud2 = (
+        "crud2.js",
+        "export function init() { return 2; }\nexport function get() { return 2; }\n",
+    );
+    let other = ("other.js", "export function init() { return 3; }\n");
+    let decoy = (
+        "helper.test.js",
+        "function init() { return 4; }\nexport function t() { return init(); }\n",
+    );
+    let app = ("app.js", "import { init, get } from './index.js';\nexport function main() { return init() + get(); }\n");
+    #[allow(clippy::type_complexity)]
+    let cases: &[(&str, Vec<(&str, &str)>, Vec<(&str, Option<&str>)>)] = &[
+        (
+            "named re-export retargeted",
+            vec![
+                crud,
+                crud2,
+                decoy,
+                app,
+                ("index.js", "export { init, get } from './crud.js';\n"),
+            ],
+            vec![(
+                "index.js",
+                Some("export { init, get } from './crud2.js';\n"),
+            )],
+        ),
+        (
+            "the middle of a two-hop chain retargeted",
+            vec![
+                crud,
+                crud2,
+                decoy,
+                app,
+                ("index.js", "export { init, get } from './mid.js';\n"),
+                ("mid.js", "export { init, get } from './crud.js';\n"),
+            ],
+            vec![("mid.js", Some("export { init, get } from './crud2.js';\n"))],
+        ),
+        (
+            "a barrel gains a re-export",
+            vec![
+                crud,
+                other,
+                app,
+                ("index.js", "export { get } from './crud.js';\n"),
+            ],
+            vec![("index.js", Some("export { init, get } from './crud.js';\n"))],
+        ),
+        (
+            "a barrel loses a re-export",
+            vec![
+                crud,
+                other,
+                app,
+                ("index.js", "export { init, get } from './crud.js';\n"),
+            ],
+            vec![("index.js", Some("export { get } from './crud.js';\n"))],
+        ),
+        (
+            "an export * source swapped",
+            vec![
+                crud,
+                crud2,
+                decoy,
+                app,
+                ("index.js", "export * from './crud.js';\n"),
+            ],
+            vec![("index.js", Some("export * from './crud2.js';\n"))],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, before, after) in cases {
+        let (project, _d, db) = fresh_index_of(before);
+        let mut tree: Vec<(String, String)> = before
+            .iter()
+            .map(|(p, b)| (p.to_string(), b.to_string()))
+            .collect();
+        for (path, body) in after {
+            tree.retain(|(p, _)| p != path);
+            let b = body.expect("edits only");
+            fs::write(project.path().join(path), b).unwrap();
+            tree.push((path.to_string(), b.to_string()));
+        }
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+        let (_p2, _d2, control) = fresh_index_of(&files);
+        let (got, want) = (edge_set(&db), edge_set(&control));
+        if got != want {
+            let only_inc: Vec<_> = got.iter().filter(|e| !want.contains(e)).collect();
+            let only_full: Vec<_> = want.iter().filter(|e| !got.contains(e)).collect();
+            failures.push(format!(
+                "{label}: incremental only {only_inc:?}, rebuild only {only_full:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Pre-tag review of 0.185.0, M2: the re-export walk counted every file it
+/// visited, so a barrel with eight or more `export *` sources stopped before
+/// the ninth and the import fell back to a same-named function elsewhere. The
+/// bound is on depth.
+#[test]
+fn a_wide_export_star_barrel_is_followed_past_eight_sources() {
+    let mut tree: Vec<(String, String)> = (1..=10)
+        .map(|i| {
+            (
+                format!("m{i}.js"),
+                format!("export function f{i}() {{ return {i}; }}\n"),
+            )
+        })
+        .collect();
+    tree.push((
+        "m9.js".into(),
+        "export function init() { return 9; }\nexport function get() { return 9; }\n".into(),
+    ));
+    tree.retain(|(p, b)| p != "m9.js" || b.contains("init"));
+    let barrel: String = (1..=10)
+        .map(|i| format!("export * from './m{i}.js';\n"))
+        .collect();
+    tree.push(("index.js".into(), barrel));
+    tree.push((
+        "helper.js".into(),
+        "export function init() { return 0; }\n".into(),
+    ));
+    tree.push((
+        "app.js".into(),
+        "import { init, get } from './index.js';\nexport function main() { return init() + get(); }\n".into(),
+    ));
+    let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    let (_p, _d, db) = fresh_index_of(&files);
+    let got: Vec<String> = edge_set(&db)
+        .into_iter()
+        .filter(|e| e.starts_with("app.js."))
+        .collect();
+    for want in [
+        "app.js.<module> --imports--> m9.js.init",
+        "app.js.main --calls--> m9.js.init",
+        "app.js.main --calls--> m9.js.get",
+    ] {
+        assert!(got.iter().any(|e| e == want), "missing {want}\n{got:#?}");
+    }
+    assert!(
+        !got.iter().any(|e| e.contains("helper.js")),
+        "fell back to a namesake\n{got:#?}"
+    );
 }
 
 #[test]

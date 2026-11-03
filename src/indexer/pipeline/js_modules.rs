@@ -19,6 +19,14 @@ use std::collections::{HashMap, HashSet};
 /// TypeScript-first resolution order (a `.ts` next to a stale `.js` wins).
 const JS_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
 
+/// Whether `path` has an extension [`resolve_js_specifier_path`] resolves to.
+pub(super) fn is_js_module_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| JS_EXTENSIONS.contains(&e))
+}
+
 /// Resolve a relative ES module specifier to the indexed file it refers to.
 /// Returns the normalized repo-relative file path present in `file_set`, trying
 /// `<base>`, `<base>.<ext>`, then `<base>/index.<ext>`. None for bare specifiers
