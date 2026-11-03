@@ -1353,18 +1353,11 @@ fn test_python_call_on_a_module_level_class_binds_the_mro_owner() {
             "m",
             None,
         ),
+        // Spelled mangled, the method names a def the index calls `__m`.
         (
             "a mangled name spelled out",
             "class B:\n    def _C__m(self): pass\nclass C(B):\n    def __m(self): pass\nclass A:\n    def run(self):\n        C._C__m(self)\n",
             "_C__m",
-            Some("C"),
-        ),
-        // A module-level read before the class statement sees the star
-        // import's `C`, not this class.
-        (
-            "a call before the class statement",
-            "from ext import *\nC.m(None)\nclass C:\n    def m(self): pass\n",
-            "m",
             None,
         ),
         (

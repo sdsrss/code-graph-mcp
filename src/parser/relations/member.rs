@@ -1206,10 +1206,12 @@ pub(super) fn python_class_call_meta(call: tree_sitter::Node, source: &str) -> O
     }
     let (class, method) = (node_text(&object, source), node_text(&method, source));
     // Python mangles a `__x` name in a class body (`C.__m` is `C._A__m` inside
-    // class `A`, and `def __m` in C is `_C__m`): it is not the name written.
+    // class `A`, and `def __m` in C is `_C__m`): it is not the name written,
+    // and a method spelled mangled (`_C__m`) names a def the index calls `__m`.
     if [class, method]
         .iter()
         .any(|n| n.starts_with("__") && !n.ends_with("__"))
+        || (method.starts_with('_') && !method.starts_with("__") && method[1..].contains("__"))
     {
         return None;
     }
@@ -1253,8 +1255,9 @@ struct PyClass {
     /// walrus in a `def`'s, a lambda's or a nested class's header
     /// ([`py_header_walrus`]), a name `__slots__` lists.
     other: HashSet<String>,
-    /// The body may bind names nothing above shows: it calls `locals`, `vars`,
-    /// `exec` or `eval`, or sets `__slots__` to anything but string literals.
+    /// The body may bind names nothing above shows: it names `locals`, `vars`,
+    /// `exec` or `eval` (in a statement or a header), or sets `__slots__` to
+    /// anything but string literals.
     opaque: bool,
 }
 
@@ -1603,24 +1606,13 @@ fn py_class_names(root: tree_sitter::Node, source: &str) -> PyClasses {
     // the nearest ancestor at or above `i` that is no container.
     let mut ancestors: Vec<tree_sitter::Node> = Vec::new();
     let mut tops: Vec<usize> = Vec::new();
-    // `fns[i]`: how many of `ancestors[..=i]` are a def or a lambda.
-    let mut fns: Vec<usize> = Vec::new();
     let mut cursor = root.walk();
     loop {
         let node = cursor.node();
         match node.kind() {
             "identifier" => {
                 let name = node_text(&node, source);
-                let mut candidate = defs.contains_key(name) && !rejected.contains(name);
-                // Run while the module loads, before the class statement: the
-                // name is still a star import's (or unbound).
-                if candidate
-                    && fns.last().copied().unwrap_or(0) == 0
-                    && defs[name].first().is_some_and(|&at| node.start_byte() < at)
-                {
-                    rejected.insert(name.to_string());
-                    candidate = false;
-                }
+                let candidate = defs.contains_key(name) && !rejected.contains(name);
                 if candidate || roots.contains(name) {
                     let read = py_class_name_is_read(node, &ancestors, &tops, &module_defs);
                     if !read {
@@ -1656,10 +1648,9 @@ fn py_class_names(root: tree_sitter::Node, source: &str) -> PyClasses {
                 if let (Some(class), Some(def), false) =
                     (class, node.child_by_field_name("name"), direct)
                 {
-                    let class = node_text(&class, source);
                     state.nested.insert((
-                        class.to_string(),
-                        py_mangle(class, node_text(&def, source).to_string()),
+                        node_text(&class, source).to_string(),
+                        node_text(&def, source).to_string(),
                     ));
                 }
             }
@@ -1672,8 +1663,6 @@ fn py_class_names(root: tree_sitter::Node, source: &str) -> PyClasses {
             } else {
                 i
             });
-            let scope = matches!(node.kind(), "function_definition" | "lambda") as usize;
-            fns.push(fns.last().copied().unwrap_or(0) + scope);
             ancestors.push(node);
             continue;
         }
@@ -1697,7 +1686,6 @@ fn py_class_names(root: tree_sitter::Node, source: &str) -> PyClasses {
             }
             ancestors.pop();
             tops.pop();
-            fns.pop();
         }
     }
 }
@@ -1864,28 +1852,11 @@ fn py_class_shape(class: tree_sitter::Node, source: &str) -> PyClass {
             shape.other.insert(name);
         }
     }
-    // Python stores a `__x` the body binds as `_C__x`.
-    if let Some(name) = class.child_by_field_name("name") {
-        let class = node_text(&name, source);
-        shape.methods = shape.methods.drain().map(|n| py_mangle(class, n)).collect();
-        shape.other = shape.other.drain().map(|n| py_mangle(class, n)).collect();
-    }
     shape
 }
 
 /// Builtins through which a class body can bind names its text does not show.
 const PY_NAMESPACE_WRITERS: [&str; 4] = ["locals", "vars", "exec", "eval"];
-
-/// `name` as class `class`'s body stores it: a `__x` (not `__x__`) becomes
-/// `_C__x`, the class name's leading underscores dropped.
-fn py_mangle(class: &str, name: String) -> String {
-    let stem = class.trim_start_matches('_');
-    if name.starts_with("__") && !name.ends_with("__") && !stem.is_empty() {
-        format!("_{stem}{name}")
-    } else {
-        name
-    }
-}
 
 /// For a class-body statement `__slots__ = …`: Some(the names it lists) when
 /// the value is a string or a tuple / list / set of strings, Some(None) for

@@ -27,8 +27,7 @@ that class:
   after it, and every other occurrence of its name is one the parser
   recognises as a read: a call, an argument or base class, an attribute, an
   annotation, an assignment's value, an operand, `except C`, `case C()`, and
-  so on. None of those reads runs at module level before the class statement
-  (where `C` is still a star import's).
+  so on.
 - Every base in `C`'s hierarchy is such a class of the file, defined above
   the class that names it, or an import, a builtin, `object`, or a dotted or
   subscripted name rooted at one of those (`mod.Base`, `Generic[T]`; `class
@@ -39,9 +38,11 @@ that class:
   classes of the file that move the MRO.
 - No metaclass of the file in the hierarchy (its `__new__`, `__prepare__` or
   `__init__` can drop `m`) and no two metaclasses; one from outside the file
-  is taken to answer nothing before the class's body does. No class keyword
-  other than `metaclass=` (it goes to `__init_subclass__`) and no `**kw`. No
-  class of the MRO has `__bases__` or `__class__` assigned.
+  is taken to leave the class's names alone and to answer nothing first (no
+  data descriptor or `__getattribute__`, no `__new__` or `__prepare__` that
+  drops `m`). No class keyword other than `metaclass=` (it goes to
+  `__init_subclass__`) and no `**kw`. No class of the MRO has `__bases__` or
+  `__class__` assigned.
 - `m` is found before an import, a builtin or `object` in the MRO. No class
   on the way binds it any other way (a class attribute, a second `def`, a
   `def` under `if`, a name `__slots__` lists, a walrus in a decorator, a
@@ -49,9 +50,9 @@ that class:
   `vars()`, `exec` or `eval` (in the body or a header) or a computed
   `__slots__`. The file has no `C.m = …` or `del C.m` on any of them
   (parenthesised or starred too), and the owner has no `def m` nested in
-  another of its methods (the index names that one `C.m` as well). A name
-  Python mangles is compared mangled (`def __m` in `C` is `C._C__m`); a call
-  spelled `C.__m` is left undecided.
+  another of its methods (the index names that one `C.m` as well). A method
+  name Python mangles, or one spelled mangled (`C.__m`, `C._C__m`), leaves the
+  call undecided.
 - The MRO, `object` aside, is at most 64 classes long, and Python accepts it:
   an inconsistent order (`class C(object, A)`) or a duplicate base leaves the
   call undecided.
@@ -62,26 +63,31 @@ Any other call resolves as before, an `m` from an imported base, a builtin
 What the rule does not see, so a decided call can still name a method Python
 does not run (each reproduced): `C.m` replaced or removed through another
 name (`E = C; E.m = f`), by `setattr` or `delattr`, `globals()["C"].m = …`,
-`exec` (also reached as `builtins.exec`), from another module (`a.C.m = f`),
-by a base's `__init_subclass__` (`cls.m = …`) or by a descriptor's
-`__set_name__`; the class name rebound through `globals()` or
-`sys.modules`; an imported metaclass with a data descriptor named `m`; a
+`exec` (also reached as `builtins.exec` or another name, `run = exec`), a
+frame (`sys._getframe(1).f_locals`), from another module (`a.C.m = f`), by a
+base's `__init_subclass__` (`cls.m = …`) or by a descriptor's
+`__set_name__`; `__bases__` replaced by `setattr` or through another name;
+the class name rebound through `globals()` or `sys.modules`; an imported
+metaclass with a data descriptor named `m`, or whose `__new__` drops it; a
+read of `C` that runs before its class statement (a default value, a lambda
+default, `C`'s own body), where a star import or a builtin supplies `C`; a
 class Python refuses for how its imported bases relate (`C(E1, E2)` with
 `E2` deriving from `E1`) or for their instance layout; a module that fails to
 import before the call could run (another class Python refuses, a statement
 that raises). In each of these the old resolution bound the same method,
 among the other same-named ones. Where the method Python runs is another `m`
-of the same file (after `delattr`, a rebinding of the class name,
-`builtins.exec`, a descriptor's `__set_name__`), the old resolution had that
-edge too, and this one drops it.
+of the same file (after `delattr`, a rebinding of the class name or of
+`__bases__`, an `exec` or a frame write, a descriptor's `__set_name__`, an
+imported metaclass's `__new__`), the old resolution had that edge too, and
+this one drops it.
 
 Measured against 0.182.0's source build:
 
 - 15,000 generated files (`tasks/d370g-kit/enum`: base kinds × hierarchy
   shapes × metaclasses × body bindings × patches), each run by CPython 3.14:
-  of the 805 calls the rule decided in files that import, 719 bound the
-  method CPython ran; the other 86 all had `C.m` replaced through another
-  name (44) or by `setattr` (42). Another 308 decided calls sit in files
+  of the 927 calls the rule decided in files that import, 834 bound the
+  method CPython ran; the other 93 all had `C.m` replaced through another
+  name (46) or by `setattr` (47). Another 358 decided calls sit in files
   CPython refuses to import. Every undecided call kept 0.182.0's edges and
   pending rows byte for byte.
 - SCIP call oracle (`scripts/scip_oracle`), edges at the default `inferred`
@@ -99,15 +105,15 @@ Measured against 0.182.0's source build:
   of which calls it. It now finds no caller and says so (`Risk: UNKNOWN` with
   the not-in-the-call-graph warning).
 - Full index of the standard library (569 files, `--no-embed`, 9 interleaved
-  runs each, at load average 4–9 from other work): user CPU median 5.35 s →
-  5.53 s (+3.4%; the median of the 9 paired ratios is +2.8%), wall 3.28 s →
-  3.24 s. An incremental run after a class-structure edit re-reads the same
-  caller files as before (tkinter `Widget.__init__` toggled 4 times).
+  runs each): user CPU median 5.44 s → 5.51 s (+1.3%; the 9 paired ratios
+  range from −0.4% to +3.8%), wall 3.37 s → 3.29 s. An incremental run after
+  a class-structure edit re-reads the same caller files as before (tkinter
+  `Widget.__init__` toggled 4 times).
 - Files near the 1 MiB size cap built to stress the rule, user CPU (peak
-  memory where it was the cost): 340,000 duplicate bases 1.92 s → 2.17 s;
-  200,000 nested lists naming the class 0.61 s → 0.76 s; 3,000 classes with
-  62 bases each 9.68 s → 7.23 s; a chain of 25,758 classes, each with its own
-  metaclass, 3.31 s and 132 MB → 3.58 s and 162 MB.
+  memory where it was the cost): 340,000 duplicate bases 1.82 s → 2.11 s;
+  200,000 nested lists naming the class 0.58 s → 0.75 s; 3,000 classes with
+  62 bases each 8.9 s → 5.9 s; a chain of 25,758 classes, each with its own
+  metaclass, 3.16 s and 132 MB → 3.66 s and 162 MB (medians of 3).
 
 ## 0.182.0
 

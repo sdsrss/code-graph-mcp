@@ -4,8 +4,7 @@ The scripts, parity scenarios and review case files of `/var/tmp/d370`, kept
 for the redesign before that directory was deleted. The first design was
 withdrawn after three review rounds (its code is on branch
 `d370g-py-class-call`); the redesign (185f4ce8 and the 0.183.0 pre-tag review
-repairs) was checked first against CPython with `enum/` and shipped in
-0.183.0. The spec with every review round is
+repairs) was checked first against CPython with `enum/`, for release 0.183.0. The spec with every review round is
 `tasks/specs/d370g-py-class-qualified-call.md`.
 
 `enum/`: `gen.py SEED N OUT` generates one-call files, `truth.py` runs each with
