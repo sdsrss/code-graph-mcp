@@ -16,6 +16,9 @@ prints which `go` that one call ran.
 import json, os, random, sys
 
 OUT, N, SEED = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+# A fourth argument `alias` gives every case one patch through another name
+# (review round 2): an alias, a parameter, a container.
+ONLY_ALIAS = len(sys.argv) > 4 and sys.argv[4] == "alias"
 rnd = random.Random(SEED)
 LIB = {
     "ext.py": 'def go():\n    print("EXT")\n\nclass sub:\n    go = staticmethod(go)\n\nclass C:\n    go = staticmethod(go)\n    sub = sub\n',
@@ -65,6 +68,9 @@ OCC = [
     ("read", "_s = f'{R}'"), ("read", "assert R"), ("read", "_t = R.sub"),
     ("read", "def _p(x=R.sub):\n    return x"), ("read", "_i = isinstance(1, (R.sub,))"),
     ("read", "if R and not R:\n    pass"),
+    ("alias", "_a = R\n_a.go = go"), ("alias", "_a = R\n_a.sub.go = go"),
+    ("alias", "def _w(m):\n    m.go = go\n_w(R)"), ("alias", "def _w(m):\n    m.sub.go = go\n_w(R)"),
+    ("alias", "_box = [R]\n_box[0].go = go"),
     ("dyn", "setattr(R, 'go', go)"), ("dyn", "vars(R)['go'] = go"),
     ("dyn", "globals()['R'] = Local"),
 ]
@@ -82,8 +88,10 @@ def case(i):
     call = rnd.choice(calls)
     me = f"c{i:05d}"
     imp, R, call = imp.replace("SELF", me), R.replace("SELF", me), call.replace("SELF", me)
+    picked = ([rnd.choice([o for o in OCC if o[0] == "alias"])] if ONLY_ALIAS
+              else rnd.sample(OCC, rnd.choice([0, 1, 1, 2])))
     occ = [(k, s.replace("R", R) if R != "R" else s, rnd.choice(["mod", "main", "fn"]))
-           for k, s in rnd.sample(OCC, rnd.choice([0, 1, 1, 2]))]
+           for k, s in picked]
     # `R` inside templates is the placeholder; protect identifiers containing R.
     src = imp + "\n" + PRE
     main_pre = []

@@ -49,33 +49,34 @@ after `alias = ext`, `mod.go = go` in a function handed `ext`), and a direct
 `ext.go()` call on a name that holds one plain-imported module everywhere in
 the file (since 0.176.0 it binds what `from ext import go` would).
 
-Measured against 0.183.0: the Python standard library loses 517 call edges
-(497 caller–callee pairs), nltk 3.9.2 170 (158) and flask 7, all same-file;
+Measured against 0.183.0: the Python standard library loses 490 call edges
+(470 caller–callee pairs), nltk 3.9.2 167 (155) and flask 3, all same-file;
 hono, leveldb, cobra and gin keep every edge, and no edge is added or
 relabelled on any of the seven. On the standard library the
 SCIP oracle's default floor (`extracted` + `inferred`) goes from 10,996 of
-14,329 judged edges correct (76.7%) to 10,971 of 13,879 (79.0%): 2,908 wrong
+14,329 judged edges correct (76.7%) to 10,971 of 13,902 (78.9%): 2,931 wrong
 edges instead of 3,333. The 25 correct pairs it loses, and the 5 gold calls
 its recall loses, are all explicit base-class calls (`logging.Handler.close(self)`,
 `Widget.destroy(self)`) that the oracle credits to a subclass override in the
 caller's file; Python runs the base class's method there. 54 standard-library
 definitions whose only recorded callers were such calls now show no caller.
-A full standard-library index took 2.2–2.9% more CPU time (two interleaved
+A full standard-library index took 3.0–3.7% more CPU time (two interleaved
 batches of five runs).
 
 ### Not covered
 
 - A name rebound or patched at run time: `setattr(ext, "go", go)`,
   `globals()["ext"] = …`, `vars(ext)["go"] = go`, `ext.__dict__["go"] = go`,
-  `mock.patch`, `sys.modules`, `exec`. On 8,989 generated files run under
-  CPython (a third of the last 2,994 inside a package, importing it), every
-  call the new rule stopped binding while Python ran the file's own `go` used
-  one of the first three.
+  `mock.patch`, `sys.modules`, `exec`. On 11,588 generated files run under
+  CPython (1,973 of them inside a package they import, 600 patching the
+  module through another name), every call the new rule stopped binding
+  while Python ran the file's own `go` used one of the first three.
 - A module that hands the caller's own definition back: `os.path.join`
   called inside `posixpath.py`, nltk's `chunk/util.py` calling
   `nltk.chunk.tagstr2tree`, which `nltk/chunk/__init__.py` imports from it,
-  or nltk's `framenet.py` calling `fn.frames()` through the corpus loader
-  `from nltk.corpus import framenet as fn` (11 such edges in nltk 3.9.2).
+  or the `demo()` functions of nltk's `framenet.py` and `lin.py`, which reach
+  their own file's reader through `nltk.corpus`'s lazy loader (`from
+  nltk.corpus import framenet as fn`, then `fn.frames()`; 11 edges).
 - A direct `ext.go()` call on a name that holds one plain-imported module
   everywhere in the file, where `from ext import go` would find nothing, keeps
   its bind into the caller's file (15 wrong edges at the default floor in the
