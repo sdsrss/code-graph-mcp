@@ -54,8 +54,8 @@ function cwdHash(cwd) {
 // other. Flag paths are byte-identical to what each hook wrote before.
 //
 // pre-read-guide.js is deliberately NOT folded in: its `.code-graph-readfan-*`
-// file is a JSON state document keyed on the cwd alone, not a per-command
-// cooldown flag — same directory, different thing.
+// file is a JSON state document keyed on the cwd and session, not a
+// per-command cooldown flag — same directory, different thing.
 function makeCooldown(prefix) {
   const commandHash = (cmd) =>
     crypto.createHash('sha1').update(String(cmd)).digest('hex').slice(0, 12);

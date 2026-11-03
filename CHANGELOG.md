@@ -45,6 +45,21 @@ loses the call whatever its name, a separate defect. `impact get --file
 frontend/src/api/request.ts` there went from "0 callers, Risk: UNKNOWN" to 56
 direct callers.
 
+### change: a directory overview goes to the agent that read five files of it
+
+After five distinct source files of one directory are read, the Read hook (and
+a `sed -n` range read) adds that directory's overview to the context. The count
+was kept per project, so every session, subagent and worktree of it added to
+one count, and the overview went to whichever read crossed it. It is now kept
+per session and, within a session, per subagent (the `agent_id` Claude Code
+puts on a subagent's tool events), falling back to per project when the hook
+input names neither.
+
+Replaying 1,348 source reads from two weeks of sessions (29 sessions, 99
+transcripts of which 70 are subagents') through both rules: 19 overviews before, 7 of them to a context
+that had not read five files of the directory itself (a parent and its
+subagents adding up); 14 after, each to the context that did.
+
 ### fix: the startup repair runs without waiting for a tool call
 
 The MCP server's startup repair reaps orphan vectors, compacts the vector

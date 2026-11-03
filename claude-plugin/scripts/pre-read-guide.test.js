@@ -40,7 +40,7 @@ const {
   buildHintWithAnswer, isSilenced, isAnswerDisabled,
   trackReadAndMaybeHint,
   FANOUT_THRESHOLD, STATE_TTL_MS,
-  loadState, saveState, statePath,
+  loadState, saveState, statePath, readerOf,
 } = require('./pre-read-guide');
 
 // ── isSourceFile ────────────────────────────────────────────────────
@@ -337,6 +337,79 @@ test('D5: no fan-out hint while the startup index is being written, and the dir 
     if (oldEnv === undefined) delete process.env._CG_ANSWER_BINARY;
     else process.env._CG_ANSWER_BINARY = oldEnv;
     fs.rmSync(statePath(root), { force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// D#713: the count is per session. Keyed on the project alone, every session
+// and worktree of it added to one count, and the overview went to whichever
+// read crossed it: in the 2026-11-03 audit, 7 of 27 overviews reached the
+// session that had fanned out.
+test('trackReadAndMaybeHint: another session\'s reads do not add up (D#713)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-sessions-'));
+  const stub = path.join(root, 'stub.js');
+  fs.writeFileSync(stub, '#!/usr/bin/env node\nprocess.stdout.write("Module overview stub: 3 symbols\\n");');
+  fs.chmodSync(stub, 0o755);
+  const oldEnv = process.env._CG_ANSWER_BINARY;
+  process.env._CG_ANSWER_BINARY = stub;
+  fs.mkdirSync(path.join(root, '.code-graph'), { recursive: true });
+  const now = Date.now();
+  try {
+    for (let i = 0; i < FANOUT_THRESHOLD; i++) {
+      assert.equal(trackReadAndMaybeHint(root, 'src/storage/file' + i + '.rs', now, 'sess-A'), null);
+    }
+    assert.equal(trackReadAndMaybeHint(root, 'src/storage/other.rs', now, 'sess-B'), null,
+      "sess-B's first read of the dir");
+    assert.match(String(trackReadAndMaybeHint(root, 'src/storage/file9.rs', now, 'sess-A')),
+      /Module overview stub/, "sess-A's fifth read of the dir");
+  } finally {
+    if (oldEnv === undefined) delete process.env._CG_ANSWER_BINARY;
+    else process.env._CG_ANSWER_BINARY = oldEnv;
+    for (const s of ['sess-A', 'sess-B']) fs.rmSync(statePath(root, s), { force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('readerOf: the session, and the subagent within it (D#713)', () => {
+  assert.equal(readerOf({ session_id: 'sess-A' }), 'sess-A');
+  assert.equal(readerOf({ session_id: 'sess-A', agent_id: 'a1' }), 'sess-A/a1');
+  assert.equal(readerOf({}), null);
+  assert.equal(readerOf(null), null);
+  assert.notEqual(statePath('/p', 'sess-A/a1'), statePath('/p', 'sess-A'));
+  assert.equal(statePath('/p', null), statePath('/p'));
+  // A reader key is stdin from the harness: never a path segment as given.
+  assert.equal(path.dirname(statePath('/p', '../../etc/x')), path.dirname(statePath('/p')));
+});
+
+test('hook entry: the Read hook counts the session and subagent its input names (D#713)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'readfan-main-sess-'));
+  fs.mkdirSync(path.join(root, '.code-graph'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.code-graph', 'index.db'), '');
+  const stub = path.join(root, 'stub.js');
+  fs.writeFileSync(stub, '#!/usr/bin/env node\nprocess.stdout.write("Module overview stub: 3 symbols\\n");');
+  fs.chmodSync(stub, 0o755);
+  const read = (ids) => require('child_process').spawnSync(process.execPath, [path.join(__dirname, 'pre-read-guide.js')], {
+    cwd: root,
+    input: JSON.stringify({ ...ids, tool_input: { file_path: path.join(root, 'src', 'storage', 'db.rs') } }),
+    encoding: 'utf8',
+    env: { ...process.env, _CG_ANSWER_BINARY: stub, CODE_GRAPH_QUIET_HOOKS: '0', CODE_GRAPH_NO_ANSWER_IN_DENY: '0' },
+  });
+  try {
+    const state = loadState(root, Date.now(), 'sess-A');
+    for (let i = 0; i < FANOUT_THRESHOLD; i++) recordRead(state, 'src/storage');
+    saveState(root, state, 'sess-A');
+    const b = read({ session_id: 'sess-B' });
+    assert.equal(b.status, 0, b.stderr);
+    assert.equal(b.stdout.trim(), '', "sess-B's first read of the dir");
+    // A subagent's hooks get the parent's session_id, and its own agent_id.
+    const sub = read({ session_id: 'sess-A', agent_id: 'a1', agent_type: 'Explore' });
+    assert.equal(sub.status, 0, sub.stderr);
+    assert.equal(sub.stdout.trim(), '', "the subagent's first read of the dir");
+    const a = read({ session_id: 'sess-A' });
+    assert.equal(a.status, 0, a.stderr);
+    assert.match(JSON.parse(a.stdout).hookSpecificOutput.additionalContext, /5\+ Reads into src\/storage\//);
+  } finally {
+    for (const s of ['sess-A', 'sess-B', 'sess-A/a1']) fs.rmSync(statePath(root, s), { force: true });
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

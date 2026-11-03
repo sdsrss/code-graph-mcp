@@ -2294,7 +2294,8 @@ function runMain() {
       if (!readGuide.isSourceFile(t)) continue;
       const abs = path.isAbsolute(t) ? t : path.resolve(shellCwd, t);
       // D#560 — a linked worktree's copy counts toward the indexed directory.
-      const dir = readGuide.trackRead(root, indexKey(root, path.relative(root, abs)));
+      const dir = readGuide.trackRead(
+        root, indexKey(root, path.relative(root, abs)), Date.now(), readGuide.readerOf(input));
       if (dir !== null) firedDirs.push(dir);  // a dir fires once: markHint starts its cooldown
     }
     if (firedDirs.length > 0) {

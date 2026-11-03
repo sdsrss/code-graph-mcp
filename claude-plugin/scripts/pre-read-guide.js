@@ -23,10 +23,16 @@ if (require.main === module) require('./hook-fail-open').installHookFailOpen('Pr
 //   6. The dir has not fired before while its state entry lives
 //   7. The CLI delivers an overview for the dir (no advice-only line)
 //
-// State scoping: per-cwd (NOT per-session). Cost: two concurrent sessions in
-// the same project might share counters and over-trigger by ~1 hint each.
-// Cheaper than threading session_id through hook plumbing, and the hint is
-// skippable. Stale entries (no read in 30 min) get pruned on load.
+// State scoping: per project AND per reader (D#713) — the session, and within
+// it the subagent, as the hook input's session_id and agent_id name them
+// (`readerOf`); per project alone when the input carries neither. Keyed on the
+// project alone, every session, subagent and worktree of it added to one
+// count, and the overview went to whichever read crossed it: replaying era E
+// (tasks/d713-fanout-per-session/replay_fanout.py), 7 of 19 overviews landed in
+// a context that had not read 5 files of the dir itself — a parent and its
+// subagents adding up, since a subagent's hooks get the parent's session_id.
+// Stale entries (no read in 30 min) get pruned on load; SessionStart's
+// pruneCgTmp removes the files a day after their last write.
 //
 // Escape hatch: CODE_GRAPH_QUIET_HOOKS=1 — matches user-prompt-context.js /
 // pre-grep-guide.js convention.
@@ -35,6 +41,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { cgTmpDir } = require('./tmp-dir');
+const { sessionKey } = require('./session-edits');
 const { recordRecommendation } = require('./recommendation-log');
 const { resolveProjectRoot, indexKey, indexBuildInProgress } = require('./project-root');
 const { runOverviewAnswer } = require('./cg-answer');
@@ -73,14 +80,26 @@ function cwdHash(cwd) {
   return crypto.createHash('sha1').update(String(cwd)).digest('hex').slice(0, 12);
 }
 
-function statePath(cwd) {
-  return path.join(cgTmpDir(), `.code-graph-readfan-${cwdHash(cwd)}.json`);
+/// Who is reading, for the fan-out count: the session, and the subagent the
+/// hook fired in (Claude Code sets `agent_id` on a subagent's tool events and
+/// gives it the parent's `session_id`). null when the input names neither.
+function readerOf(input) {
+  const session = (input && input.session_id) || '';
+  const agent = (input && input.agent_id) || '';
+  if (!session && !agent) return null;
+  return agent ? `${session}/${agent}` : session;
 }
 
-function loadState(cwd, now = Date.now()) {
+function statePath(cwd, reader = null) {
+  const key = sessionKey(reader);
+  const suffix = key ? `-${key}` : '';
+  return path.join(cgTmpDir(), `.code-graph-readfan-${cwdHash(cwd)}${suffix}.json`);
+}
+
+function loadState(cwd, now = Date.now(), reader = null) {
   let state;
   try {
-    const raw = fs.readFileSync(statePath(cwd), 'utf8');
+    const raw = fs.readFileSync(statePath(cwd, reader), 'utf8');
     state = JSON.parse(raw);
   } catch { return { by_dir: {} }; }
   if (!state || typeof state !== 'object' || !state.by_dir) return { by_dir: {} };
@@ -94,9 +113,9 @@ function loadState(cwd, now = Date.now()) {
   return state;
 }
 
-function saveState(cwd, state) {
+function saveState(cwd, state, reader = null) {
   try {
-    fs.writeFileSync(statePath(cwd), JSON.stringify(state));
+    fs.writeFileSync(statePath(cwd, reader), JSON.stringify(state));
   } catch { /* ok */ }
 }
 
@@ -163,16 +182,17 @@ function isAnswerDisabled(env = process.env) {
 
 // --- Shared tracking core (also driven by pre-grep-guide's sed-range path) ---
 
-/// Record one read of `rel` (project-root-relative source path). Returns the
-/// dir when this read crossed the fanout threshold (the hint is marked as
-/// delivered), else null. Writes nothing to stdout: a hook's stdout is parsed as
-/// ONE JSON value, so only the entry point may write, and only once.
-function trackRead(root, rel, now = Date.now()) {
+/// Record one read of `rel` (project-root-relative source path) by `reader`
+/// ([`readerOf`]). Returns the dir when this read crossed the fanout threshold
+/// (the hint is marked as delivered), else null. Writes nothing to stdout: a
+/// hook's stdout is parsed as ONE JSON value, so only the entry point may
+/// write, and only once.
+function trackRead(root, rel, now = Date.now(), reader = null) {
   if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
   const dir = path.dirname(rel);
   if (!dir || dir === '.' || dir === '') return null;  // top-level file: not fanout
 
-  const state = loadState(root, now);
+  const state = loadState(root, now, reader);
   recordRead(state, dir, now, rel);
   let fired = false;
   // During the startup build the overview would list part of the dir as the
@@ -181,7 +201,7 @@ function trackRead(root, rel, now = Date.now()) {
     markHint(state, dir, now);
     fired = true;
   }
-  saveState(root, state);
+  saveState(root, state, reader);
   if (!fired) {
     // Outcome proxy: a source read that didn't trip the fanout hint still ran.
     // Record it (best-effort) so `stats` can measure the model's read fan-out —
@@ -231,8 +251,8 @@ function buildFanoutHint(root, dir, { maxBytes } = {}) {
 
 /// trackRead + buildFanoutHint for one read. Returns the hint text when the
 /// hint fired with an overview, else null. The caller emits it.
-function trackReadAndMaybeHint(root, rel, now = Date.now()) {
-  const dir = trackRead(root, rel, now);
+function trackReadAndMaybeHint(root, rel, now = Date.now(), reader = null) {
+  const dir = trackRead(root, rel, now, reader);
   return dir === null ? null : buildFanoutHint(root, dir);
 }
 
@@ -262,7 +282,7 @@ function runMain() {
     rel = indexKey(root, path.relative(root, filePath));
   } catch { return; }
 
-  const hint = trackReadAndMaybeHint(root, rel);
+  const hint = trackReadAndMaybeHint(root, rel, Date.now(), readerOf(input));
   // Emit via the PreToolUse allow+additionalContext envelope (shared
   // hook-emit.js). Bare stdout on a PreToolUse exit-0 lands in the debug log
   // only and never reaches the model (CC docs v2026-06); the additionalContext
@@ -276,7 +296,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  isSourceFile, dirOf, cwdHash, statePath,
+  isSourceFile, dirOf, cwdHash, statePath, readerOf,
   loadState, saveState, recordRead, shouldHint, markHint,
   buildHintWithAnswer, isSilenced, isAnswerDisabled,
   trackReadAndMaybeHint,   // v0.49 — shared with pre-grep-guide's sed-range path

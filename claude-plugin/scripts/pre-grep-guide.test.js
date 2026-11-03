@@ -1515,10 +1515,10 @@ function e2eFixture(stubBody) {
   return { dir, stub };
 }
 
-function runHook(cmd, fixture, cwdOverride) {
+function runHook(cmd, fixture, cwdOverride, ids = {}) {
   const res = spawnHook(process.execPath, [pathE2e.join(__dirname, 'pre-grep-guide.js')], {
     cwd: cwdOverride || fixture.dir,
-    input: JSON.stringify({ tool_input: { command: cmd, description: 'search' } }),
+    input: JSON.stringify({ ...ids, tool_input: { command: cmd, description: 'search' } }),
     encoding: 'utf8',
     env: {
       ...process.env,
@@ -2802,6 +2802,33 @@ test('sed-range fanout: one dir crossing still emits its single envelope', () =>
     assert.doesNotMatch(out.additionalContext, /Reads into tests\//);
     assert.match(out.additionalContext, /overview stub/, 'the overview answer still rides in the envelope');
   } finally {
+    fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+// D#713: the sed path counts per session and subagent, as the Read hook does.
+test('sed-range fanout: another session\'s reads do not add up (D#713)', () => {
+  const readGuide = require('./pre-read-guide');
+  const fixture = e2eFixture('process.stdout.write("overview stub\\n");');
+  const root = resolveProjectRoot(fixture.dir);
+  try {
+    const state = readGuide.loadState(root, Date.now(), 'sess-A');
+    for (let i = 0; i < readGuide.FANOUT_THRESHOLD; i++) readGuide.recordRead(state, 'lib');
+    readGuide.saveState(root, state, 'sess-A');
+
+    const b = runHook('sed -n 1,10p lib/core.js', fixture, undefined, { session_id: 'sess-B' });
+    assert.equal(b.status, 0, b.stderr);
+    assert.equal(b.stdout.trim(), '', "sess-B's first read of lib/");
+    const sub = runHook('sed -n 1,10p lib/core.js', fixture, undefined, { session_id: 'sess-A', agent_id: 'a1' });
+    assert.equal(sub.status, 0, sub.stderr);
+    assert.equal(sub.stdout.trim(), '', "the subagent's first read of lib/");
+    const a = runHook('sed -n 1,10p lib/core.js', fixture, undefined, { session_id: 'sess-A' });
+    assert.equal(a.status, 0, a.stderr);
+    assert.match(JSON.parse(a.stdout).hookSpecificOutput.additionalContext, /5\+ Reads into lib\//);
+  } finally {
+    for (const s of ['sess-A', 'sess-B', 'sess-A/a1']) {
+      fsE2e.rmSync(readGuide.statePath(root || fixture.dir, s), { force: true });
+    }
     fsE2e.rmSync(fixture.dir, { recursive: true, force: true });
   }
 });
