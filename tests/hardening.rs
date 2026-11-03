@@ -4151,7 +4151,7 @@ fn pipeline_and_query_layers_never_begin_their_own_transaction() {
     // The first version of this exemption keyed on the file, because the two
     // legitimate IMMEDIATE sites happened to live in two files. But the
     // justification is about the CALL — "reached only from
-    // `spawn_startup_repair`'s own thread and connection, never from inside
+    // `run_startup_repair`'s own thread and connection, never from inside
     // `rebuild_index`'s transaction" — and a file is not a call. Pre-ship review
     // 2026-09-08 measured the gap: `Transaction::new_unchecked` planted as the
     // first statement of `insert_node_vectors_batch`, which IS reached from

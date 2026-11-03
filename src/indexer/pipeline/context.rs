@@ -156,7 +156,7 @@ pub(super) fn regenerate_context_strings(
 pub fn repair_null_context_strings(db: &Database, model: Option<&EmbeddingModel>) -> Result<usize> {
     let mut total = 0usize;
     // `get_nodes_missing_context` returns one capped page. This used to take a
-    // single page and return, while `spawn_startup_repair` calls this exactly
+    // single page and return, while `run_startup_repair` calls this exactly
     // once per process — so a server that stays up never finished repairing an
     // index holding more NULLs than the cap, and the count logged below (always
     // at or below the cap) never revealed it had been truncated.

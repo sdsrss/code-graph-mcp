@@ -592,11 +592,12 @@ pub fn reap_orphan_vectors(conn: &Connection) -> Result<usize> {
     // lock across enumerate+delete, so a racing writer either committed before our snapshot (its
     // node is seen as live, never enumerated as an orphan) or is serialized after us. vec0 still
     // requires point deletes by primary key, so the enumerate-then-delete shape is unchanged.
-    // `reap_orphan_vectors` has exactly one production caller, `spawn_startup_repair`
-    // (mcp/server/mod.rs), which runs on its own thread with its own connection —
-    // never inside `rebuild_index`'s transaction, so there is no enclosing one to
-    // abort. IMMEDIATE is required here and a SAVEPOINT cannot supply it.
-    // bare-begin-ok: startup-repair thread only; needs IMMEDIATE
+    // `reap_orphan_vectors` has exactly one production caller, `run_startup_repair`
+    // (mcp/server/mod.rs), which runs on a background thread with its own connection
+    // after the startup index has committed — never inside `rebuild_index`'s
+    // transaction, so there is no enclosing one to abort. IMMEDIATE is required here
+    // and a SAVEPOINT cannot supply it.
+    // bare-begin-ok: startup repair only; needs IMMEDIATE
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     // Safety: never sweep against an EMPTY `nodes` table. An empty nodes set is far more likely a
     // transient (mid-rebuild / INDEX_VERSION-bump wipe window) than a real zero-symbol project —

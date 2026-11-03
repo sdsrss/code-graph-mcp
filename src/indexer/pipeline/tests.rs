@@ -5497,7 +5497,7 @@ fn test_python_external_survives_incremental_index() {
 fn test_repair_null_context_strings_drains_past_one_page() {
     // Audit 2026-09-07 CORE-17. `get_nodes_missing_context` caps its result at
     // 10,000 rows; `repair_null_context_strings` took ONE page and returned, and
-    // `spawn_startup_repair` runs it exactly once per process. An index carrying
+    // `run_startup_repair` runs it exactly once per process. An index carrying
     // more than a page of NULL context strings therefore never finished
     // repairing — and the log line prints a count that is always <= the cap, so
     // nothing said it had been truncated. The contract asserted here is the one

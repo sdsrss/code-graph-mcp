@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### fix: the startup repair runs without waiting for a tool call
+
+The MCP server's startup repair reaps orphan vectors, compacts the vector
+table, and prunes the embedding cache. It ran at the first MCP message after
+the startup index. Claude Code's handshake is over before that index is, and
+sessions call code-graph through the CLI, so in those sessions it never ran,
+and every index rebuild left the vector table's old slots allocated. It now
+runs in the startup index's own thread as soon as the index is done, before
+the embedding backfill and serialized with it.
+
+Measured on copies of two real indexes, with a session that sends only the
+handshake:
+
+| Index | Vector slots | `index.db` | Repair took |
+|---|---|---|---|
+| 3,488 vectors, 0.184.0 | 78,848 → 81,920 | 148 → 153 MB | did not run |
+| same, this build | 78,848 → 4,096 | 148 → 32 MB | 0.4 s |
+| 19,912 vectors, current version, this build | 245,760 → 19,456 | 588 → 246 MB | 1.5 s |
+
+An existing index is compacted the next time its MCP server starts. The file
+watcher still starts at the first tool call.
+
 ## 0.184.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 125 → 126

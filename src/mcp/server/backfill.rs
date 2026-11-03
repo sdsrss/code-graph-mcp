@@ -46,6 +46,16 @@ pub(super) enum BackfillOutcome {
     /// (D1). Learned nothing about embeddability: the floor stays.
     Yielded,
 }
+
+/// Clears the `embedding_in_progress` flag on drop, so an early return or a panic
+/// releases it.
+struct FlagGuard<'a>(&'a AtomicBool);
+impl Drop for FlagGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Decide the periodic backfill driver's next `(floor, stall_retries)` from one
 /// drain attempt's [`BackfillOutcome`] and the freshly re-measured unembedded count.
 ///
@@ -200,25 +210,53 @@ impl McpServer {
         if in_progress.swap(true, Ordering::AcqRel) {
             return None; // a backfill is already running
         }
-        // Drop guard ensures the flag is always cleared, even on panic.
-        struct FlagGuard<'a>(&'a AtomicBool);
-        impl Drop for FlagGuard<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
+        let _guard = FlagGuard(in_progress);
+        Some(Self::run_backfill_reporting_errors(
+            db_path,
+            yield_requested,
+        ))
+    }
+
+    /// The startup repair, then the backfill, under one claim of `in_progress`
+    /// (D#711). Blocks the caller: the startup-index thread once its index is
+    /// committed, or the thread `spawn_startup_repair` starts.
+    ///
+    /// The repair writes outside the yield protocol, and beside a backfill or an
+    /// incremental it fails them with `SQLITE_BUSY_SNAPSHOT`. While it holds the
+    /// flag a backfill skips and an incremental waits for it, as they do for a
+    /// backfill. The claim carries on into the backfill, so no other backfill can
+    /// start in between, beside an incremental that was waiting for the flag.
+    ///
+    /// It waits for the flag instead of skipping: the holder is a backfill (the
+    /// periodic driver ticks during a startup index longer than its period), and
+    /// a skipped repair has no other trigger in a session that sends no tool call.
+    pub(super) fn run_startup_repair_then_backfill(
+        db_path: &Path,
+        in_progress: &AtomicBool,
+        yield_requested: &AtomicBool,
+    ) {
+        while in_progress.swap(true, Ordering::AcqRel) {
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
         let _guard = FlagGuard(in_progress);
-        match Self::run_unembedded_backfill(db_path, yield_requested) {
-            Ok(outcome) => Some(outcome),
-            Err(e) => {
-                // A hard error (DB open / count query failed) embedded nothing — a
-                // zero-progress stall. Report it that way (not a clean drain) so the driver
-                // bounded-retries instead of pinning the floor on what may be a transient
-                // (e.g. mid-swap) failure.
-                tracing::warn!("[embed-bg] Failed: {}", e);
-                Some(BackfillOutcome::Stalled { progressed: false })
-            }
+        Self::run_startup_repair(db_path);
+        if cfg!(feature = "embed-model") {
+            Self::run_backfill_reporting_errors(db_path, yield_requested);
         }
+    }
+
+    fn run_backfill_reporting_errors(
+        db_path: &Path,
+        yield_requested: &AtomicBool,
+    ) -> BackfillOutcome {
+        Self::run_unembedded_backfill(db_path, yield_requested).unwrap_or_else(|e| {
+            // A hard error (DB open / count query failed) embedded nothing — a
+            // zero-progress stall. Report it that way (not a clean drain) so the driver
+            // bounded-retries instead of pinning the floor on what may be a transient
+            // (e.g. mid-swap) failure.
+            tracing::warn!("[embed-bg] Failed: {}", e);
+            BackfillOutcome::Stalled { progressed: false }
+        })
     }
     /// Embed every node that still lacks a vector, hot-path first, in batches.
     /// Loads its own model + DB connection (EmbeddingModel is `!Send`, so it can't

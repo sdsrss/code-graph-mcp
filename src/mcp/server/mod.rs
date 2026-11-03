@@ -312,7 +312,7 @@ fn take_forced_fk_error() -> bool {
 /// Whether an indexing error is "another connection holds the write path right
 /// now", as opposed to a real failure.
 ///
-/// The server writes from more than one connection (the startup-repair thread,
+/// The server writes from more than one connection (the startup repair,
 /// the embedding backfill, and — after a secondary→primary promotion — the
 /// read-write handle opened at promotion). WAL absorbs most of that through
 /// `busy_timeout`, but a deferred read transaction that must upgrade to a write
@@ -898,11 +898,12 @@ impl McpServer {
                     None
                 };
                 self.spawn_startup_indexing(project_root, has_existing, dir_cache);
-                // The watcher and other post-index services wait for the first tool call
-                // (consume_startup_index_result), but the embedding backfill driver must
-                // run even in a NO-tool-call session — that's exactly when out-of-band
-                // CLI/hook node additions would otherwise strand unembedded. It polls the
-                // DB independently and no-ops while the startup backfill holds the flag.
+                // The watcher waits for the first tool call (consume_startup_index_result);
+                // the index thread runs the startup repair and the backfill. The periodic
+                // backfill driver must also run in a NO-tool-call session — that's exactly
+                // when out-of-band CLI/hook node additions would otherwise strand
+                // unembedded. It polls the DB independently and no-ops while the startup
+                // backfill holds the flag.
                 if cfg!(feature = "embed-model") {
                     self.spawn_periodic_backfill();
                 }
@@ -970,6 +971,7 @@ impl McpServer {
         );
         let embedding_flag = Arc::clone(&self.indexing.embedding_in_progress);
         let embedding_yield = Arc::clone(&self.indexing.embedding_yield);
+        let repair_done = Arc::clone(&self.indexing.startup_repair_done);
         // Kept out of the closure so the spawn-failure path below can still clear
         // the flags the closure's IndexGuard would have cleared.
         let spawn_fail_flag = Arc::clone(&self.indexing.startup_indexing);
@@ -989,8 +991,9 @@ impl McpServer {
                 // the progress file, signals the done condvar on drop). Scoped to its own
                 // block so the guard drops — and `startup_indexing` reads false — BEFORE
                 // the embedding backfill below, which can run for minutes; otherwise the
-                // server would look "still indexing" for the whole embed.
-                {
+                // server would look "still indexing" for the whole embed. Evaluates to
+                // whether the index succeeded.
+                let index_ok = {
                     // Guard ensures flags are always cleared, even on panic
                     struct IndexGuard {
                         flag: Arc<AtomicBool>,
@@ -1105,6 +1108,7 @@ impl McpServer {
                                     )
                                 }
                             }
+                            true
                         }
                         Err(e) => {
                             let msg = format!("Background indexing failed: {}", e);
@@ -1112,10 +1116,11 @@ impl McpServer {
                             if let Ok(mut slot) = error_slot.lock() {
                                 *slot = Some(msg);
                             }
+                            false
                         }
                     }
                     // IndexGuard drops here: clears startup flag, removes progress file, signals condvar.
-                }
+                };
 
                 // Embed the freshly-indexed nodes right here, in the same background
                 // thread. The index is committed and `startup_indexing` is now clear, so
@@ -1129,7 +1134,20 @@ impl McpServer {
                 // Skipped in no-embed builds (`default = []`): with no model to embed
                 // with, spawning the backfill + its model-load attempt is pure per-session
                 // waste (the message-driven spawn_background_embedding is already guarded).
-                if cfg!(feature = "embed-model") {
+                //
+                // The startup repair runs first, here too (D#711): it used to start only
+                // from consume_startup_index_result(), so it never ran in a session that
+                // sends no tool call (the audit's nine indexes held 894 MB of vector
+                // slots it would have reclaimed). Before the backfill, so the context
+                // strings it rebuilds are embedded in the same run; not after a failed
+                // index, as before.
+                if index_ok && !repair_done.swap(true, Ordering::AcqRel) {
+                    Self::run_startup_repair_then_backfill(
+                        &db_path,
+                        &embedding_flag,
+                        &embedding_yield,
+                    );
+                } else if cfg!(feature = "embed-model") {
                     let _ = Self::run_guarded_backfill(&db_path, &embedding_flag, &embedding_yield);
                 }
             });
@@ -1259,10 +1277,10 @@ impl McpServer {
         self.spawn_model_download();
     }
 
-    /// Spawn a background thread that runs `repair_null_context_strings` once per
-    /// process. Covers the failure path where a prior session crashed mid-Phase-3
-    /// (post-node-insert, before context_string/embedding commit). Primary-only:
-    /// secondary instances can't write.
+    /// Spawn a background thread that runs the startup repair once per process,
+    /// when the startup-index thread has not already run it: after a promotion
+    /// from secondary, or when the session started on an index already marked
+    /// indexed. Primary-only: secondary instances can't write.
     fn spawn_startup_repair(&self, project_root: &Path) {
         // The repair rewrites context strings in this binary's format; not over an
         // index a newer binary owns.
@@ -1277,68 +1295,82 @@ impl McpServer {
             return; // already ran this session
         }
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
+        let flag = Arc::clone(&self.indexing.embedding_in_progress);
+        let yield_flag = Arc::clone(&self.indexing.embedding_yield);
         std::thread::spawn(move || {
-            let outcome = (|| -> Result<(usize, usize, usize, usize, usize)> {
-                let db = Database::open_with_vec(&db_path)?;
-                #[cfg(feature = "embed-model")]
-                let model = EmbeddingModel::load().ok().flatten();
-                #[cfg(not(feature = "embed-model"))]
-                let model: Option<EmbeddingModel> = None;
-                let repaired =
-                    crate::indexer::pipeline::repair_null_context_strings(&db, model.as_ref())?;
-                // Sweep orphan vectors (vectors whose node was deleted) accumulated across index
-                // generations — the backfill-race residue now prevented at the insert site, plus
-                // any predating that guard (daagu carried 157 at rowids past the live range). Runs
-                // here because the startup index has already populated `nodes`; reap_orphan_vectors
-                // additionally no-ops on an empty nodes table, so a transient mid-rebuild window
-                // can never nuke live vectors. Independent of embed-model: the vec table exists in
-                // all builds and reap is a cheap anti-join + point deletes.
-                let reaped = crate::storage::queries::reap_orphan_vectors(db.conn())?;
-                // Reclaim the chunk slots that churn strands (audit 2026-08-29 STO-01).
-                // sqlite-vec only ever inserts into the newest chunk and never reuses a
-                // deleted slot, so every generation — incremental re-index, re-embed,
-                // INDEX_VERSION wipe — leaves its vectors' space allocated forever: this
-                // repo reached 189 MB of chunks for ~7.7 MB of live vectors. Runs after
-                // the reap so the rewrite carries the smallest possible set, and inside
-                // this same once-per-session thread because it takes the write lock.
-                // Independent of embed-model for the same reason the reap is: it moves
-                // bytes that already exist and never reaches the model.
-                let compacted =
-                    crate::storage::queries::compact_node_vectors_if_wasteful(db.conn())?;
-                // Same-dim model-swap guard BEFORE seeding (ordering matters): if the model
-                // changed, drop the stale cache + node_vectors now so the seed below cannot
-                // repopulate the cache with OLD-model embeddings that a matching-but-stale
-                // fingerprint would then treat as valid. No-op when unchanged / first run.
-                // best-effort — a failed check must not abort the rest of the repair.
-                #[cfg(feature = "embed-model")]
-                if let Err(e) = crate::storage::queries::ensure_embedding_cache_valid(
-                    db.conn(),
-                    EmbeddingModel::MODEL_CONTENT_BLAKE3,
-                ) {
-                    tracing::warn!(
-                        "[embed-cache] startup validity check failed (continuing): {}",
-                        e
-                    );
-                }
-                // Seed the content-hash cache from existing vectors (once) so an already-embedded
-                // index reuses on its NEXT version bump instead of paying one more full re-embed.
-                let seeded = crate::storage::queries::seed_embedding_cache_from_vectors(db.conn())?;
-                // Bound the cache to live nodes (prune entries whose content no longer exists).
-                // Same empty-nodes safety valve as the reap, so a mid-rebuild window can't wipe
-                // the reuse cache.
-                let pruned = crate::storage::queries::gc_embedding_cache(db.conn())?;
-                Ok((repaired, reaped, compacted, seeded, pruned))
-            })();
-            match outcome {
-                Ok((0, 0, 0, 0, 0)) => {}
-                Ok((repaired, reaped, compacted, seeded, pruned)) => tracing::info!(
-                    "[startup-repair] Rebuilt {} NULL context_string rows; reaped {} orphan vectors; \
-                     compacted {} vectors; seeded {} cache entries; pruned {} stale",
-                    repaired, reaped, compacted, seeded, pruned
-                ),
-                Err(e) => tracing::warn!("[startup-repair] Failed: {}", e),
-            }
+            Self::run_startup_repair_then_backfill(&db_path, &flag, &yield_flag);
         });
+    }
+
+    /// The startup repair: rebuild `NULL` context strings a prior session's crash
+    /// mid-Phase-3 left (post-node-insert, before context_string/embedding
+    /// commit), reap orphan vectors, compact the vector table, and seed and prune
+    /// the embedding cache. Run through
+    /// [`Self::run_startup_repair_then_backfill`], which serializes it with the
+    /// backfill.
+    fn run_startup_repair(db_path: &Path) {
+        let outcome = (|| -> Result<(usize, usize, usize, usize, usize)> {
+            let db = Database::open_with_vec(db_path)?;
+            #[cfg(feature = "embed-model")]
+            let model = EmbeddingModel::load().ok().flatten();
+            #[cfg(not(feature = "embed-model"))]
+            let model: Option<EmbeddingModel> = None;
+            let repaired =
+                crate::indexer::pipeline::repair_null_context_strings(&db, model.as_ref())?;
+            // Sweep orphan vectors (vectors whose node was deleted) accumulated across index
+            // generations — the backfill-race residue now prevented at the insert site, plus
+            // any predating that guard (daagu carried 157 at rowids past the live range). Runs
+            // here because the startup index has already populated `nodes`; reap_orphan_vectors
+            // additionally no-ops on an empty nodes table, so a transient mid-rebuild window
+            // can never nuke live vectors. Independent of embed-model: the vec table exists in
+            // all builds and reap is a cheap anti-join + point deletes.
+            let reaped = crate::storage::queries::reap_orphan_vectors(db.conn())?;
+            // Reclaim the chunk slots that churn strands (audit 2026-08-29 STO-01).
+            // sqlite-vec only ever inserts into the newest chunk and never reuses a
+            // deleted slot, so every generation — incremental re-index, re-embed,
+            // INDEX_VERSION wipe — leaves its vectors' space allocated forever: this
+            // repo reached 189 MB of chunks for ~7.7 MB of live vectors. Runs after
+            // the reap so the rewrite carries the smallest possible set, and in this
+            // once-per-process repair, under the backfill's flag, because it takes
+            // the write lock.
+            // Independent of embed-model for the same reason the reap is: it moves
+            // bytes that already exist and never reaches the model.
+            let compacted = crate::storage::queries::compact_node_vectors_if_wasteful(db.conn())?;
+            // Same-dim model-swap guard BEFORE seeding (ordering matters): if the model
+            // changed, drop the stale cache + node_vectors now so the seed below cannot
+            // repopulate the cache with OLD-model embeddings that a matching-but-stale
+            // fingerprint would then treat as valid. No-op when unchanged / first run.
+            // best-effort — a failed check must not abort the rest of the repair.
+            #[cfg(feature = "embed-model")]
+            if let Err(e) = crate::storage::queries::ensure_embedding_cache_valid(
+                db.conn(),
+                EmbeddingModel::MODEL_CONTENT_BLAKE3,
+            ) {
+                tracing::warn!(
+                    "[embed-cache] startup validity check failed (continuing): {}",
+                    e
+                );
+            }
+            // Seed the content-hash cache from existing vectors (once) so an already-embedded
+            // index reuses on its NEXT version bump instead of paying one more full re-embed.
+            let seeded = crate::storage::queries::seed_embedding_cache_from_vectors(db.conn())?;
+            // Bound the cache to live nodes (prune entries whose content no longer exists).
+            // Same empty-nodes safety valve as the reap, so a mid-rebuild window can't wipe
+            // the reuse cache.
+            let pruned = crate::storage::queries::gc_embedding_cache(db.conn())?;
+            Ok((repaired, reaped, compacted, seeded, pruned))
+        })();
+        match outcome {
+            Ok((0, 0, 0, 0, 0)) => {}
+            Ok((repaired, reaped, compacted, seeded, pruned)) => {
+                tracing::info!(
+                "[startup-repair] Rebuilt {} NULL context_string rows; reaped {} orphan vectors; \
+                 compacted {} vectors; seeded {} cache entries; pruned {} stale",
+                repaired, reaped, compacted, seeded, pruned
+            )
+            }
+            Err(e) => tracing::warn!("[startup-repair] Failed: {}", e),
+        }
     }
 
     /// Spawn a background thread to embed nodes that don't yet have vectors.
@@ -9198,6 +9230,105 @@ end
         assert!(
             !server.indexing.startup_repair_done.load(Ordering::Acquire),
             "the repair must not be started over a newer index"
+        );
+    }
+
+    /// An indexed project whose vector table holds one orphan (a vector at a
+    /// node id no node has), the residue the startup repair reaps.
+    fn indexed_project_with_an_orphan_vector() -> (TempDir, PathBuf) {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("alpha.rs"), "fn alpha_fn() {}\n").unwrap();
+        McpServer::new_test_with_project(project.path())
+            .ensure_indexed()
+            .unwrap();
+        let db_path = project.path().join(CODE_GRAPH_DIR).join("index.db");
+        let db = Database::open_with_vec(&db_path).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO node_vectors(node_id, embedding) VALUES (90001, ?1)",
+                [bytemuck::cast_slice::<f32, u8>(
+                    &[0.0f32; crate::domain::EMBEDDING_DIM],
+                )],
+            )
+            .unwrap();
+        assert_eq!(orphan_vectors(&db_path), 1);
+        (project, db_path)
+    }
+
+    fn orphan_vectors(db_path: &Path) -> i64 {
+        Database::open_nondestructive_with_vec(db_path)
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM node_vectors WHERE node_id = 90001",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn wait_for_orphan_reaped(db_path: &Path) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if orphan_vectors(db_path) == 0 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// D#711: the startup repair runs once the startup index is done, with no
+    /// MCP message after it. It used to wait for the next message, and Claude
+    /// Code's handshake is over before the index is, so sessions that use the
+    /// CLI never ran it (claudemd's index kept 78,848 vector slots for 3,104
+    /// live vectors).
+    #[test]
+    fn test_startup_repair_runs_without_a_tool_call() {
+        let (project, db_path) = indexed_project_with_an_orphan_vector();
+        let server = McpServer::new_test_with_project(project.path());
+        server.spawn_startup_indexing(project.path().to_path_buf(), true, None);
+        assert!(
+            wait_for_orphan_reaped(&db_path),
+            "the startup index finished and nothing reaped the orphan vector"
+        );
+    }
+
+    /// The repair writes outside the backfill's yield protocol, so it runs under
+    /// the backfill's flag: while a backfill holds it the repair waits, and once
+    /// it is released the repair still runs rather than being skipped.
+    #[test]
+    fn test_startup_repair_waits_for_a_running_backfill() {
+        let (project, db_path) = indexed_project_with_an_orphan_vector();
+        let server = McpServer::new_test_with_project(project.path());
+        server
+            .indexing
+            .embedding_in_progress
+            .store(true, Ordering::SeqCst);
+        server.spawn_startup_indexing(project.path().to_path_buf(), true, None);
+        {
+            let (lock, cvar) = &*server.indexing.startup_indexing_done;
+            let mut done = lock.lock().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !*done {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(!left.is_zero(), "the startup run never finished");
+                done = cvar.wait_timeout(done, left).unwrap().0;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(
+            orphan_vectors(&db_path),
+            1,
+            "the repair ran while a backfill held the flag"
+        );
+        server
+            .indexing
+            .embedding_in_progress
+            .store(false, Ordering::SeqCst);
+        assert!(
+            wait_for_orphan_reaped(&db_path),
+            "the repair never ran after the backfill released the flag"
         );
     }
 
