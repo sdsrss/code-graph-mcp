@@ -4002,6 +4002,69 @@ fn settle_python_reexports<'a>(
     }
 }
 
+/// The JS named imports the deferred pass parked because the file their
+/// specifier resolves to defines no node of their name (D#714 A2), bound to
+/// what that file re-exports under it ([`js_import_edge_targets`]). Asked again
+/// until a round binds nothing, as [`settle_python_reexports`] is: a re-export
+/// of a re-export answers only once the inner one is bound. What no round
+/// answers stays in `waiting` for the pass to bind as it did before.
+fn settle_js_reexports(
+    db: &Database,
+    waiting: &mut Vec<(&DeferredRelation, Vec<i64>, String)>,
+    all_file_paths: &HashSet<String>,
+    name_to_ids: &HashMap<String, Vec<i64>>,
+    node_id_to_path: &HashMap<i64, String>,
+) -> Result<usize> {
+    let mut edges_created = 0usize;
+    let mut exports = super::resolve::JsExports::default();
+    let parked = waiting.len();
+    let mut rounds = 0usize;
+    loop {
+        rounds += 1;
+        let mut bound = false;
+        let mut left = Vec::with_capacity(waiting.len());
+        for (d, source_ids, file) in waiting.drain(..) {
+            let targets = super::resolve::js_import_edge_targets(
+                db.conn(),
+                &mut exports,
+                file.clone(),
+                &d.target_name,
+                all_file_paths,
+                name_to_ids,
+                node_id_to_path,
+            )?;
+            if targets.is_empty() {
+                left.push((d, source_ids, file));
+                continue;
+            }
+            edges_created += insert_relation_edges(
+                db,
+                &source_ids,
+                &targets,
+                &d.relation,
+                d.metadata.as_deref(),
+                false,
+            )?;
+            exports.forget(&d.rel_path);
+            bound = true;
+        }
+        *waiting = left;
+        if !bound || waiting.is_empty() {
+            if parked > 0 {
+                tracing::info!(
+                    "[index] Phase 2b-final: {} JS import(s) waited on a re-export, {} bound \
+                     ({} edge(s)) in {} round(s)",
+                    parked,
+                    parked - waiting.len(),
+                    edges_created,
+                    rounds
+                );
+            }
+            return Ok(edges_created);
+        }
+    }
+}
+
 /// Phase 2b-final: post-loop resolution for `DeferredRelation`s (audit
 /// 2026-08-02 P0-1).
 ///
@@ -4105,6 +4168,7 @@ fn resolve_deferred_relations(
         .filter(|d| d.relation != REL_CALLS)
         .collect();
     let mut reexport_wait: Vec<(&DeferredRelation, Vec<i64>, Vec<String>)> = Vec::new();
+    let mut js_reexport_wait: Vec<(&DeferredRelation, Vec<i64>, String)> = Vec::new();
     let mut waited: HashSet<*const DeferredRelation> = HashSet::new();
     let mut calls_queued = false;
     let mut next = 0usize;
@@ -4126,10 +4190,18 @@ fn resolve_deferred_relations(
                 &mut relative_bound,
                 python_module_map,
             )?;
+            edges_created += settle_js_reexports(
+                db,
+                &mut js_reexport_wait,
+                all_file_paths,
+                &name_to_ids,
+                &node_id_to_path,
+            )?;
             for d in reexport_wait
                 .drain(..)
                 .map(|(d, _, _)| d)
                 .chain(relative_bound)
+                .chain(js_reexport_wait.drain(..).map(|(d, _, _)| d))
             {
                 waited.insert(d);
                 queue.push(d);
@@ -4416,6 +4488,23 @@ fn resolve_deferred_relations(
                         false,
                     )?;
                     continue;
+                }
+                // A named import of a name the file does not define may be one
+                // it re-exports (D#714 A2): `import { init } from './index.js'`
+                // names `index.js`'s `export { init } from './crud.js'`. That
+                // re-export's own edge may be among this pass's, so the miss
+                // waits until every other relation is in, and binds as below
+                // only when no re-export answers it then.
+                if d.relation == REL_IMPORTS
+                    && meta.get("q").is_none()
+                    && !waited.contains(&(queued as *const DeferredRelation))
+                {
+                    if let Some(file) =
+                        resolve_js_specifier_path(js_module, &d.rel_path, all_file_paths)
+                    {
+                        js_reexport_wait.push((queued, source_ids, file));
+                        continue;
+                    }
                 }
             }
         }

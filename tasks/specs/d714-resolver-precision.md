@@ -1,6 +1,6 @@
 # D#714：解析精度（同文件同名定义、内置方法名、barrel 导入）（2026-11-03）
 
-状态：A3 已提交（a82c3b54）；A4 已实现（Python 内置值类型方法名 → `ambiguous`，见"A4 实现"）；A2 剩余实现中。来源：`docs/plugin-usage-audit-2026-11-03.md` A2–A4，待办 D#714。
+状态：A3 已提交（a82c3b54）；A4 已提交（644e8640，见"A4 模拟与决定"）；A2 剩余已实现（见"A2 实现"）。来源：`docs/plugin-usage-audit-2026-11-03.md` A2–A4，待办 D#714。
 
 ## A3：同一文件里多个同名定义，调用会连到每一个
 
@@ -78,6 +78,15 @@
 
 - gsd-lite：`init` 的导入边按名字连到了 `tests/round2-edge.test.js:48`，产生 42 条错边。
 - D#712 已让 `js_import_targets` 跟进重导出，但导入边本身（`resolve_js_module_targets`）在指定文件里找不到名字时仍退回按名字解析。可以复用同一个跟进逻辑。
+
+### A2 实现（2026-11-03）
+
+- `resolve::js_export_through_reexports` 加一个"本文件里找名字"的参数：D#712 的调用仍只找导出的顶层函数（`JsFileExports::targets`），导入边找该文件里任何同名节点（和 `resolve_js_module_targets` 一样）。新函数 `js_import_edge_targets`。
+- 延迟阶段第 3 步：具名导入（元数据没有 `q`）在指定文件里没找到名字、且指定文件在索引里时，先停放；其余关系都处理完后 `settle_js_reexports` 按轮绑定，直到一轮什么都没绑上（和 Python 的 `settle_python_reexports` 同一个做法：重导出的重导出要等里面那层的边先写进去）；没答上的再走一遍原来的按名字回退。
+- 决定：重导出列表从数据库里重导出文件自己的 `imports` 边读，所以要等那些边存在；按轮重试 + 每绑一条就 `forget` 该文件的缓存。
+- 测试 `a_js_import_through_a_reexport_binds_what_it_names`：具名重导出、`export *`、重导出的重导出（导入方在桶文件之前处理，要第二轮）、同目录的同名干扰项；全量索引后逐个文件改动再增量，结果必须不变。5 个单点回退（不停放、不 settle、不 forget、只一轮、不跟 `export *`）各自让测试变红。
+- 实测（BEFORE = 644e8640 的源码树，AFTER = 工作树）：gsd-lite 召回 96.31% → 99.68%，默认下限精度 96.62% → 100.00%；hono 精度 97.34% → 97.44%，召回不变；其余 5 个不变。hono 去掉 134 条导入边、22 条调用边，gsd-lite 去掉 100 条、42 条，全部是同名多绑里错的那几个，没有哪个导入或调用变成一个目标都没有。
+- INDEX_VERSION 131。
 
 ## 相关
 

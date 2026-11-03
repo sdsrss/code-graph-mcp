@@ -2,9 +2,10 @@
 
 ## Unreleased
 
-**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 130
-because JavaScript and TypeScript call edges are added, same-file call edges
-are dropped and some Python call edges are labelled `ambiguous` (below). The MCP server
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 131
+because JavaScript and TypeScript call and import edges are added or moved,
+same-file call edges are dropped and some Python call edges are labelled
+`ambiguous` (below). The MCP server
 rebuilds the index when it starts; from the command line,
 `code-graph-mcp reindex` does. To pin the binary back:
 `npm i -g @sdsrs/code-graph@0.184.0`, then delete
@@ -79,6 +80,34 @@ type argument spread over several lines (`await get<{⏎ total: number ⏎}>(…
 which the oracle's call detection does not see; counted as right, precision
 is 99.7%. hono also gains two edges below the default floor (`ambiguous`),
 one of them right.
+
+### fix: an import through a barrel file binds what the barrel re-exports
+
+`import { init } from '../src/tools/state/index.js'`, where `index.js` holds
+`export { init } from './crud.js'`, bound `init` by name, to same-named
+functions elsewhere in the project: in one project, test files' helpers. The
+calls of `init()` through that import followed it; the SCIP oracle scored 42
+calls into a test helper as wrong, and the 42 calls into `crud.js` were
+missing.
+Such an import now binds what the file's re-exports lead to: `export { … }
+from`, the one `export * from` source that has the name, and re-exports of
+re-exports, up to 8 files. D#712 above follows the same re-exports for the
+calls of a noise-named or renamed import; this applies to every named import. An import that no
+re-export answers binds as before.
+
+SCIP oracle, before and after, on the same copy of each project:
+
+| Project | Gold pairs | Recall at the floor | Precision at the floor |
+|---|---|---|---|
+| a JS CLI with a barrel `index.js` | 1,247 | 96.3% → 99.7% | 96.6% → 100.0% |
+| hono 4.6.14 | 1,145 | 81.1% → 81.1% | 97.3% → 97.4% |
+| express 4.21.2, and four other JS/TS projects | 69 – 9,000 | unchanged | unchanged |
+
+hono loses 134 import and 22 call edges, gsd-lite 100 and 42; every one was a
+same-named target beside one that stays (`import { serveStatic } from
+'../../src/adapter/bun'` had bound five `serveStatic` functions and now binds
+`bun/serve-static.ts`'s), and on neither is an import or a call left
+without a target.
 
 ### fix: a call binds the same-named definition its scope sees
 

@@ -298,12 +298,49 @@ pub(super) fn js_import_targets(
         return Ok(relative.then(Vec::new));
     };
     let mut seen = HashSet::new();
-    js_export_through_reexports(conn, exports, file, export, all_file_paths, &mut seen).map(Some)
+    let own = |f: &JsFileExports, _: &str| f.targets(export);
+    js_export_through_reexports(conn, exports, file, export, all_file_paths, &mut seen, &own)
+        .map(Some)
+}
+
+/// What a named JS import of `name` binds when `file`, the file its specifier
+/// resolves to, defines no node of that name (D#714 A2): the node of that
+/// name, of any kind, that one of `file`'s re-exports leads to (`export { init
+/// } from './crud.js'`, or the one `export *` source that has it), as
+/// [`js_import_targets`] follows them for a call. Empty when none does. Read
+/// from the re-exporting files' own `imports` edges, so it answers only once
+/// those exist: the deferred pass asks again until nothing moves
+/// (`settle_js_reexports`).
+pub(super) fn js_import_edge_targets(
+    conn: &rusqlite::Connection,
+    exports: &mut JsExports,
+    file: String,
+    name: &str,
+    all_file_paths: &HashSet<String>,
+    name_to_ids: &HashMap<String, Vec<i64>>,
+    node_id_to_path: &HashMap<i64, String>,
+) -> Result<Vec<i64>> {
+    let own = |_: &JsFileExports, path: &str| -> Vec<i64> {
+        name_to_ids
+            .get(name)
+            .map(|ids| {
+                ids.iter()
+                    .filter(|id| node_id_to_path.get(id).is_some_and(|p| p == path))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut seen = HashSet::new();
+    js_export_through_reexports(conn, exports, file, name, all_file_paths, &mut seen, &own)
 }
 
 /// How many files [`js_import_targets`] follows re-exports through.
 const MAX_JS_REEXPORT_HOPS: usize = 8;
 
+/// The nodes `own` finds for `export` in `file`, else in the first file one
+/// of its re-exports of that name leads to, else in the one `export *` source
+/// that has it.
 fn js_export_through_reexports(
     conn: &rusqlite::Connection,
     exports: &mut JsExports,
@@ -311,6 +348,7 @@ fn js_export_through_reexports(
     export: &str,
     all_file_paths: &HashSet<String>,
     seen: &mut HashSet<String>,
+    own: &dyn Fn(&JsFileExports, &str) -> Vec<i64>,
 ) -> Result<Vec<i64>> {
     if seen.len() >= MAX_JS_REEXPORT_HOPS || !seen.insert(file.clone()) {
         return Ok(Vec::new());
@@ -319,9 +357,9 @@ fn js_export_through_reexports(
         let loaded = JsFileExports::load(conn, &file)?;
         exports.by_file.insert(file.clone(), loaded);
     }
-    let own = exports.by_file[&file].targets(export);
-    if !own.is_empty() {
-        return Ok(own);
+    let here = own(&exports.by_file[&file], &file);
+    if !here.is_empty() {
+        return Ok(here);
     }
     let resolve =
         |spec: &str| super::js_modules::resolve_js_specifier_path(spec, &file, all_file_paths);
@@ -340,14 +378,16 @@ fn js_export_through_reexports(
         )
     };
     for next in named {
-        let ids = js_export_through_reexports(conn, exports, next, export, all_file_paths, seen)?;
+        let ids =
+            js_export_through_reexports(conn, exports, next, export, all_file_paths, seen, own)?;
         if !ids.is_empty() {
             return Ok(ids);
         }
     }
     let mut found: Option<Vec<i64>> = None;
     for next in stars {
-        let ids = js_export_through_reexports(conn, exports, next, export, all_file_paths, seen)?;
+        let ids =
+            js_export_through_reexports(conn, exports, next, export, all_file_paths, seen, own)?;
         if ids.is_empty() {
             continue;
         }
@@ -371,6 +411,13 @@ fn js_export_through_reexports(
 #[derive(Default)]
 pub(super) struct JsExports {
     by_file: HashMap<String, JsFileExports>,
+}
+
+impl JsExports {
+    /// Drop what is held for `file`, whose `<module>` just gained an edge.
+    pub(super) fn forget(&mut self, file: &str) {
+        self.by_file.remove(file);
+    }
 }
 
 /// `(node, name, published as, is a function, start line, end line)`.

@@ -15288,3 +15288,101 @@ fn a_python_builtin_method_name_on_an_untyped_receiver_is_ambiguous() {
         ]
     );
 }
+
+/// D#714 A2: a named JS import of a name the file its specifier resolves to
+/// only re-exports (`export { init } from './crud.js'`, or `export * from`)
+/// binds what the re-export names, and the calls through it follow, instead of
+/// the same-named function of another file name matching found.
+const D714_BARREL_TREE: &[(&str, &str)] = &[
+    (
+        "src/state/crud.js",
+        "export function init(cwd) { return cwd; }\nexport function patch(x) { return x; }\n",
+    ),
+    (
+        "src/state/more.js",
+        "export function prune(x) { return x; }\n",
+    ),
+    (
+        "src/state/index.js",
+        "export { init, patch } from './crud.js';\nexport * from './more.js';\n",
+    ),
+    (
+        "src/api.js",
+        "export { init } from './state/index.js';\n",
+    ),
+    (
+        "tests/state.test.js",
+        "import { init, prune } from '../src/state/index.js';\n\
+         import { init as boot } from '../src/api.js';\n\
+         export function t1() { init('.'); prune(1); boot('.'); }\n",
+    ),
+    (
+        "tests/other.test.js",
+        "async function init(cwd) { return cwd; }\nfunction prune(x) { return x; }\nexport function t2() { init('.'); prune(2); }\n",
+    ),
+    // Nearer the importers below than `crud.js`: what name matching picks.
+    (
+        "src/decoy.js",
+        "export function init(cwd) { return cwd; }\n",
+    ),
+    // Met before the barrel it imports from, itself a re-export of a re-export:
+    // binds in the settle's second round, from a fresh read of that barrel.
+    (
+        "src/aa-use.js",
+        "import { init } from './zz-api.js';\nexport function u2() { init('.'); }\n",
+    ),
+    (
+        "src/zz-api.js",
+        "export { init } from './state/index.js';\n",
+    ),
+];
+
+fn d714_barrel_edges(db: &Database) -> Vec<String> {
+    edge_set(db)
+        .into_iter()
+        .filter(|e| {
+            [
+                "tests/state.test.js.",
+                "src/api.js.",
+                "src/aa-use.js.",
+                "src/zz-api.js.",
+            ]
+            .iter()
+            .any(|p| e.starts_with(p))
+                && !e.contains("--contains-->")
+        })
+        .collect()
+}
+
+#[test]
+fn a_js_import_through_a_reexport_binds_what_it_names() {
+    let want = [
+        "src/aa-use.js.<module> --imports--> src/state/crud.js.init",
+        "src/aa-use.js.u2 --calls--> src/state/crud.js.init",
+        "src/api.js.<module> --imports--> src/state/crud.js.init",
+        "src/zz-api.js.<module> --imports--> src/state/crud.js.init",
+        "tests/state.test.js.<module> --imports--> src/state/crud.js.init",
+        "tests/state.test.js.<module> --imports--> src/state/more.js.prune",
+        "tests/state.test.js.t1 --calls--> src/state/crud.js.init",
+        "tests/state.test.js.t1 --calls--> src/state/more.js.prune",
+    ];
+    let (project, _d, db) = fresh_index_of(D714_BARREL_TREE);
+    let got = d714_barrel_edges(&db);
+    for w in want {
+        assert!(
+            got.iter().any(|e| e == w),
+            "full index: missing {w}\n{got:#?}"
+        );
+    }
+    assert!(
+        !got.iter()
+            .any(|e| e.contains("tests/other.test.js") || e.contains("src/decoy.js")),
+        "full index: bound a namesake\n{got:#?}"
+    );
+    for (f, _) in D714_BARREL_TREE {
+        let body = fs::read_to_string(project.path().join(f)).unwrap();
+        fs::write(project.path().join(f), format!("{body}\n")).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        assert_eq!(d714_barrel_edges(&db), got, "after {f} changed");
+    }
+}
