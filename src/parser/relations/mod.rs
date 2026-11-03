@@ -148,6 +148,12 @@ pub struct ParsedRelation {
     /// `@overload` stubs, nested `def index()` handlers) instead of giving every
     /// one of them this relation.
     pub source_line: Option<u32>,
+    /// Byte where a bare call starts (`app()`, not `x.app()` or a call through
+    /// an import), in a language whose definitions carry a
+    /// [`LexicalScope`](crate::parser::treesitter::LexicalScope): the resolver
+    /// keeps the same-file definitions of that name the call sees (D#714). In
+    /// memory only.
+    pub call_at: Option<usize>,
 }
 
 pub fn extract_relations(source: &str, language: &str) -> Result<Vec<ParsedRelation>> {
@@ -212,6 +218,7 @@ pub fn extract_relations_from_tree(
                 ),
                 source_language: String::new(),
                 source_line: None,
+                call_at: None,
             });
         }
         imports::count_python_import_sources(&mut relations);
@@ -351,6 +358,7 @@ mod ruby_bare_calls {
                             metadata: None,
                             source_language: String::new(),
                             source_line: None,
+                            call_at: None,
                         });
                     }
                 }

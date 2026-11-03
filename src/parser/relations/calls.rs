@@ -233,6 +233,7 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                             }),
                             source_language: String::new(),
                             source_line: None,
+                            call_at: None,
                         });
                     }
 
@@ -259,6 +260,7 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                             metadata: Some(serde_json::json!({ "q": crate::domain::IMPORT_Q_NS_REQUIRE, "js_module": &path }).to_string()),
                             source_language: String::new(),
                             source_line: None,
+                            call_at: None,
                         });
                     }
 
@@ -302,6 +304,7 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                                                     metadata: Some(metadata.clone()),
                                                     source_language: String::new(),
                                                     source_line: None,
+                                                    call_at: None,
                                                 });
                                             }
                                         }
@@ -322,6 +325,7 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                                         metadata: Some(serde_json::json!({ "q": crate::domain::IMPORT_Q_NS_REQUIRE, "js_module": &path }).to_string()),
                                         source_language: String::new(),
                                         source_line: None,
+                                        call_at: None,
                                     });
                                 }
                             }
@@ -542,6 +546,13 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                         }),
                     some => some,
                 };
+                // A bare call by its own name (no import, package, `use` path or
+                // receiver) picks among same-file definitions by scope (D#714).
+                let call_at = (metadata.is_none()
+                    && qualifier == helpers::CalleeQualifier::Bare
+                    && helpers::call_function(&node).is_some_and(|f| f.kind() == "identifier"))
+                .then(|| crate::parser::treesitter::bare_call_at(&node, ctx.language))
+                .flatten();
                 results.push(ParsedRelation {
                     source_name: scope,
                     target_name: callee,
@@ -549,6 +560,7 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     metadata,
                     source_language: String::new(),
                     source_line: None,
+                    call_at,
                 });
             }
         }
@@ -717,6 +729,7 @@ fn extract_struct_literal(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     metadata: None,
                     source_language: String::new(),
                     source_line: None,
+                    call_at: None,
                 });
             }
         }
@@ -771,6 +784,7 @@ fn extract_js_new(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 metadata: serialize_callee_qualifier(&qualifier),
                 source_language: String::new(),
                 source_line: None,
+                call_at: None,
             });
         }
     }
@@ -805,6 +819,7 @@ fn extract_csharp_new(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     metadata: None,
                     source_language: String::new(),
                     source_line: None,
+                    call_at: None,
                 });
             }
         }
@@ -843,6 +858,7 @@ fn extract_php_new(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     metadata: None,
                     source_language: String::new(),
                     source_line: None,
+                    call_at: None,
                 });
             }
         }
@@ -885,6 +901,13 @@ fn extract_python_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
             })
             .or_else(|| super::member::python_module_call_meta(node, source))
             .or_else(|| super::member::python_untyped_receiver_meta(node, source));
+        // `h()`, not `x.h()`: picks among same-file definitions by scope (D#714).
+        let call_at = (metadata.is_none()
+            && node
+                .child_by_field_name("function")
+                .is_some_and(|f| f.kind() == "identifier"))
+        .then(|| crate::parser::treesitter::bare_call_at(&node, ctx.language))
+        .flatten();
         results.push(ParsedRelation {
             source_name: scope.to_string(),
             target_name: callee,
@@ -892,6 +915,7 @@ fn extract_python_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
             metadata,
             source_language: String::new(),
             source_line: None,
+            call_at,
         });
     }
 }
@@ -914,6 +938,7 @@ fn extract_ruby_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                             metadata: None,
                             source_language: String::new(),
                             source_line: None,
+                            call_at: None,
                         });
                     }
                 }
@@ -930,6 +955,7 @@ fn extract_ruby_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 metadata: None,
                 source_language: String::new(),
                 source_line: None,
+                call_at: None,
             });
         }
     }
@@ -957,6 +983,7 @@ fn extract_java_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     metadata: None,
                     source_language: String::new(),
                     source_line: None,
+                    call_at: None,
                 });
             }
         }
@@ -1009,6 +1036,7 @@ fn extract_php_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                 metadata: None,
                 source_language: String::new(),
                 source_line: None,
+                call_at: None,
             });
         }
     }
@@ -1043,6 +1071,7 @@ fn extract_csharp_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     metadata: None,
                     source_language: String::new(),
                     source_line: None,
+                    call_at: None,
                 });
             }
         }
@@ -1095,6 +1124,7 @@ fn extract_bash_command(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                             metadata: None,
                             source_language: String::new(),
                             source_line: None,
+                            call_at: None,
                         });
                     }
                 }
@@ -1131,6 +1161,7 @@ fn extract_bash_command(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     metadata: None,
                     source_language: String::new(),
                     source_line: None,
+                    call_at: None,
                 });
             }
         }

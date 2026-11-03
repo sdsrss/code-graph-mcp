@@ -22,6 +22,91 @@ pub struct ParsedNode {
     pub param_types: Option<String>,
     /// True if this node is inside a test context (#[cfg(test)], mod tests, #[test], etc.)
     pub is_test: bool,
+    /// Where a bare call sees this definition ([`lexical_scope`]); None when it
+    /// is no lexical binding. In memory only, never stored.
+    pub lexical_scope: Option<LexicalScope>,
+}
+
+/// Where a definition binds its name for a bare call (D#714): what tells
+/// same-named definitions of one file apart, such as `const app = () => …` in
+/// each of a test file's `describe` callbacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LexicalScope {
+    /// A top-level definition, which the whole file sees.
+    File,
+    /// The byte range of the innermost function, named or not, around it.
+    Within(usize, usize),
+}
+
+impl LexicalScope {
+    /// Whether a call starting at byte `at` sees a definition of this scope.
+    pub fn sees(self, at: usize) -> bool {
+        match self {
+            LexicalScope::File => true,
+            LexicalScope::Within(start, end) => start <= at && at < end,
+        }
+    }
+
+    /// Of two scopes that see one call, the narrower is the inner one.
+    pub fn width(self) -> usize {
+        match self {
+            LexicalScope::File => usize::MAX,
+            LexicalScope::Within(start, end) => end - start,
+        }
+    }
+}
+
+/// The function-like kinds (an anonymous one too) and the member containers of
+/// a language [`lexical_scope`] covers.
+fn lexical_scope_kinds(
+    language: &str,
+) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    match language {
+        "javascript" | "typescript" | "tsx" => Some((
+            &[
+                "function_declaration",
+                "generator_function_declaration",
+                "function_expression",
+                "function",
+                "generator_function",
+                "arrow_function",
+                "method_definition",
+            ],
+            &["class_body", "object"],
+        )),
+        "python" => Some((&["function_definition", "lambda"], &["class_definition"])),
+        "rust" => Some((
+            &["function_item", "closure_expression"],
+            &["impl_item", "trait_item", "foreign_mod_item"],
+        )),
+        _ => None,
+    }
+}
+
+/// D#714: the scope of `def`, a definition that binds its name lexically (a
+/// JS/TS function declaration or variable declarator, a Python `def`, a Rust
+/// `fn`): the innermost function around it, or the file. None when the first
+/// container met going up is a class, impl, trait or object literal (a member
+/// is no name a bare call reaches), and for every other language.
+pub(crate) fn lexical_scope(def: &tree_sitter::Node, language: &str) -> Option<LexicalScope> {
+    let (functions, members) = lexical_scope_kinds(language)?;
+    let mut cur = def.parent();
+    while let Some(n) = cur {
+        if functions.contains(&n.kind()) {
+            return Some(LexicalScope::Within(n.start_byte(), n.end_byte()));
+        }
+        if members.contains(&n.kind()) {
+            return None;
+        }
+        cur = n.parent();
+    }
+    Some(LexicalScope::File)
+}
+
+/// D#714: where a bare call in a language [`lexical_scope`] covers starts,
+/// for the resolver to pick the same-file definitions it sees.
+pub(crate) fn bare_call_at(call: &tree_sitter::Node, language: &str) -> Option<usize> {
+    lexical_scope_kinds(language).map(|_| call.start_byte())
 }
 
 thread_local! {
@@ -767,6 +852,7 @@ fn extract_nodes(
             if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class)
             {
                 parsed.is_test = node_is_test;
+                parsed.lexical_scope = lexical_scope(&node, language);
                 if matches!(config.name, "javascript" | "typescript" | "tsx") {
                     if let Some(q) = js_returned_member(&node, &parsed.name, source) {
                         parsed.qualified_name = Some(q);
@@ -842,6 +928,7 @@ fn extract_nodes(
                             return_type: sig_info.return_type,
                             param_types: sig_info.param_types,
                             is_test: node_is_test || is_gtest,
+                            lexical_scope: None,
                         });
                     }
                 }
@@ -857,6 +944,7 @@ fn extract_nodes(
                 };
                 if let Some(mut parsed) = extract_function_node(&node, source, nt, parent_class) {
                     parsed.is_test = node_is_test;
+                    parsed.lexical_scope = lexical_scope(&node, language);
                     results.push(parsed);
                 }
             }
@@ -866,6 +954,7 @@ fn extract_nodes(
             if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class)
             {
                 parsed.is_test = node_is_test;
+                parsed.lexical_scope = lexical_scope(&node, language);
                 results.push(parsed);
             }
         }
@@ -873,7 +962,7 @@ fn extract_nodes(
         // Arrow functions (TS/JS): covers const/let (lexical) and var (variable)
         // A single declaration may contain multiple arrow functions.
         "lexical_declaration" | "variable_declaration" => {
-            for mut parsed in extract_named_arrows(&node, source) {
+            for mut parsed in extract_named_arrows(&node, source, language) {
                 parsed.is_test = node_is_test;
                 if parsed.node_type == "function" {
                     if let Some(q) = js_returned_member(&node, &parsed.name, source) {
@@ -918,6 +1007,7 @@ fn extract_nodes(
                     return_type: None,
                     param_types: None,
                     is_test: node_is_test,
+                    lexical_scope: None,
                 });
                 extract_children(
                     node,
@@ -1281,6 +1371,7 @@ fn extract_nodes(
                                 return_type: None,
                                 param_types: None,
                                 is_test: node_is_test,
+                                lexical_scope: None,
                             });
                         }
                     }
@@ -1393,6 +1484,7 @@ fn extract_nodes(
                     return_type: None,
                     param_types: None,
                     is_test: false,
+                    lexical_scope: None,
                 });
             }
         }
@@ -1427,6 +1519,7 @@ fn extract_nodes(
                     return_type: None,
                     param_types: None,
                     is_test: false,
+                    lexical_scope: None,
                 });
             }
         }
@@ -1602,6 +1695,7 @@ fn assigned_function_node(
         return_type: sig_info.return_type,
         param_types: sig_info.param_types,
         is_test,
+        lexical_scope: None,
     }
 }
 
@@ -1624,6 +1718,7 @@ fn make_simple_node(
         return_type: None,
         param_types: None,
         is_test,
+        lexical_scope: None,
     }
 }
 
@@ -1826,6 +1921,7 @@ fn extract_function_node(
         return_type: sig_info.return_type,
         param_types: sig_info.param_types,
         is_test: false,
+        lexical_scope: None,
     })
 }
 
@@ -1943,7 +2039,7 @@ fn js_returned_member(decl: &tree_sitter::Node, name: &str, source: &str) -> Opt
     Some(format!("{}.{name}", node_text(&outer_name, source)))
 }
 
-fn extract_named_arrows(node: &tree_sitter::Node, source: &str) -> Vec<ParsedNode> {
+fn extract_named_arrows(node: &tree_sitter::Node, source: &str, language: &str) -> Vec<ParsedNode> {
     // lexical_declaration -> variable_declarator -> arrow_function
     // A single declaration may contain multiple arrow functions: const a = () => {}, b = () => {};
     let mut out = Vec::new();
@@ -1997,6 +2093,7 @@ fn extract_named_arrows(node: &tree_sitter::Node, source: &str) -> Vec<ParsedNod
                     return_type: sig_info.return_type,
                     param_types: sig_info.param_types,
                     is_test: false,
+                    lexical_scope: lexical_scope(&child, language),
                 });
             } else if !matches!(value.kind(), "function_expression" | "function")
                 && node.parent().map(|p| p.kind()) == Some("export_statement")
@@ -2048,6 +2145,7 @@ fn extract_named_arrows(node: &tree_sitter::Node, source: &str) -> Vec<ParsedNod
                         return_type: None,
                         param_types: None,
                         is_test: false,
+                        lexical_scope: None,
                     });
                 }
             }
@@ -2554,6 +2652,7 @@ fn extract_dart_method_signature(
                         return_type: ret_with_args,
                         param_types: params,
                         is_test: false,
+                        lexical_scope: None,
                     });
                 }
                 "constructor_signature" => {
@@ -2579,6 +2678,7 @@ fn extract_dart_method_signature(
                         return_type: None,
                         param_types: params,
                         is_test: false,
+                        lexical_scope: None,
                     });
                 }
                 _ => {}
@@ -2647,6 +2747,7 @@ fn extract_dart_top_level_function(
         return_type: ret,
         param_types: params,
         is_test: false,
+        lexical_scope: None,
     })
 }
 
@@ -2712,6 +2813,7 @@ fn extract_dart_declaration(
                         return_type: ret_with_args,
                         param_types: params,
                         is_test: false,
+                        lexical_scope: None,
                     });
                 }
                 "constructor_signature" => {
@@ -2737,6 +2839,7 @@ fn extract_dart_declaration(
                         return_type: None,
                         param_types: params,
                         is_test: false,
+                        lexical_scope: None,
                     });
                 }
                 _ => {}

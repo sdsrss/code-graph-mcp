@@ -160,5 +160,6 @@ pub(super) fn extract_java_type_reference(
         metadata: None,
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     })
 }

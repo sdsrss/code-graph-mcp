@@ -2,8 +2,9 @@
 
 ## Unreleased
 
-**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 128
-because JavaScript and TypeScript call edges are added (below). The MCP server
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 129
+because JavaScript and TypeScript call edges are added and same-file call
+edges are dropped (below). The MCP server
 rebuilds the index when it starts; from the command line,
 `code-graph-mcp reindex` does. To pin the binary back:
 `npm i -g @sdsrs/code-graph@0.184.0`, then delete
@@ -78,6 +79,44 @@ type argument spread over several lines (`await get<{⏎ total: number ⏎}>(…
 which the oracle's call detection does not see; counted as right, precision
 is 99.7%. hono also gains two edges below the default floor (`ambiguous`),
 one of them right.
+
+### fix: a call binds the same-named definition its scope sees
+
+In JavaScript, TypeScript, Python and Rust, a bare call such as `app()` in a
+file that defines `app` more than once had an edge to every one of them. A
+test file whose `describe` callbacks each define `const app = () => …` gave
+each callback's helpers a call of every callback's `app`; a function with a
+local `const ok = …` was recorded as calling the file's top-level `function
+ok` too, and a function that does not define `ok` as calling the local one.
+Such a call now binds only the definitions it can see by the language's
+scoping: the innermost function around a definition, named or not (an arrow
+function, a `function () {}` callback, a closure), must contain the call, and
+of the definitions it sees, the innermost. This applies to JavaScript and
+TypeScript `function` declarations and `const f = () => …`, to a Python `def`
+not in a class, and to a Rust `fn` not in an `impl` or `trait`. Methods and
+object members keep being candidates as before, and a call that sees none of
+the definitions keeps every one of them. No edge is added.
+
+SCIP oracle, before and after, on the same copy of each project; precision
+over the edges at the default confidence floor (recall at it is unchanged on
+every project):
+
+| Project | Gold pairs | Precision | Wrong edges at the floor |
+|---|---|---|---|
+| a JS plugin with many `describe` files | 9,000 | 94.8% → 99.6% | 487 → 32 |
+| another JS project | 1,666 | 98.6% → 100.0% | 24 → 0 |
+| a JS CLI with a barrel `index.js` | 1,247 | 96.5% → 96.6% | 44 → 42 |
+| a TypeScript project | 1,641 | 99.5% → 99.6% | 9 → 7 |
+| a Python backend | 16,082 | 97.9% → 98.0% | 322 → 304 |
+| nltk 3.9.2 | 5,838 | 89.2% → 89.3% | 699 → 695 |
+| the Python 3.14 standard library | 12,375 | 79.0% → 79.6% | 2,908 → 2,805 |
+| the Vue/TS frontend, hono 4.6.14, express 4.21.2 | 69 – 1,145 | unchanged | unchanged |
+
+On this repository (Rust, with JS and Python tooling) the oracle's judged edges
+did not move; 43 call edges are gone, each from a function to a helper of the
+same name that another function defines for itself (`fn walk` inside several
+test functions of `tests/hardening.rs`, `const norm` in two functions of
+`pre-grep-guide.js`).
 
 ### change: a directory overview goes to the agent that read five files of it
 

@@ -151,6 +151,7 @@ pub(super) fn extract_export_names(
                     ),
                     source_language: String::new(),
                     source_line: None,
+                    call_at: None,
                 });
             }
         }
@@ -181,6 +182,7 @@ pub(super) fn extract_export_names(
                             metadata: None,
                             source_language: String::new(),
                             source_line: None,
+                            call_at: None,
                         });
                     }
                 }
@@ -200,6 +202,7 @@ pub(super) fn extract_export_names(
                                         metadata: None,
                                         source_language: String::new(),
                                         source_line: None,
+                                        call_at: None,
                                     });
                                 }
                             }
@@ -234,6 +237,7 @@ fn collect_reexport_specifiers(
                     metadata: metadata.map(str::to_string),
                     source_language: String::new(),
                     source_line: None,
+                    call_at: None,
                 });
             }
         }
@@ -351,6 +355,7 @@ pub(super) fn extract_cjs_exports(
             metadata,
             source_language: String::new(),
             source_line: None,
+            call_at: None,
         });
     };
 

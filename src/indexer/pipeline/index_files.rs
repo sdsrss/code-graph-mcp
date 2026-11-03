@@ -34,7 +34,7 @@ use crate::indexer::merkle::hash_file;
 use crate::parser::relations::{
     cpp_class_fields, extract_relations_from_tree, CppField, ParsedRelation,
 };
-use crate::parser::treesitter::{extract_nodes_from_tree, parse_tree};
+use crate::parser::treesitter::{extract_nodes_from_tree, parse_tree, LexicalScope};
 use crate::storage::db::Database;
 use crate::storage::queries::{
     delete_files_by_paths, delete_nodes_by_file, get_all_node_names_with_ids, get_edges_batch,
@@ -297,6 +297,9 @@ struct FileParsed {
     // Rust function id → its parameters, for this file's functions: the
     // batch-time half of `resolve::rust_call_shape_admits`.
     rust_fn_shapes: HashMap<i64, super::resolve::RustFnShape>,
+    // Node id → where a bare call sees it, for this file's lexical definitions
+    // (D#714, `visible_same_file_targets`).
+    node_scopes: HashMap<i64, LexicalScope>,
 }
 
 impl FileParsed {
@@ -716,6 +719,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         let mut node_qualified_names: Vec<Option<String>> = Vec::new();
         let mut node_types: Vec<String> = Vec::new();
         let mut node_lines: Vec<(u32, u32)> = Vec::new();
+        let mut node_scopes: HashMap<i64, LexicalScope> = HashMap::new();
         let mut rust_fns: Vec<super::resolve::RustFnRow> = Vec::new();
 
         let module_node_id = insert_node_cached(
@@ -771,6 +775,9 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             node_qualified_names.push(pn.qualified_name.clone());
             node_types.push(pn.node_type.clone());
             node_lines.push((pn.start_line, pn.end_line));
+            if let Some(scope) = pn.lexical_scope {
+                node_scopes.insert(node_id, scope);
+            }
             if pp.language == "rust" && pn.node_type == "function" {
                 rust_fns.push(super::resolve::RustFnRow {
                     id: node_id,
@@ -800,6 +807,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             node_types,
             node_lines,
             rust_fn_shapes,
+            node_scopes,
         });
     }
 
@@ -2445,11 +2453,12 @@ fn resolve_batch_relations(
                 if super::resolve::is_package_bound(rel.metadata.as_deref()) {
                     Vec::new()
                 } else {
-                    all_target_ids
+                    let local: Vec<i64> = all_target_ids
                         .iter()
                         .filter(|id| local_ids.contains(id))
                         .copied()
-                        .collect()
+                        .collect();
+                    visible_same_file_targets(local, rel, pf)
                 };
 
             let source_lang = pf.language.as_str();
@@ -2565,6 +2574,36 @@ fn resolve_batch_relations(
 /// this file does not define). Only for a truly bare call: `DB::Put()` carries
 /// `{"q":"scoped"}` metadata and names its class itself, and `Cls(...)` inside a
 /// `Cls` member is a constructor call.
+/// D#714: a bare call's same-file candidates less the lexical definitions it
+/// cannot see or sees only behind an inner one of the same name. Of the
+/// definitions whose scope sees the call, the innermost stay: `app()` in one
+/// `describe` callback binds that callback's `const app`, not the next one's,
+/// and a local `const ok` shadows the top-level `function ok`. A candidate
+/// that is no lexical binding (a method, an object member) stays, and so does
+/// every candidate when the call sees none: the rule only takes from the set.
+fn visible_same_file_targets(targets: Vec<i64>, rel: &ParsedRelation, pf: &FileParsed) -> Vec<i64> {
+    let Some(at) = rel.call_at else {
+        return targets;
+    };
+    let Some(innermost) = targets
+        .iter()
+        .filter_map(|id| pf.node_scopes.get(id))
+        .filter(|scope| scope.sees(at))
+        .map(|scope| scope.width())
+        .min()
+    else {
+        return targets;
+    };
+    targets
+        .into_iter()
+        .filter(|id| {
+            pf.node_scopes
+                .get(id)
+                .is_none_or(|scope| scope.sees(at) && scope.width() == innermost)
+        })
+        .collect()
+}
+
 fn cpp_implicit_this_members(
     language: &str,
     rel: &crate::parser::relations::ParsedRelation,

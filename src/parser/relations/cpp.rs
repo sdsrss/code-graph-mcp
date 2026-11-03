@@ -74,6 +74,7 @@ pub(super) fn extract_cpp_inheritance(
                     metadata: None,
                     source_language: String::new(),
                     source_line: None,
+                    call_at: None,
                 });
             }
         }
@@ -141,6 +142,7 @@ pub(super) fn extract_cpp_value_reference(
         metadata: None,
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     })
 }
 

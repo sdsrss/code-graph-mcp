@@ -126,6 +126,7 @@ pub(super) fn extract_python_type_reference(
         metadata: None,
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     })
 }
 
@@ -204,6 +205,7 @@ pub(super) fn extract_python_value_reference(
         metadata: None,
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     })
 }
 

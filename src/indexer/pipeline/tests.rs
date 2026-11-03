@@ -15032,3 +15032,200 @@ fn a_python_module_call_into_the_callers_own_module_keeps_its_bind() {
     ];
     assert_eq!(rows, want);
 }
+
+/// Every same-file `calls` edge as `caller@line -> callee@line`, sorted.
+fn same_file_call_lines(db: &Database) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT ns.name || '@' || ns.start_line || ' -> ' || nt.name || '@' || nt.start_line \
+             FROM edges e \
+             JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON nt.id = e.target_id \
+             WHERE e.relation = 'calls' AND ns.file_id = nt.file_id ORDER BY 1",
+        )
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+/// D#714 A3: a bare call among same-named definitions of one file binds the
+/// ones its lexical scope sees — the innermost function around each
+/// definition must contain the call — and the innermost of those. A
+/// definition that is no lexical binding (a method, an object member) and a
+/// call no definition is visible to are left as they were.
+#[test]
+fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
+    #[allow(clippy::type_complexity)]
+    let table: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "js: one arrow per describe callback",
+            "t.test.js",
+            "describe('a', () => {\n  const app = () => 1;\n  const write = () => app();\n});\n\
+             describe('b', () => {\n  const app = () => 2;\n  const write = () => app();\n});\n",
+            &["write@3 -> app@2", "write@7 -> app@6"],
+        ),
+        (
+            "js: a local arrow shadows a top-level function",
+            "install.js",
+            "function ok(m) { return m; }\nfunction install() {\n  const ok = (m) => m + 1;\n  ok('a');\n}\n\
+             function other() { ok('b'); }\n",
+            &["install@2 -> ok@3", "other@6 -> ok@1"],
+        ),
+        (
+            "js: function declarations in sibling functions, called before them",
+            "a.js",
+            "function a() {\n  h();\n  function h() {}\n}\nfunction b() {\n  function h() {}\n  h();\n}\n",
+            &["a@1 -> h@3", "b@5 -> h@6"],
+        ),
+        (
+            "js: a closure sees its outer function's definition",
+            "a.js",
+            "function outer() {\n  function h() {}\n  function inner() { h(); }\n}\n\
+             function other() {\n  function h() {}\n}\n",
+            &["inner@3 -> h@2"],
+        ),
+        (
+            "js: function declarations in function-expression callbacks",
+            "t.test.js",
+            "describe('a', function () {\n  function app() {}\n  function w() { app(); }\n});\n\
+             describe('b', function () {\n  function app() {}\n  function w() { app(); }\n});\n",
+            &["w@3 -> app@2", "w@7 -> app@6"],
+        ),
+        (
+            "ts: in a .ts file",
+            "a.ts",
+            "function a(): void {\n  const h = (): number => 1;\n  h();\n}\n\
+             function b(): void {\n  const h = (): number => 2;\n  h();\n}\n",
+            &["a@1 -> h@2", "b@5 -> h@6"],
+        ),
+        (
+            "js: one function, two blocks (kept)",
+            "a.js",
+            "function a(x) {\n  if (x) {\n    const h = () => 1;\n    h();\n  } else {\n    const h = () => 2;\n    h();\n  }\n}\n",
+            &["a@1 -> h@3", "a@1 -> h@6"],
+        ),
+        (
+            "js: no definition visible at the call (kept)",
+            "a.js",
+            "function a() { function h() {} }\nfunction b() { function h() {} }\nfunction c() { h(); }\n",
+            &["c@3 -> h@1", "c@3 -> h@2"],
+        ),
+        (
+            "py: nested defs in sibling functions",
+            "m.py",
+            "def a():\n    def h():\n        pass\n    h()\n\n\ndef b():\n    def h():\n        pass\n    h()\n",
+            &["a@1 -> h@2", "b@7 -> h@8"],
+        ),
+        (
+            "py: async nested defs",
+            "m.py",
+            "async def a():\n    async def h():\n        pass\n    await h()\n\n\n\
+             async def b():\n    async def h():\n        pass\n    await h()\n",
+            &["a@1 -> h@2", "b@7 -> h@8"],
+        ),
+        (
+            "py: a decorated nested def",
+            "m.py",
+            "def deco(f):\n    return f\n\n\ndef a():\n    @deco\n    def h():\n        pass\n    h()\n\n\n\
+             def b():\n    def h():\n        pass\n",
+            &["a@5 -> h@6"],
+        ),
+        (
+            "py: a nested def shadows a module function",
+            "m.py",
+            "def h():\n    pass\n\n\ndef a():\n    def h():\n        pass\n    h()\n\n\ndef b():\n    h()\n",
+            &["a@5 -> h@6", "b@11 -> h@1"],
+        ),
+        (
+            "rs: nested fns in sibling fns",
+            "src/lib.rs",
+            "fn a() {\n    fn h() {}\n    h();\n}\nfn b() {\n    fn h() {}\n    h();\n}\n",
+            &["a@1 -> h@2", "b@5 -> h@6"],
+        ),
+        (
+            "rs: cfg twins at the top level (kept)",
+            "src/lib.rs",
+            "#[cfg(unix)]\nfn h() {}\n#[cfg(windows)]\nfn h() {}\nfn c() {\n    h();\n}\n",
+            &["c@5 -> h@2", "c@5 -> h@4"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, path, code, want) in table {
+        let (_p, _d, db) = fresh_index_of(&[(path, code)]);
+        let got = same_file_call_lines(&db);
+        if got != *want {
+            failures.push(format!("{label}: got {got:?}\n    want {want:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// D#714 A3, rows the rule must leave as they were before it: a method or an
+/// object member of the same name as a lexical definition is no lexical
+/// binding, and the rule only drops lexical definitions.
+#[test]
+fn a_same_name_member_is_left_to_the_other_rules() {
+    let table: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "js: class method beside a function",
+            "a.js",
+            "function run() {}\nclass A {\n  run() {}\n  go() { run(); }\n}\n",
+            &["go@4 -> run@1", "go@4 -> run@3"],
+        ),
+        (
+            "js: object member beside a function",
+            "a.js",
+            "function h() {}\nconst o = { h: () => 1 };\nfunction a() { h(); }\n",
+            &["a@3 -> h@1"],
+        ),
+        (
+            "py: method beside a module function",
+            "m.py",
+            "def h():\n    pass\n\n\nclass C:\n    def h(self):\n        pass\n\n    def g(self):\n        h()\n",
+            &["g@9 -> h@1", "g@9 -> h@6"],
+        ),
+        (
+            "rs: method beside a free fn",
+            "src/lib.rs",
+            "fn h() {}\nstruct S;\nimpl S {\n    fn h(&self) {}\n    fn g(&self) {\n        h();\n    }\n}\n",
+            &["g@5 -> h@1"],
+        ),
+        (
+            "py: method of a class inside the calling function",
+            "m.py",
+            "def h():\n    pass\n\n\ndef f():\n    class C:\n        def h(self):\n            pass\n    h()\n",
+            &["f@5 -> h@1", "f@5 -> h@7"],
+        ),
+        (
+            "rs: method of an impl inside the calling fn",
+            "src/lib.rs",
+            "fn h() {}\nfn f() {\n    struct S;\n    impl S {\n        fn h() {}\n    }\n    h();\n}\n",
+            &["f@2 -> h@1"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, path, code, want) in table {
+        let (_p, _d, db) = fresh_index_of(&[(path, code)]);
+        let got = same_file_call_lines(&db);
+        if got != *want {
+            failures.push(format!("{label}: got {got:?}\n    want {want:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// D#714 A3: editing a file whose twins the rule told apart, and editing a
+/// file that calls into it, give the calls a rebuild gives.
+#[test]
+fn a_scoped_same_file_bind_survives_an_incremental_run() {
+    let twins = "export function top() {}\n\
+                 describe('a', () => {\n  const app = () => 1;\n  const write = () => app();\n});\n\
+                 describe('b', () => {\n  const app = () => 2;\n  const write = () => app();\n});\n";
+    let user = "import { top } from './t.test.js';\nexport function u() { top(); }\n";
+    let tree = [("t.test.js", twins), ("u.js", user)];
+    assert_incremental_matches_rebuild(
+        &tree,
+        &[("t.test.js", Some(&format!("// moved\n{twins}")))],
+    );
+    assert_incremental_matches_rebuild(&tree, &[("u.js", Some(&format!("{user}// touched\n")))]);
+}

@@ -73,6 +73,7 @@ pub(super) fn extract_go_type_reference(
         metadata: None,
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     })
 }
 
@@ -164,6 +165,7 @@ pub(super) fn extract_go_inheritance(
             metadata: None,
             source_language: String::new(),
             source_line: None,
+            call_at: None,
         })
         .collect()
 }
@@ -260,6 +262,7 @@ pub(super) fn extract_go_value_reference(
         metadata: None,
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     })
 }
 

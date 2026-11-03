@@ -176,6 +176,7 @@ pub(super) fn extract_rust_use_imports(
                 metadata,
                 source_language: String::new(),
                 source_line: None,
+                call_at: None,
             });
         }
     }
@@ -304,6 +305,7 @@ pub(super) fn extract_rust_impl_trait(
         metadata: None,
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     })
 }
 
@@ -398,6 +400,7 @@ pub(super) fn extract_rust_path_reference(
         metadata: None,
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     })
 }
 
@@ -485,6 +488,7 @@ pub(super) fn extract_rust_type_reference(
         metadata: None,
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     })
 }
 
@@ -642,6 +646,7 @@ pub(super) fn extract_rust_macro_token_call(
         metadata,
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     })
 }
 
@@ -849,6 +854,7 @@ pub(super) fn extract_rust_value_reference(
         metadata: None,
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     })
 }
 

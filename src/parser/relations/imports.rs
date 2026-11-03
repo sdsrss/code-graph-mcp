@@ -51,6 +51,7 @@ impl ImportCtx<'_> {
             metadata,
             source_language: String::new(),
             source_line: None,
+            call_at: None,
         }
     }
 }
@@ -371,6 +372,7 @@ fn extract_go_import_spec(ctx: &ImportCtx, results: &mut Vec<ParsedRelation>) {
         metadata: None,
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     });
 }
 
@@ -517,6 +519,7 @@ pub(super) fn extract_import_names(
                                     ),
                                     source_language: String::new(),
                                     source_line: None,
+                                    call_at: None,
                                 });
                             }
                         }
@@ -537,6 +540,7 @@ pub(super) fn extract_import_names(
                             metadata: metadata.clone(),
                             source_language: String::new(),
                             source_line: None,
+                            call_at: None,
                         });
                     }
                 }
@@ -584,6 +588,7 @@ fn emit_namespace_import(
         ),
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     });
 }
 
@@ -616,6 +621,7 @@ fn extract_import_specifiers_inner(
                 metadata: metadata.map(str::to_string),
                 source_language: String::new(),
                 source_line: None,
+                call_at: None,
             });
         }
         return;
@@ -662,6 +668,7 @@ fn extract_import_names_recursive_inner(
                 metadata: metadata.map(str::to_string),
                 source_language: String::new(),
                 source_line: None,
+                call_at: None,
             });
         }
         return;
@@ -698,6 +705,7 @@ pub(super) fn extract_python_import_names(
                         metadata: Some(metadata),
                         source_language: String::new(),
                         source_line: None,
+                        call_at: None,
                     });
                 }
             } else if child.kind() == "aliased_import" {
@@ -717,6 +725,7 @@ pub(super) fn extract_python_import_names(
                             metadata: Some(metadata),
                             source_language: String::new(),
                             source_line: None,
+                            call_at: None,
                         });
                     }
                 }
@@ -827,6 +836,7 @@ pub(super) fn extract_python_from_import_names(
             ),
             source_language: String::new(),
             source_line: None,
+            call_at: None,
         });
     };
     for i in 0..node.named_child_count() {
@@ -859,6 +869,7 @@ pub(super) fn extract_python_from_import_names(
                                 metadata,
                                 source_language: String::new(),
                                 source_line: None,
+                                call_at: None,
                             });
                         }
                     }
@@ -878,6 +889,7 @@ pub(super) fn extract_python_from_import_names(
                             metadata,
                             source_language: String::new(),
                             source_line: None,
+                            call_at: None,
                         });
                     }
                 }
@@ -907,6 +919,7 @@ pub(super) fn extract_python_from_import_names(
                                 metadata,
                                 source_language: String::new(),
                                 source_line: None,
+                                call_at: None,
                             });
                         }
                     }
@@ -923,6 +936,7 @@ pub(super) fn extract_python_from_import_names(
                         metadata,
                         source_language: String::new(),
                         source_line: None,
+                        call_at: None,
                     });
                 }
                 _ => {}

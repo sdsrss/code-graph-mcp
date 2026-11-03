@@ -74,6 +74,7 @@ pub(super) fn extract_dart_imports(
                 metadata: None,
                 source_language: String::new(),
                 source_line: None,
+                call_at: None,
             });
         }
     }
@@ -129,6 +130,7 @@ pub(super) fn extract_dart_call_from_selector(
                 metadata: None,
                 source_language: String::new(),
                 source_line: None,
+                call_at: None,
             });
         }
     }

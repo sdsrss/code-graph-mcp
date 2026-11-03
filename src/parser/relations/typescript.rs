@@ -74,6 +74,7 @@ pub(super) fn extract_ts_type_reference(
         metadata: None,
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     })
 }
 
@@ -140,6 +141,7 @@ pub(super) fn extract_js_value_reference(
         metadata: None,
         source_language: String::new(),
         source_line: None,
+        call_at: None,
     })
 }
 

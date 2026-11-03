@@ -209,6 +209,7 @@ fn extract_declaration_heritage(ctx: &HeritageCtx, results: &mut Vec<ParsedRelat
             metadata: None,
             source_language: String::new(),
             source_line: None,
+            call_at: None,
         });
     }
     extract_implements(&ctx.node, ctx.source, &cls, results);
@@ -266,6 +267,7 @@ fn extract_rust_impl_heritage(ctx: &HeritageCtx, results: &mut Vec<ParsedRelatio
             metadata: Some(super::serialize_impl_method_metadata(&method_owner)),
             source_language: String::new(),
             source_line: None,
+            call_at: None,
         });
     }
 }
@@ -309,6 +311,7 @@ fn extract_csharp_base_list(ctx: &HeritageCtx, results: &mut Vec<ParsedRelation>
             metadata: None,
             source_language: String::new(),
             source_line: None,
+            call_at: None,
         });
     }
 }
@@ -521,6 +524,7 @@ pub(super) fn extract_implements(
                                             metadata: None,
                                             source_language: String::new(),
                                             source_line: None,
+                                            call_at: None,
                                         });
                                     }
                                     // Handle generic_type: IService<T> -> extract IService
@@ -537,6 +541,7 @@ pub(super) fn extract_implements(
                                                     metadata: None,
                                                     source_language: String::new(),
                                                     source_line: None,
+                                                    call_at: None,
                                                 });
                                             }
                                         }
@@ -562,6 +567,7 @@ pub(super) fn extract_implements(
                                     metadata: None,
                                     source_language: String::new(),
                                     source_line: None,
+                                    call_at: None,
                                 });
                             }
                         }
@@ -584,6 +590,7 @@ pub(super) fn extract_implements(
                                 metadata: None,
                                 source_language: String::new(),
                                 source_line: None,
+                                call_at: None,
                             });
                         }
                     }
@@ -606,6 +613,7 @@ pub(super) fn extract_implements(
                                             metadata: None,
                                             source_language: String::new(),
                                             source_line: None,
+                                            call_at: None,
                                         });
                                     }
                                 }
@@ -620,6 +628,7 @@ pub(super) fn extract_implements(
                                 metadata: None,
                                 source_language: String::new(),
                                 source_line: None,
+                                call_at: None,
                             });
                         }
                     }
