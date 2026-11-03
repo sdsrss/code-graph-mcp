@@ -1,5 +1,102 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 124 → 125
+because some Python call edges bind differently (below). The MCP server
+rebuilds the index when it starts; from the command line,
+`code-graph-mcp reindex` does. To pin the binary back:
+`npm i -g @sdsrs/code-graph@0.182.0` (or, from source, `cargo install
+--locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.182.0
+--features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0; the older
+binary rebuilds its own index once too.
+
+### Python: `C.m()` on the file's own class binds the method Python runs
+
+A call that names a class explicitly, `Widget.__init__(self, …)` or
+`ExpatBuilder.reset(self)`, was resolved as a call on an untyped object, so
+it bound every same-named method in the caller's file. Python looks `m` up
+along `C`'s MRO, and an explicit `C.m(self)` never dispatches to a subclass.
+The call now binds the method of the first class in `C`'s MRO (Python's C3
+order) whose body defines `m` with one `def`, when the caller's file decides
+that class:
+
+- `C` is a class the file defines once, as a plain statement of the module
+  (not under `if`, `try` or `with`, not decorated), with no `from … import *`
+  after it, and every other occurrence of its name is one the parser
+  recognises as a read: a call, an argument or base class, an attribute, an
+  annotation, an assignment's value, an operand, `except C`, `case C()`, and
+  so on.
+- Every base in `C`'s hierarchy is such a class of the file, defined above
+  the class that names it, or an import, a builtin, `object`, or a dotted or
+  subscripted name rooted at one of those (`mod.Base`, `Generic[T]`). A base
+  that is anything else leaves the call undecided: a decorated or
+  conditional class, an alias, a call (`with_metaclass(M, B)`), a subscript
+  of a class of the file, or a name the file binds some other way, a second
+  import included. Such a base can hide classes of the file that move the
+  MRO.
+- No two metaclasses, and no metaclass of the file binding `m` or
+  `__getattribute__` or having a metaclass of its own; no class keyword other than `metaclass=` (it goes to
+  `__init_subclass__`) and no `**kw`.
+- `m` is found before an import, a builtin or `object` in the MRO. No class
+  on the way binds it any other way (a class attribute, a second `def`, a
+  `def` under `if`, a name `__slots__` lists, a walrus in a decorator, a
+  default or a lambda default) or writes its namespace through `locals()`,
+  `vars()`, `exec`, `eval` or a computed `__slots__`. The file has no
+  `C.m = …` or `del C.m` on any of them (parenthesised or starred too), the
+  owner has no `def m` nested in another of its methods (the index names that
+  one `C.m` as well), and neither name is one Python mangles in a class body
+  (`__m`, not `__m__`).
+- The MRO, `object` aside, is at most 64 classes long, and Python accepts it:
+  an inconsistent order (`class C(object, A)`) or a duplicate base leaves the
+  call undecided.
+
+Any other call resolves as before, an `m` from an imported base, a builtin
+(`Exception.__init__`) or `object` included. `super()` calls are unchanged.
+
+What the rule does not see, so a decided call can still name a method Python
+does not run (each reproduced): `C.m` replaced through another name
+(`E = C; E.m = f`), by `setattr`, `globals()["C"].m = …` or `exec`, from
+another module (`a.C.m = f`), or by a base's `__init_subclass__`
+(`cls.m = …`); an imported metaclass with a data descriptor named `m`; a
+class Python refuses for how its imported bases relate (`C(E1, E2)` with
+`E2` deriving from `E1`) or for their instance layout; a module that fails to
+import before the call could run (another class Python refuses, a statement
+that raises). In each of these the old resolution bound
+the same method, among the other same-named ones.
+
+Measured against 0.182.0's source build:
+
+- 15,000 generated files (`tasks/d370g-kit/enum`: base kinds × hierarchy
+  shapes × metaclasses × body bindings × patches), each run by CPython 3.14:
+  of the 927 calls the rule decided in files that import, 834 bound the
+  method CPython ran; the other 93 all had `C.m` replaced through another
+  name (46) or by `setattr` (47). Another 358 decided calls sit in files
+  CPython refuses to import. Every undecided call kept 0.182.0's edges and
+  pending rows byte for byte.
+- SCIP call oracle (`scripts/scip_oracle`), edges at the default `inferred`
+  floor, Python 3.14 standard library: 4,824 → 3,332 wrong edges; precision
+  11,003/15,827 (69.5%) → 10,996/14,328 (76.7%); recall unchanged
+  (10,764/12,375). The edge set lost 1,500 `extracted` same-file edges and
+  gained none. 7 edges the oracle counts as right left the floor; each is a
+  subclass override reached from an explicit base-class call, such as
+  `ExpatBuilder.reset(self)` → `ExpatBuilderNS.reset`. The oracle credits an
+  override for any call to a method; the call binds `ExpatBuilder.reset`.
+- flask 3.1.0, hono 4.6.14, leveldb 1.23, gin 1.10.0, cobra 1.8.1: edge sets
+  identical.
+- In tkinter, `impact Label.__init__ --file tkinter/__init__.py` said `Risk:
+  HIGH`, 24 direct callers (`StringVar.__init__`, `Button.__init__`, …), none
+  of which calls it. It now finds no caller and says so (`Risk: UNKNOWN` with
+  the not-in-the-call-graph warning).
+- Full index of the standard library (569 files, `--no-embed`, 5 interleaved
+  runs each): user CPU median 5.21 s → 5.39 s (+3.6%), wall 3.18 s → 3.19 s.
+  An incremental run after a class-structure edit re-reads the same caller
+  files as before (tkinter `Widget.__init__` toggled 4 times).
+- Files near the 1 MiB size cap built to stress the rule, user CPU: 340,000
+  duplicate bases 1.89 s → 2.16 s; 200,000 nested lists naming the class
+  0.59 s → 0.74 s; 3,000 classes with 62 bases each 8.84 s → 5.94 s.
+
 ## 0.182.0
 
 **Upgrading: nothing to do** (`INDEX_VERSION` stays at 124). Only `snapshot

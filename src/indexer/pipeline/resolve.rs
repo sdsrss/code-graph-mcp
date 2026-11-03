@@ -34,6 +34,10 @@ pub(super) enum CalleeMeta {
     RecvType(String),
     /// `super().f()` (Python): the first base class, bound like `RecvType` but
     /// without its subclasses' overrides — `super()` names one implementation.
+    /// Also a Python `C.f()` whose defining class the parser found inside the
+    /// caller's file (`member::python_class_call_meta`, D#370): the payload is
+    /// that class, which defines `f`, so `recv_type_targets` binds its own
+    /// method — the caller's file's, among same-named classes.
     SuperType(String),
     Receiver(String),
     Chain,
@@ -1402,7 +1406,9 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
         .collect();
     // A Rust call typed by its receiver (`"rt"`, D#112) reads whether the file
     // of each candidate impl defines a struct of the receiver's name
-    // (`foreign_receiver_owner`): it moves with a class of that name.
+    // (`foreign_receiver_owner`): it moves with a class of that name. A Python
+    // `C.m()` the parser decided inside its file (`"own"`, D#370) binds that
+    // file's class's method whatever other files hold: left out.
     let mut stmt = conn.prepare(
         "SELECT f.path, json_extract(e.metadata, '$.q'), json_extract(e.metadata, '$.v'),
                 json_extract(e.metadata, '$.fc'), t.name, json_extract(e.metadata, '$.vc'),
@@ -1411,7 +1417,8 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
          JOIN nodes s ON s.id = e.source_id JOIN files f ON f.id = s.file_id
          JOIN nodes t ON t.id = e.target_id
          WHERE e.relation = 'calls'
-           AND (json_extract(e.metadata, '$.q') IN ('rtype', 'super')
+           AND ((json_extract(e.metadata, '$.q') IN ('rtype', 'super')
+                 AND json_extract(e.metadata, '$.own') IS NULL)
                 OR json_extract(e.metadata, '$.fc') IS NOT NULL
                 OR json_extract(e.metadata, '$.vc') IS NOT NULL
                 OR json_extract(e.metadata, '$.rt') IS NOT NULL)
@@ -1421,7 +1428,8 @@ pub(super) fn typed_callers_of_class_drift(conn: &rusqlite::Connection) -> Resul
                 json_extract(p.metadata, '$.rt')
          FROM pending_unresolved_calls p
          JOIN nodes s ON s.id = p.source_id JOIN files f ON f.id = s.file_id
-         WHERE json_extract(p.metadata, '$.q') IN ('rtype', 'super')
+         WHERE (json_extract(p.metadata, '$.q') IN ('rtype', 'super')
+                AND json_extract(p.metadata, '$.own') IS NULL)
             OR json_extract(p.metadata, '$.fc') IS NOT NULL
             OR json_extract(p.metadata, '$.vc') IS NOT NULL
             OR json_extract(p.metadata, '$.rt') IS NOT NULL",

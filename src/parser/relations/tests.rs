@@ -773,6 +773,603 @@ fn test_member_call_on_an_object_is_marked_member() {
     assert_eq!(meta_of(&c, "read"), None);
 }
 
+// D#370(g): `C.m()` on a class the file defines once, at module level, and
+// never rebinds runs the first `m` along C's MRO — never another class of the
+// file and never a subclass's. When the file decides that class, the call
+// carries the `super()` qualifier naming it. Measured on the Python stdlib by
+// the SCIP oracle (0.182.0): 2,057 wrong edges from `Widget.__init__(self)`-
+// style calls, each bound to every same-file `__init__`.
+//
+// The shape table: every case is one file; the call checked is `C.m(…)`, and
+// C defines `m` itself, so only whether C qualifies is tested here (the MRO is
+// the next test). Accepted shapes read C anywhere; a declined one binds C,
+// defines C again or conditionally, or reaches `m` through something other
+// than C itself.
+#[test]
+fn test_python_call_on_a_module_level_class_carries_that_class() {
+    const CLASS_C: &str = "class B:\n    def m(self): pass\nclass C(B):\n    def m(self): pass\n";
+    const SUPER_C: &str = r#"{"own":1,"q":"super","v":"C"}"#;
+    let meta_of_m = |code: &str| -> Option<String> {
+        let calls = call_meta(code, "python");
+        meta_of(&calls, "m").map(str::to_string)
+    };
+    let accepted: &[(&str, &str)] = &[
+        (
+            "a method of a subclass",
+            "class D(C):\n    def m(self):\n        C.m(self)\n",
+        ),
+        ("a function", "def f(x):\n    C.m(x)\n"),
+        ("module level", "C.m(None)\n"),
+        (
+            "a nested function",
+            "def f():\n    def g():\n        C.m(None)\n",
+        ),
+        ("a lambda", "f = lambda x: C.m(x)\n"),
+        ("a comprehension", "y = [C.m(v) for v in z]\n"),
+        ("a class body", "class D:\n    x = C.m(None)\n"),
+        (
+            "reads of C",
+            "c = C()\nisinstance(c, C)\nisinstance(c, (C, int))\nclass D(C, metaclass=M): pass\n\
+             x: C = c\ndef f(a: C) -> C:\n    return C\nE = C\nf(key=C)\nC[int]\nC is None\n\
+             [C, E]\n{C: C}\nf(*C)\nprint(f'{C}')\nassert C\nif C:\n    pass\nraise C() from C\n\
+             @C\ndef h(): pass\nC.attr = 1\ndef g():\n    C.m(None)\n",
+        ),
+        (
+            "an except clause",
+            "try:\n    pass\nexcept C:\n    C.m(None)\n",
+        ),
+        (
+            "a class pattern",
+            "match x:\n    case C():\n        C.m(x)\n",
+        ),
+    ];
+    for (label, body) in accepted {
+        let code = format!("{CLASS_C}{body}");
+        assert_eq!(
+            meta_of_m(&code).as_deref(),
+            Some(SUPER_C),
+            "{label}:\n{code}"
+        );
+    }
+    // A star import before the class is overridden by it.
+    let code = "from x import *\nclass C:\n    def m(self): pass\nC.m(None)\n";
+    assert_eq!(meta_of_m(code).as_deref(), Some(SUPER_C), "{code}");
+    // A definition that may not run, or that a decorator may replace.
+    for (label, code) in [
+        (
+            "under if/else",
+            "if X:\n    class C:\n        def m(self): pass\nelse:\n    class C:\n        def m(self): pass\nC.m(None)\n",
+        ),
+        ("under try", "try:\n    class C:\n        def m(self): pass\nexcept E:\n    pass\nC.m(None)\n"),
+        (
+            "in except after a star import",
+            "try:\n    from fast import *\nexcept ImportError:\n    class C:\n        def m(self): pass\nC.m(None)\n",
+        ),
+        (
+            "a NameError shim",
+            "try:\n    C\nexcept NameError:\n    class C:\n        def m(self): pass\nC.m(None)\n",
+        ),
+        ("decorated", "@dataclass\nclass C:\n    def m(self): pass\nC.m(None)\n"),
+        (
+            "a metaclass binding m",
+            "class M(type):\n    @property\n    def m(cls): pass\nclass C(metaclass=M):\n    def m(self): pass\nC.m(None)\n",
+        ),
+    ] {
+        assert_ne!(meta_of_m(code).as_deref(), Some(SUPER_C), "{label}:\n{code}");
+    }
+
+    let declined: &[(&str, &str)] = &[
+        ("module-level assignment", "C = wrap(C)\nC.m(None)\n"),
+        (
+            "local assignment",
+            "def f():\n    C = make()\n    C.m(None)\n",
+        ),
+        ("tuple target", "a, C = x\nC.m(None)\n"),
+        ("list target", "[C] = x\nC.m(None)\n"),
+        ("starred target", "a, *C = x\nC.m(None)\n"),
+        ("annotated target", "C: type = X\nC.m(None)\n"),
+        ("augmented assignment", "C += 1\nC.m(None)\n"),
+        ("parameter", "def f(C):\n    C.m(None)\n"),
+        ("star parameter", "def f(*C):\n    C.m(None)\n"),
+        ("default parameter", "def f(C=1):\n    C.m(None)\n"),
+        ("typed parameter", "def f(C: int):\n    C.m(None)\n"),
+        ("keyword-only parameter", "def f(*, C):\n    C.m(None)\n"),
+        ("lambda parameter", "f = lambda C: C.m(None)\n"),
+        ("for target", "for C in xs:\n    C.m(None)\n"),
+        ("comprehension target", "y = [C.m(None) for C in xs]\n"),
+        ("with target", "with f() as C:\n    C.m(None)\n"),
+        (
+            "except target",
+            "try:\n    pass\nexcept E as C:\n    C.m(None)\n",
+        ),
+        ("import", "import C\nC.m(None)\n"),
+        ("import as", "import a as C\nC.m(None)\n"),
+        ("from import", "from x import C\nC.m(None)\n"),
+        ("from import as", "from x import y as C\nC.m(None)\n"),
+        ("global", "def f():\n    global C\n    C.m(None)\n"),
+        (
+            "nonlocal",
+            "def f():\n    def g():\n        nonlocal C\n        C.m(None)\n",
+        ),
+        ("del", "del C\nC.m(None)\n"),
+        ("del in a tuple", "del a, C\nC.m(None)\n"),
+        ("walrus", "if (C := f()):\n    C.m(None)\n"),
+        ("a def of the name", "def C(): pass\nC.m(None)\n"),
+        (
+            "a method of the name",
+            "class D:\n    def C(self): pass\nC.m(None)\n",
+        ),
+        (
+            "a nested class of the name",
+            "def f():\n    class C:\n        def m(self): pass\n    C.m(None)\n",
+        ),
+        (
+            "a class-level class of the name",
+            "class D:\n    class C:\n        def m(self): pass\nC.m(None)\n",
+        ),
+        (
+            "a capture pattern",
+            "match x:\n    case C:\n        C.m(None)\n",
+        ),
+        ("a type parameter", "def f[C](x):\n    C.m(x)\n"),
+        ("a type alias", "type C = int\nC.m(None)\n"),
+        ("a star import after it", "from x import *\nC.m(None)\n"),
+        (
+            "a class-level attribute of the name",
+            "class D:\n    C = int\nC.m(None)\n",
+        ),
+        (
+            "a match-as capture",
+            "match x:\n    case D() as C:\n        C.m(None)\n",
+        ),
+        (
+            "a starred with target",
+            "with f() as (a, *C):\n    C.m(None)\n",
+        ),
+        (
+            "a starred with list target",
+            "with f() as [a, *C]:\n    C.m(None)\n",
+        ),
+        ("a second class of the name", "class C: pass\nC.m(None)\n"),
+        ("the method assigned", "C.m = f\nC.m(None)\n"),
+        ("the method deleted", "del C.m\nC.m(None)\n"),
+    ];
+    for (label, body) in declined {
+        let code = format!("{CLASS_C}{body}");
+        assert_ne!(
+            meta_of_m(&code).as_deref(),
+            Some(SUPER_C),
+            "{label}:\n{code}"
+        );
+    }
+    // Receivers that are not the class itself.
+    for (label, body) in [
+        (
+            "an attribute of self",
+            "class D:\n    def f(self):\n        self.C.m(None)\n",
+        ),
+        ("an attribute of the class", "C.D.m(None)\n"),
+        ("an instance", "C().m()\n"),
+        ("an attribute of a name", "x.C.m(None)\n"),
+    ] {
+        let code = format!("{CLASS_C}{body}");
+        assert_ne!(
+            meta_of_m(&code).as_deref(),
+            Some(SUPER_C),
+            "{label}:\n{code}"
+        );
+    }
+    // A class the file does not define, and `super()`, as before.
+    assert_ne!(
+        meta_of_m("class C(B):\n    def f(self):\n        B.m(self)\n").as_deref(),
+        Some(r#"{"q":"super","v":"B"}"#)
+    );
+    assert_eq!(
+        meta_of_m(&format!(
+            "{CLASS_C}class D(C):\n    def f(self):\n        super().m()\n"
+        ))
+        .as_deref(),
+        Some(r#"{"q":"super","v":"C"}"#)
+    );
+}
+
+// The class whose `m` a `C.m()` runs: the first of C's MRO (C3) that defines
+// it with one `def`, found only when everything on the way is a class of this
+// file; anything else declines (None: the call stays an untyped member call).
+// The C3 cases are the reviewer's counter-examples to a breadth-first walk.
+#[test]
+fn test_python_call_on_a_module_level_class_binds_the_mro_owner() {
+    let owner_of_m = |code: &str| -> Option<String> {
+        let calls = call_meta(code, "python");
+        let meta: serde_json::Value = serde_json::from_str(meta_of(&calls, "m")?).ok()?;
+        (meta["q"] == "super" && meta["own"] == 1).then(|| meta["v"].as_str().unwrap().to_string())
+    };
+    let cases: &[(&str, &str, Option<&str>)] = &[
+        ("own", "class C:\n    def m(self): pass\n", Some("C")),
+        ("own, static", "class C:\n    @staticmethod\n    def m(): pass\n", Some("C")),
+        ("one base", "class A:\n    def m(self): pass\nclass C(A): pass\n", Some("A")),
+        (
+            "depth before breadth",
+            "class Base1:\n    def m(self): pass\nclass A(Base1): pass\nclass B:\n    def m(self): pass\nclass C(A, B): pass\n",
+            Some("Base1"),
+        ),
+        (
+            "a diamond",
+            "class R:\n    def m(self): pass\nclass A(R): pass\nclass B(R):\n    def m(self): pass\nclass C(A, B): pass\n",
+            Some("B"),
+        ),
+        (
+            "an open base, own m",
+            "from x import Base\nclass C(Base):\n    def m(self): pass\n",
+            Some("C"),
+        ),
+        ("an open base", "from x import Base\nclass C(Base): pass\n", None),
+        ("a dotted base", "class C(mod.Base): pass\n", None),
+        (
+            "an open base behind a file base",
+            "from x import Base\nclass A(Base): pass\nclass B:\n    def m(self): pass\nclass C(A, B): pass\n",
+            None,
+        ),
+        (
+            "a builtin before the owner",
+            "class Mixin:\n    def m(self): pass\nclass C(dict, Mixin): pass\n",
+            None,
+        ),
+        (
+            "a builtin after the owner",
+            "class Mixin:\n    def m(self): pass\nclass C(Mixin, dict): pass\n",
+            Some("Mixin"),
+        ),
+        ("no owner in the file", "class A: pass\nclass C(A): pass\n", None),
+        (
+            "a class attribute of the name",
+            "class A:\n    def m(self): pass\nclass C(A):\n    m = other\n",
+            None,
+        ),
+        ("a conditional def", "class C:\n    if X:\n        def m(self): pass\n", None),
+        (
+            "two defs",
+            "class C:\n    def m(self): pass\n    def m(self, a): pass\n",
+            None,
+        ),
+        (
+            "a base with a metaclass",
+            "class M(type):\n    @property\n    def m(cls): pass\nclass A(metaclass=M):\n    def m(self): pass\nclass C(A): pass\n",
+            None,
+        ),
+        (
+            "a base's method assigned",
+            "class A:\n    def m(self): pass\nclass C(A): pass\nA.m = f\n",
+            None,
+        ),
+        (
+            "an inconsistent MRO",
+            "class A:\n    def m(self): pass\nclass B(A): pass\nclass C(A, B): pass\n",
+            None,
+        ),
+        (
+            "a base rebound",
+            "class A:\n    def m(self): pass\nclass C(A): pass\nA = None\n",
+            None,
+        ),
+        // A `std` path is Rust's standard library to the resolver.
+        ("a class named std", "class std:\n    def m(self): pass\nclass C(std): pass\n", None),
+        // Review round 2 of D#370(g). A `class` statement reads its bases when
+        // it runs: a class defined further down is not the base yet.
+        (
+            "a base defined further down",
+            "class C(A): pass\nclass A:\n    def m(self): pass\n",
+            None,
+        ),
+        // A metaclass is inherited, and can answer `C.m` before C's body.
+        (
+            "a metaclass on a base",
+            "class M(type):\n    @property\n    def m(cls): pass\nclass B(metaclass=M): pass\nclass C(B):\n    def m(self): pass\n",
+            None,
+        ),
+        (
+            "a metaclass two bases up",
+            "class M(type):\n    @property\n    def m(cls): pass\nclass A(metaclass=M): pass\nclass B(A): pass\nclass C(B):\n    def m(self): pass\n",
+            None,
+        ),
+        // Python refuses the class: there is no `C.m` to run.
+        (
+            "an inconsistent MRO, own m",
+            "class A: pass\nclass B(A): pass\nclass C(A, B):\n    def m(self): pass\n",
+            None,
+        ),
+        // A walrus in a def's or a class's header binds in the class body.
+        (
+            "a walrus in a default",
+            "class C:\n    def m(self): pass\n    def z(self, a=(m := f)): pass\n",
+            None,
+        ),
+        (
+            "a walrus in a decorator",
+            "class C:\n    def m(self): pass\n    @(m := deco)\n    def z(self): pass\n",
+            None,
+        ),
+        (
+            "a walrus in an annotation",
+            "class C:\n    def m(self): pass\n    def z(self) -> (m := int): pass\n",
+            None,
+        ),
+        (
+            "a walrus in a nested class's bases",
+            "class C:\n    def m(self): pass\n    class I((m := object)): pass\n",
+            None,
+        ),
+        (
+            "a walrus in a base's default",
+            "class A:\n    def m(self): pass\n    def z(self, a=(m := f)): pass\nclass C(A): pass\n",
+            None,
+        ),
+        ("assigned in parentheses", "class C:\n    def m(self): pass\n(C).m = f\n", None),
+        ("deleted in parentheses", "class C:\n    def m(self): pass\ndel (C).m\n", None),
+        (
+            "a base assigned in parentheses",
+            "class A:\n    def m(self): pass\nclass C(A): pass\n((A)).m = f\n",
+            None,
+        ),
+        // Controls: a walrus elsewhere in a def binds in the def's own scope;
+        // a metaclass below the class is not its metaclass.
+        (
+            "a walrus in a body",
+            "class C:\n    def m(self): pass\n    def z(self):\n        (m := f)\n",
+            Some("C"),
+        ),
+        (
+            "a metaclass on a subclass",
+            "class C:\n    def m(self): pass\nclass D(C, metaclass=M): pass\n",
+            Some("C"),
+        ),
+        // Redesign after review round 3. A base the rule cannot see whole (a
+        // decorated, conditional, aliased, subscripted or computed class)
+        // may hide classes of the file that reorder the MRO, or a metaclass:
+        // the class is left undecided. An imported or builtin base is a leaf.
+        (
+            "a decorated base",
+            "class Base:\n    def m(self): pass\nclass Mixin(Base): pass\n@keep\nclass Data(Base):\n    def m(self): pass\nclass C(Mixin, Data): pass\n",
+            None,
+        ),
+        (
+            "a base under if",
+            "class Base:\n    def m(self): pass\nif X:\n    class I(Base): pass\nclass C(I): pass\n",
+            None,
+        ),
+        ("an alias base", "class A:\n    def m(self): pass\nB = A\nclass C(B): pass\n", None),
+        (
+            "a subscript of a file class",
+            "class G(Generic[T]):\n    def m(self): pass\nclass C(G[int]): pass\n",
+            None,
+        ),
+        ("a call base", "class A:\n    def m(self): pass\nclass C(mk(A)): pass\n", None),
+        (
+            "an imported base reassigned",
+            "from x import E\nE = wrap(E)\nclass A:\n    def m(self): pass\nclass C(A, E): pass\n",
+            None,
+        ),
+        (
+            "a subscript of an import",
+            "from typing import Generic, TypeVar\nT = TypeVar('T')\nclass C(Generic[T]):\n    def m(self): pass\n",
+            Some("C"),
+        ),
+        (
+            "an imported base after the owner",
+            "from x import E\nclass A:\n    def m(self): pass\nclass C(A, E): pass\n",
+            Some("A"),
+        ),
+        (
+            "an imported module's class after the owner",
+            "import mod\nclass A:\n    def m(self): pass\nclass C(A, mod.E): pass\n",
+            Some("A"),
+        ),
+        // A base's root name bound anywhere else in the file (here `def f(x)`,
+        // the call's own parameter) is taken as rebound: the class is blind.
+        (
+            "a base rooted at a name bound elsewhere",
+            "import x\nclass A:\n    def m(self): pass\nclass C(A, x.E): pass\n",
+            None,
+        ),
+        // `object` ends every MRO: first among other bases, Python refuses.
+        ("object first", "class A:\n    def m(self): pass\nclass C(object, A): pass\n", None),
+        ("object last", "class A:\n    def m(self): pass\nclass C(A, object): pass\n", Some("A")),
+        (
+            "a duplicate imported base",
+            "from x import E\nclass C(E, E):\n    def m(self): pass\n",
+            None,
+        ),
+        // A metaclass answers `C.m` first only through a data descriptor or
+        // `__getattribute__`: one of the file is read, an imported one is
+        // taken to have none.
+        (
+            "an imported metaclass",
+            "from abc import ABCMeta\nclass A(metaclass=ABCMeta):\n    def m(self): pass\nclass C(A): pass\n",
+            Some("A"),
+        ),
+        (
+            "a metaclass of the file without m",
+            "class M(type):\n    def other(cls): pass\nclass C(metaclass=M):\n    def m(self): pass\n",
+            Some("C"),
+        ),
+        (
+            "a metaclass with __getattribute__",
+            "class M(type):\n    def __getattribute__(cls, n): pass\nclass C(metaclass=M):\n    def m(self): pass\n",
+            None,
+        ),
+        (
+            "a metaclass binding m",
+            "class M(type):\n    def m(cls): pass\nclass C(metaclass=M):\n    def m(self): pass\n",
+            None,
+        ),
+        (
+            "two metaclasses",
+            "from abc import ABCMeta\nclass M(type):\n    def other(cls): pass\nclass A(metaclass=M): pass\nclass B(metaclass=ABCMeta): pass\nclass C(A, B):\n    def m(self): pass\n",
+            None,
+        ),
+        ("a metaclass by **", "class C(**kw):\n    def m(self): pass\n", None),
+        (
+            "an aliased metaclass",
+            "class M(type): pass\nN = M\nclass C(metaclass=N):\n    def m(self): pass\n",
+            None,
+        ),
+        (
+            "a metaclass behind a decorated base",
+            "class M(type):\n    @property\n    def m(cls): pass\n@keep\nclass R(metaclass=M): pass\nclass C(R):\n    def m(self): pass\n",
+            None,
+        ),
+        // Any other class keyword goes to `__init_subclass__`, which may bind m.
+        ("a class keyword", "class A:\n    def m(self): pass\nclass C(A, flag=1): pass\n", None),
+        (
+            "a walrus in a lambda default",
+            "class C:\n    def m(self): pass\n    f = lambda a=(m := g): a\n",
+            None,
+        ),
+        (
+            "slots naming m in a base",
+            "class S:\n    __slots__ = (\"m\",)\nclass A:\n    def m(self): pass\nclass C(S, A): pass\n",
+            None,
+        ),
+        (
+            "slots without m",
+            "class S:\n    __slots__ = (\"x\",)\nclass A:\n    def m(self): pass\nclass C(S, A): pass\n",
+            Some("A"),
+        ),
+        (
+            "computed slots",
+            "class S:\n    __slots__ = names\nclass A:\n    def m(self): pass\nclass C(S, A): pass\n",
+            None,
+        ),
+        (
+            "locals in the body",
+            "class C:\n    def m(self): pass\n    locals()[\"m\"] = f\n",
+            None,
+        ),
+        // The index names a function nested in a method `C.m` too.
+        (
+            "a nested namesake",
+            "class C:\n    def m(self): pass\n    def other(self):\n        def m(): pass\n",
+            None,
+        ),
+        ("assigned starred", "class C:\n    def m(self): pass\n*C.m, = [f]\n", None),
+        ("assigned in a starred list", "class C:\n    def m(self): pass\n[*C.m] = [f]\n", None),
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for (label, classes, want) in cases {
+        let code = format!("{classes}def f(x):\n    C.m(x)\n");
+        let got = owner_of_m(&code);
+        if got.as_deref() != *want {
+            wrong.push(format!("{label}: {got:?}, want {want:?}"));
+        }
+    }
+    // The longest MRO decided is 64 classes (once a walk stopped at 32): a
+    // chain of 64 is decided, one of 65 is not.
+    let chain = |n: usize| {
+        let mut code = String::from("class K0:\n    def m(self): pass\n");
+        for i in 1..=n {
+            code += &format!("class K{i}(K{}): pass\n", i - 1);
+        }
+        code + &format!("def f(x):\n    K{n}.m(x)\n")
+    };
+    for (n, want) in [(63, Some("K0")), (64, None)] {
+        let got = owner_of_m(&chain(n));
+        if got.as_deref() != want {
+            wrong.push(format!("a chain of {}: {got:?}, want {want:?}", n + 1));
+        }
+    }
+    // Python mangles `__x` in a class body (`C.__m` → `C._A__m` inside `A`),
+    // so a name written that way is not the def it spells. A dunder is not.
+    let owner_of = |code: &str, method: &str| -> Option<String> {
+        let calls = call_meta(code, "python");
+        let meta: serde_json::Value = serde_json::from_str(meta_of(&calls, method)?).ok()?;
+        (meta["own"] == 1).then(|| meta["v"].as_str().unwrap().to_string())
+    };
+    let mangled: &[(&str, &str, &str, Option<&str>)] = &[
+        (
+            "a mangled method",
+            "class C:\n    def __m(self): pass\nclass A:\n    def run(self):\n        C.__m(self)\n",
+            "__m",
+            None,
+        ),
+        (
+            "a mangled class",
+            "class __C:\n    def m(self): pass\nclass A:\n    def run(self):\n        __C.m(self)\n",
+            "m",
+            None,
+        ),
+        (
+            "a dunder",
+            "class C:\n    def __init__(self): pass\nclass A:\n    def run(self):\n        C.__init__(self)\n",
+            "__init__",
+            Some("C"),
+        ),
+    ];
+    for (label, code, method, want) in mangled {
+        let got = owner_of(code, method);
+        if got.as_deref() != *want {
+            wrong.push(format!("{label}: {got:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// Review round 3 of D#370(g): duplicate bases made the C3 merge quadratic
+// (100,000 bases: 6.1 s against 0.39 s before the rule), and every occurrence
+// of a class name climbed all the containers around it (20,000 nested lists:
+// 3.0 s against 0.07 s). Both are linear now.
+#[test]
+fn test_python_class_rule_costs_stay_linear() {
+    let within = |label: &str, code: String| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(call_meta(&code, "python"));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{label} took over 60 s"))
+    };
+    let k = 100_000;
+    let dup = format!(
+        "class A:\n    def m(self): pass\nclass C({}): pass\ndef f(x):\n    C.m(x)\n",
+        vec!["A"; k].join(", ")
+    );
+    assert_eq!(meta_of(&within("duplicate bases", dup), "m"), Some(MEMBER));
+    let nest = format!(
+        "class C:\n    def m(self): pass\nx = {}{}{}\ndef f(y):\n    C.m(y)\n",
+        "[".repeat(k),
+        vec!["C"; k].join(", "),
+        "]".repeat(k)
+    );
+    let calls = within("nested lists", nest);
+    assert_eq!(
+        meta_of(&calls, "m"),
+        Some(r#"{"own":1,"q":"super","v":"C"}"#)
+    );
+}
+
+// Review round 2 of D#370(g): each class's MRO is merged once. The walk that
+// merged every base's MRO again for each path to it doubled with each class
+// of `Ki(K(i-1), …, K0)` (22 classes: 0.6 s, 26: 10 s); 30 is hours.
+#[test]
+fn test_python_class_mro_costs_one_merge_per_class() {
+    let mut code = String::from("class K0:\n    def m(self): pass\n");
+    for i in 1..=30usize {
+        let bases: Vec<String> = (0..i).rev().map(|j| format!("K{j}")).collect();
+        code += &format!("class K{i}({}): pass\n", bases.join(", "));
+    }
+    code += "def f(x):\n    K30.m(x)\n";
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(call_meta(&code, "python"));
+    });
+    let calls = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("30 overlapping classes took over 60 s");
+    assert_eq!(
+        meta_of(&calls, "m"),
+        Some(r#"{"own":1,"q":"super","v":"K0"}"#)
+    );
+}
+
 // Review of D#370(a): a name a file imports from more than one module carries
 // how many (`"n"`), so the resolver can tell a re-export with an arm it cannot
 // see from one it sees whole. Counted over the exported name (an `as`), not
