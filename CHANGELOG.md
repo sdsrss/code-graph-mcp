@@ -124,11 +124,12 @@ SCIP oracle, before and after, on the same copy of each project:
 hono loses 145 import and 22 call edges and gains 3 import edges, each now
 bound through a barrel to the definition (`toSSG` through
 `helper/ssg/index.ts`); 22 of its `references` edges go from `inferred` to
-`ambiguous`. gsd-lite loses 100 import and 42 call edges. Every edge lost was
-a same-named target beside one that stays (`import { serveStatic } from
-'../../src/adapter/bun'` had bound five `serveStatic` functions and now binds
-`bun/serve-static.ts`'s), and on neither is an import or a call left
-without a target.
+`ambiguous`. gsd-lite loses 100 import and 42 call edges and gains 66 and
+42: the same imports and calls, now bound to the definition the barrel names
+instead of a namesake. (`import { serveStatic } from '../../src/adapter/bun'`
+had bound five `serveStatic` functions and now binds
+`bun/serve-static.ts`'s.) On neither is an import or a call left without a
+target.
 
 ### fix: a call binds the same-named definition its scope sees
 
@@ -205,12 +206,12 @@ now `ambiguous`: below the default confidence floor, shown with
 `--min-confidence ambiguous`. Names of the mapping, sequence and file
 protocols (`items`, `get`, `update`, `append`, `sort`, `read`, `seek`), which
 project classes implement, keep `inferred`, and so do `match`, `start` and
-`end`. A call whose receiver the index types (an annotated parameter or
-local, `p: Path`) keeps its label, and so does a same-file call the
-confidence pass leaves `extracted` (one through a parameter or local); other
-languages are unchanged. A call on a constructor call's result in another
-file (`Store().exists()`) is not typed that way and is relabelled like an
-untyped receiver.
+`end`. A call on an annotated parameter (`p: Path`) keeps its label, and so
+does a same-file call the confidence pass leaves `extracted` (one through a
+parameter or local); other languages are unchanged. A call on an annotated
+local (`s: Store = make()`) or on a constructor call's result
+(`Store().exists()`) in another file's class is not typed that way and is
+relabelled like an untyped receiver.
 
 SCIP oracle, before and after, on the same copy of each project:
 
@@ -289,8 +290,8 @@ server next starts. The file watcher still starts at the first tool call.
   no hit below the file: 10 were the file list of a `grep -l`, 5 marked every
   hit `→ module <file>`, and none followed an empty output.
   Such an answer is now skipped when a line of the command's output has a
-  grep hit's shape (it starts `path:` or `NN:`, or is a bare path as `-l`
-  prints it). When no line has that shape, or the hook cannot read the
+  grep hit's shape (it holds a `path:` token, starts `NN:`, or is a bare path
+  as `-l` prints it). When no line has that shape, or the hook cannot read the
   output, it is added as before, and so is an answer with one hit inside a
   function or class. Replayed over those 21 answers, 14 are skipped; the 6 with a
   function or class stay, and so does 1 whose output had no such line. A skip is recorded in

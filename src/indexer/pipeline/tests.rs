@@ -15532,7 +15532,7 @@ fn a_barrel_only_edit_rebinds_its_importers_as_a_rebuild_does() {
 
 /// Pre-tag review of 0.185.0, M2: the re-export walk counted every file it
 /// visited, so a barrel with eight or more `export *` sources stopped before
-/// the ninth and the import fell back to a same-named function elsewhere. The
+/// the eighth and the import fell back to a same-named function elsewhere. The
 /// bound is on depth.
 #[test]
 fn a_wide_export_star_barrel_is_followed_past_eight_sources() {

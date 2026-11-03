@@ -98,3 +98,11 @@
 - M2（已修）：重导出遍历的上限从"总共访问 8 个文件"改为"8 层深"。测试 `a_wide_export_star_barrel_is_followed_past_eight_sources`。
 - M3（已修）：见上面"块作用域"一条。A3 表格新增 5 行。
 - LOW 处理：JS 变异存活补测试并验证能杀（grep 模式守卫、`^ {2}` 锚点）；D#713 只有 agent_id 的读者补断言；两处注释更正；其余写进 CHANGELOG 的"未覆盖"或收窄说法（D#720 的 `1 + await f<T>()`，A4 的构造器接收者，改名重导出不跟进，Python `global`，grep 跳过把 `echo`/版本号行当命中，启动修复遇并发写不重试）。
+
+## 0.185.0 预发评审第 2 轮（2026-11-03）——停在评审上限，等用户决定
+
+- 评审范围 `64f06762..c9225678`。HIGH-1：H1 的扇出跨不过 `export *`。星号行的值 `<module>␟spec␟star␟下一文件` 在下层变化时不变，上层 barrel 不算漂移；星号导入边目标名是 `<module>`，和下层漂移的具名名字对不上。用评审的 38 种编辑形状（`/var/tmp/agent-tmp-review2-0185/cases`，复制在 `/var/tmp/agent-tmp-oracle-m3/kit`，`ivf.sh BIN CASE`）复现：0.184.0 0/38 不一致，85986fff 6/38（star_chain_mid、star_chain_mid_gains_named、star_cycle、star_then_named、barrel_deleted、dir_import_file_deleted）。
+- MEDIUM-1：增删命名空间导入或整模块 `require` 时，漂移名是 `<module>`，所有命名空间导入方都被重抽（claude-mem-lite 那种编辑 99–112 → 266–284 ms，边不变）。
+- LOW：删除 barrel 不重抽导入方（按本轮之后的文件集解析）；深度上限加"每次查找只访问一次"依赖顺序；TS 合并命名空间被当嵌套块、丢正确边；测试钉不住块收窄和深度边界；`for_in_statement` 条目是死代码；四条文档说法不准（已改：gsd-lite 句子、带注解局部变量、grep 命中形状、测试注释差一）。
+- 计划中的修法（未动手）：漂移按 `export *` 边做传递闭包（经星号转出漂移文件的文件也算漂移，继承名字）；匹配时排除 `<module>` 名；被删文件按运行前的文件集解析；TS `internal_module` 的块不算嵌套块；补只含块内调用的测试行和深度边界测试；删 `for_in_statement`。验收：38 形状 0/38，12 语料边集不变，然后第 3 轮增量评审（越过两轮上限，需用户同意）。
+- 备选：按现状发版，6 种形状和过度拉取写进"未覆盖"，0.185.1 单独修。
