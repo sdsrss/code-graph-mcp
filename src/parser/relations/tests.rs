@@ -8819,6 +8819,10 @@ fn a_python_module_call_that_may_reach_its_own_module_is_marked() {
             "star from the package",
             "from pkg import *\nimport ext as mod\nmod.go()\n",
         ),
+        (
+            "star from its own module",
+            "from mod import *\nimport ext\next.go()\n",
+        ),
     ];
     for (shape, src) in marked {
         let meta = meta_at(src, at);
@@ -8832,6 +8836,86 @@ fn a_python_module_call_that_may_reach_its_own_module_is_marked() {
         let meta = meta_at("import pkg\npkg.mod.go()\n", path);
         assert!(!meta.contains(r#""loc""#), "{path:?}: {meta}");
     }
+}
+
+/// D#700(2b), review round 2: the reach check reads targets the review's
+/// surviving mutants changed (`import pkg.other` binds `pkg`; a from-import's
+/// target keeps its module; a target found twice in the path), sees imports
+/// at any depth, and costs linear time in star imports × names and in
+/// repeated imports.
+#[test]
+fn a_python_module_call_reach_holds_for_review_round_two_shapes() {
+    let meta_at = |src: &str, path: &str| -> String {
+        let tree = crate::parser::treesitter::parse_tree(src, "python").unwrap();
+        extract_relations_from_tree(&tree, src, "python", Some(path))
+            .into_iter()
+            .find(|r| r.relation == REL_CALLS && r.target_name == "go")
+            .and_then(|r| r.metadata)
+            .unwrap_or_else(|| panic!("no go() call: {src}"))
+    };
+    for (shape, src, path) in [
+        (
+            "import a.b binds a",
+            "import pkg.other\npkg.mod.go()\n",
+            "pkg/mod.py",
+        ),
+        (
+            "a segment twice in the path",
+            "import requests\nrequests.models.go()\n",
+            "requests/requests/models.py",
+        ),
+        (
+            "from-import of the file's own class",
+            "from pkg.mod import Klass as K2\nK2.go()\n",
+            "pkg/mod.py",
+        ),
+    ] {
+        let meta = meta_at(src, path);
+        assert!(meta.contains(r#""loc":1"#), "{shape}: {meta}");
+    }
+    // An import below the depth `collect` reads (1-space indentation keeps the
+    // nesting parseable) may rebind the name to the file's own module.
+    let mut deep = String::from("import ext as m\n");
+    for level in 0..100 {
+        deep += &format!("{0}if x:\n{0} pass\n{0}else:\n", " ".repeat(level));
+    }
+    deep += &format!("{}import pkg.mod as m\nm.go()\n", " ".repeat(100));
+    let tree = crate::parser::treesitter::parse_tree(&deep, "python").unwrap();
+    assert!(!tree.root_node().has_error(), "the nesting must parse");
+    assert!(
+        meta_at(&deep, "pkg/mod.py").contains(r#""loc":1"#),
+        "deep import"
+    );
+
+    let within = |label: &str, code: String| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let tree = crate::parser::treesitter::parse_tree(&code, "python").unwrap();
+            let _ = tx.send(extract_relations_from_tree(
+                &tree,
+                &code,
+                "python",
+                Some("pkg/mod.py"),
+            ));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{label} took over 60 s"))
+    };
+    let n = 40_000;
+    let mut stars = String::new();
+    for i in 0..n {
+        stars += &format!("import m{i}\nfrom s{i} import *\n");
+    }
+    stars += "m0.x.go()\n";
+    assert!(!within("star imports x names", stars).is_empty());
+    // Quadratic here took 16 s at 40,000 in a debug build: 120,000 is ~150 s.
+    let n = 120_000;
+    let repeat = format!(
+        "{}{}",
+        "import pkg\n".repeat(n),
+        "pkg.other.go()\n".repeat(n)
+    );
+    assert!(!within("repeated imports", repeat).is_empty());
 }
 
 /// D#700(2b): a call through an imported name (`{"q":"module"}`) carries

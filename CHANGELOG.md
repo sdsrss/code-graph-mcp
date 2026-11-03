@@ -43,7 +43,9 @@ same-named definition in the caller's file resolves as before. Everything else
 resolves as before too: a name the file also binds some other way (an
 assignment, a parameter, `def`, `class`, a loop or `with … as` target,
 `global`, `del`, a match capture), a file that writes an attribute rooted at
-the name (`ext.go = go`, `del ext.go`, `ext.sub.go += 1`), and a direct
+the name (`ext.go = go`, `del ext.go`, `ext.sub.go += 1`), a file that writes,
+on any object, an attribute named like a link of the call (`alias.go = go`
+after `alias = ext`, `mod.go = go` in a function handed `ext`), and a direct
 `ext.go()` call on a name that holds one plain-imported module everywhere in
 the file (since 0.176.0 it binds what `from ext import go` would).
 
@@ -70,8 +72,10 @@ batches of five runs).
   call the new rule stopped binding while Python ran the file's own `go` used
   one of the first three.
 - A module that hands the caller's own definition back: `os.path.join`
-  called inside `posixpath.py`, or nltk's `chunk/util.py` calling
-  `nltk.chunk.tagstr2tree`, which `nltk/chunk/__init__.py` imports from it.
+  called inside `posixpath.py`, nltk's `chunk/util.py` calling
+  `nltk.chunk.tagstr2tree`, which `nltk/chunk/__init__.py` imports from it,
+  or nltk's `framenet.py` calling `fn.frames()` through the corpus loader
+  `from nltk.corpus import framenet as fn` (11 such edges in nltk 3.9.2).
 - A direct `ext.go()` call on a name that holds one plain-imported module
   everywhere in the file, where `from ext import go` would find nothing, keeps
   its bind into the caller's file (15 wrong edges at the default floor in the
@@ -79,6 +83,10 @@ batches of five runs).
 - A file that uses the name somewhere the parser does not recognise as a read
   keeps every call through it as before, for example `with ext.lock:`,
   `yield ext.x`, `[ext.x for _ in y]` and `case ext.CONST:`.
+- Two import names of one module, one kept as before and one not (`import ext
+  as m1`, `import ext as m2`, `m1.flag = 0`), can store the same call edge
+  twice, once with the new `"loc"` metadata key; `refs`, `impact` and
+  `callgraph` list it once.
 
 ## 0.183.0
 

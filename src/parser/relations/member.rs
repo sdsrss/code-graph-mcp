@@ -109,10 +109,13 @@ pub(super) fn reset_import_bound(
 /// `import a.b` binds `a` to `a`, `import a.b as m` binds `m` to `a.b`, `from
 /// p import n [as m]` binds `n` (`m`) to `p.n`; a relative import to `None`.
 /// `from p import *` may bind any name, to `p.<name>`: kept in `stars`.
+/// `truncated`: the walk stopped at its depth cap, so an import below it may
+/// rebind any name.
 #[derive(Default)]
 struct PyImportTargets {
     by_name: HashMap<String, Vec<Option<String>>>,
     stars: Vec<Option<String>>,
+    truncated: bool,
 }
 
 fn collect(
@@ -124,6 +127,7 @@ fn collect(
     depth: usize,
 ) {
     if depth > 256 {
+        targets.truncated = true;
         return;
     }
     let text = |n: tree_sitter::Node| node_text(&n, source).to_string();
@@ -1187,7 +1191,11 @@ fn py_module_names(
 ///   leading part that may be the module the file is (`import a` and
 ///   `a.mod.go()` in `a/mod.py`; `from c import mod` and `mod.go()` in
 ///   `c/mod.py`), or one of the imports is relative. Without `rel_path`, or
-///   for a file no `.py`/`.pyi` name makes a module, this leg is skipped.
+///   for a file no `.py`/`.pyi` name makes a module, this leg is skipped; an
+///   import below `collect`'s depth cap takes every name;
+/// - the file writes, on any object, an attribute named like a link of an
+///   attribute chain rooted at the name: the module may be patched through
+///   another name (`alias = m; alias.f = g`, `def install(x): x.f = g`).
 ///
 /// One cursor walk, no recursion: a deep expression cannot overflow it.
 fn py_local_imports(
@@ -1213,13 +1221,35 @@ fn py_local_imports(
     // chain at all is local outright.
     let mut rests: HashMap<&str, Vec<&[&str]>> = HashMap::new();
     if let Some(caller) = &caller {
+        if targets.truncated {
+            return bound.keys().cloned().collect();
+        }
+        // `from p import *` binds a name to `p.<name>`. A leading part of `p`
+        // alone that is a trailing part of `caller` reaches the file whatever
+        // the name; past `p`, the name is the next link, so only a name that
+        // is a segment of `caller` can go on to reach it.
+        let mut starred: HashMap<&str, Vec<Option<String>>> = HashMap::new();
+        for star in &targets.stars {
+            let Some(module) = star else {
+                return bound.keys().cloned().collect();
+            };
+            let segments: Vec<&str> = module.split('.').collect();
+            if (1..=segments.len().min(caller.len())).any(|k| caller.ends_with(&segments[..k])) {
+                return bound.keys().cloned().collect();
+            }
+            for segment in caller {
+                if bound.contains_key(*segment) {
+                    starred
+                        .entry(segment)
+                        .or_default()
+                        .push(Some(format!("{module}.{segment}")));
+                }
+            }
+        }
         for name in bound.keys() {
-            let stars = targets
-                .stars
-                .iter()
-                .map(|star| star.as_ref().map(|m| format!("{m}.{name}")));
-            let own = targets.by_name.get(name).into_iter().flatten().cloned();
-            match py_reach_of(own.chain(stars), caller) {
+            let own = targets.by_name.get(name).into_iter().flatten();
+            let starred = starred.get(name.as_str()).into_iter().flatten();
+            match py_reach_of(own.chain(starred).cloned(), caller) {
                 None => {
                     local.insert(name.clone());
                 }
@@ -1230,6 +1260,10 @@ fn py_local_imports(
             }
         }
     }
+    // Attribute names the file writes on any object, and per name the links
+    // of the chains rooted at it (F1 of review round 2).
+    let mut written: HashSet<&str> = HashSet::new();
+    let mut links: HashMap<&str, HashSet<&str>> = HashMap::new();
     let no_classes: HashSet<usize> = HashSet::new();
     // `tops[i]`: the index of the nearest ancestor at or above `i` that is no
     // container, as `py_class_name_is_read` expects.
@@ -1238,20 +1272,31 @@ fn py_local_imports(
     let mut cursor = root.walk();
     loop {
         let node = cursor.node();
+        if node.kind() == "attribute"
+            && !py_import_name_is_read(node, &ancestors, &tops, &no_classes)
+        {
+            if let Some(attr) = node.child_by_field_name("attribute") {
+                written.insert(node_text(&attr, source));
+            }
+        }
         if node.kind() == "identifier" {
             let name = node_text(&node, source);
-            if bound.contains_key(name)
-                && !local.contains(name)
-                && !py_in_import(&ancestors)
-                && (!py_import_name_is_read(node, &ancestors, &tops, &no_classes)
+            if bound.contains_key(name) && !local.contains(name) && !py_in_import(&ancestors) {
+                if !py_import_name_is_read(node, &ancestors, &tops, &no_classes)
                     || py_attribute_chain_written(node, &ancestors, &tops, &no_classes)
-                    || rests.get(name).is_some_and(|rests| {
-                        let longest = rests.iter().map(|r| r.len()).max().unwrap_or(0);
-                        let chain = py_chain_segments(node, &ancestors, source, longest);
-                        rests.iter().any(|r| chain.starts_with(r))
-                    }))
-            {
-                local.insert(name.to_string());
+                {
+                    local.insert(name.to_string());
+                } else {
+                    let chain = py_chain_segments(node, &ancestors, source, usize::MAX);
+                    if rests
+                        .get(name)
+                        .is_some_and(|rests| rests.iter().any(|r| chain.starts_with(r)))
+                    {
+                        local.insert(name.to_string());
+                    } else {
+                        links.entry(name).or_default().extend(chain);
+                    }
+                }
             }
         }
         if cursor.goto_first_child() {
@@ -1266,6 +1311,11 @@ fn py_local_imports(
         }
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
+                for (name, links) in links {
+                    if links.iter().any(|link| written.contains(link)) {
+                        local.insert(name.to_string());
+                    }
+                }
                 return local;
             }
             ancestors.pop();
@@ -1329,6 +1379,9 @@ fn py_reach_of<'c>(
             }
         }
     }
+    // Each rest is a trailing part of `caller`: one per length.
+    rests.sort_by_key(|rest| rest.len());
+    rests.dedup_by_key(|rest| rest.len());
     Some(rests)
 }
 
