@@ -22,7 +22,7 @@ use super::node_text;
 
 /// The receiver class of `call` for C++ and JS/TS, or None.
 pub(super) fn receiver_type(call: tree_sitter::Node, source: &str, family: &str) -> Option<String> {
-    let function = call.child_by_field_name("function")?;
+    let function = super::helpers::call_function(&call)?;
     match family {
         "cpp" => cpp_receiver_type(function, source),
         "javascript" | "typescript" | "tsx" => js_receiver_type(function, source),

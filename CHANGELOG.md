@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 127
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 128
 because JavaScript and TypeScript call edges are added (below). The MCP server
 rebuilds the index when it starts; from the command line,
 `code-graph-mcp reindex` does. To pin the binary back:
@@ -41,9 +41,43 @@ precision over the edges at the default confidence floor, recall at it:
 The frontend's two new edges the oracle scored wrong are calls the source
 makes (`return get<{ … }>(…)` spread over several lines). Of its 40 remaining
 misses the oracle lists 38, all `await get<T>(…)`: a TypeScript shape that
-loses the call whatever its name, a separate defect. `impact get --file
+loses the call whatever its name, fixed in the next section. `impact get --file
 frontend/src/api/request.ts` there went from "0 callers, Risk: UNKNOWN" to 56
 direct callers.
+
+### fix: `await get<T>(url)` has an edge
+
+A TypeScript call with type arguments under `await` had no `calls` edge,
+whatever the function's name: `const res = await get<User>('/me')` and
+`await post<number[]>('/x')` left the enclosing function with no call of
+`get` or `post`, while `return get<User>('/me')` and `await get('/me')` had
+one. In a fixture whose two callers of `post` both await it with a type
+argument, `impact post` answered "0 callers, Risk: UNKNOWN"; it now lists 2.
+tree-sitter-typescript parses `await f<T>(x)` as a call whose callee is
+`await f`, and `!f<T>(x)`, `typeof f<T>(x)` and `delete f<T>(x)` as a call
+whose callee is `!f` and so on. Each is now read as the call `f<T>(x)` and
+recorded as that code without the operator is, in `.ts` and `.tsx`: a call
+through a named, renamed or package import, a member call (`await
+this.api.get<T>()`), and a call on a built-in global (`await
+Promise.all<T>(…)`), which still binds no project function.
+
+SCIP oracle, before (the previous section) and after, on the same copy of each
+project; precision over the edges at the default confidence floor, recall at
+it:
+
+| Project | Gold pairs | Recall | Precision |
+|---|---|---|---|
+| the Vue/TS frontend | 575 | 93.0% → 99.7% | 99.3% → 97.9% as scored |
+| another TypeScript project | 1,641 | 99.0% → 99.5% | 99.4% → 99.4% |
+| hono 4.6.14 | 1,145 | 80.9% → 81.1% | 97.3% → 97.3% |
+| express 4.21.2, and three JS projects | 69 – 9,005 | unchanged | unchanged |
+
+The frontend's drop is the oracle's: the 10 edges it scores as calls the
+caller never makes (8 of them new) are each a call the source makes with a
+type argument spread over several lines (`await get<{⏎ total: number ⏎}>(…)`),
+which the oracle's call detection does not see; counted as right, precision
+is 99.7%. hono also gains two edges below the default floor (`ambiguous`),
+one of them right.
 
 ### change: a directory overview goes to the agent that read five files of it
 

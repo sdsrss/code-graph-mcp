@@ -437,7 +437,7 @@ pub(super) fn js_renamed_import_call(
     if !matches!(family, "javascript" | "typescript" | "tsx") {
         return None;
     }
-    let function = call.child_by_field_name("function")?;
+    let function = super::helpers::call_function(&call)?;
     if function.kind() != "identifier" {
         return None;
     }
@@ -491,8 +491,7 @@ pub(super) fn js_builtin_global_call(call: tree_sitter::Node, source: &str, fami
     if !matches!(family, "javascript" | "typescript" | "tsx") {
         return false;
     }
-    let Some(object) = call
-        .child_by_field_name("function")
+    let Some(object) = super::helpers::call_function(&call)
         .filter(|f| f.kind() == "member_expression")
         .and_then(|f| f.child_by_field_name("object"))
         .filter(|o| o.kind() == "identifier")
@@ -591,8 +590,7 @@ pub(super) fn js_node_builtin_member_call(
     if !matches!(family, "javascript" | "typescript" | "tsx") {
         return false;
     }
-    let Some(mut root) = call
-        .child_by_field_name("function")
+    let Some(mut root) = super::helpers::call_function(&call)
         .filter(|f| f.kind() == "member_expression")
         .and_then(|f| f.child_by_field_name("object"))
     else {
@@ -625,7 +623,7 @@ pub(super) fn js_package_bound_call(
     if !matches!(family, "javascript" | "typescript" | "tsx") {
         return None;
     }
-    let function = call.child_by_field_name("function")?;
+    let function = super::helpers::call_function(&call)?;
     if function.kind() != "identifier" {
         return None;
     }
@@ -1027,7 +1025,7 @@ pub(super) fn js_imported_from_package(name: &str) -> bool {
 
 /// Whether the call node is a member call on an object (see module docs).
 pub(super) fn is_member_call(call: tree_sitter::Node, source: &str, family: &str) -> bool {
-    let Some(function) = call.child_by_field_name("function") else {
+    let Some(function) = super::helpers::call_function(&call) else {
         return false;
     };
     let (member_kind, object_field) = match family {

@@ -5166,6 +5166,132 @@ fn test_js_noise_named_import_call_shapes() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// D#720: tree-sitter-typescript parses `await f<T>(x)` as a call whose
+/// `function` is `await_expression(f)`, and `!f<T>(x)` / `typeof f<T>(x)` /
+/// `delete f<T>(x)` as one whose `function` is `unary_expression(f)`. Each
+/// spelling must record the calls the same code records without the operator.
+#[test]
+fn test_ts_operator_before_generic_call_records_the_call() {
+    #[allow(clippy::type_complexity)]
+    let table: &[(&str, &str, &str, &str)] = &[
+        (
+            "named import, noise name",
+            "typescript",
+            "import { get } from '../request';\nasync function go() { const r = get<{ a: number }>('/x'); }",
+            "import { get } from '../request';\nasync function go() { const r = await get<{ a: number }>('/x'); }",
+        ),
+        (
+            "named import, other name",
+            "typescript",
+            "import { post } from '../request';\nasync function go() { post<number[]>('/x'); }",
+            "import { post } from '../request';\nasync function go() { await post<number[]>('/x'); }",
+        ),
+        (
+            "renamed import",
+            "typescript",
+            "import { load as m } from './x';\nasync function go() { m<string>(); }",
+            "import { load as m } from './x';\nasync function go() { await m<string>(); }",
+        ),
+        (
+            "package import",
+            "typescript",
+            "import { get } from 'lodash';\nasync function go() { get<number>(); }",
+            "import { get } from 'lodash';\nasync function go() { await get<number>(); }",
+        ),
+        (
+            "same-file function",
+            "typescript",
+            "function f<T>(): T { return 1 as T; }\nasync function go() { f<number>(); }",
+            "function f<T>(): T { return 1 as T; }\nasync function go() { await f<number>(); }",
+        ),
+        (
+            "member call on a name",
+            "typescript",
+            "async function go(api: Api) { api.get<number>(); }",
+            "async function go(api: Api) { await api.get<number>(); }",
+        ),
+        (
+            "member call on this",
+            "typescript",
+            "class S { api = new Api(); async go() { this.api.get<number>(); } }",
+            "class S { api = new Api(); async go() { await this.api.get<number>(); } }",
+        ),
+        (
+            "builtin global",
+            "typescript",
+            "async function go() { Promise.all<number>([]); go(); }",
+            "async function go() { await Promise.all<number>([]); go(); }",
+        ),
+        (
+            "member call on an untyped chain",
+            "typescript",
+            "async function go(a) { a.b.get<number>(); }",
+            "async function go(a) { await a.b.get<number>(); }",
+        ),
+        (
+            "member call on a require namespace",
+            "typescript",
+            "const m = require('./x');\nasync function go() { m.foo<number>(); }",
+            "const m = require('./x');\nasync function go() { await m.foo<number>(); }",
+        ),
+        (
+            "node builtin module",
+            "typescript",
+            "import fs from 'fs';\nasync function go() { fs.promises.readFile<string>('x'); go(); }",
+            "import fs from 'fs';\nasync function go() { await fs.promises.readFile<string>('x'); go(); }",
+        ),
+        (
+            "chained call",
+            "typescript",
+            "import { get } from './x';\nasync function go() { get<number>('/x').then(go); }",
+            "import { get } from './x';\nasync function go() { await get<number>('/x').then(go); }",
+        ),
+        (
+            "tsx",
+            "tsx",
+            "import { get } from './x';\nasync function go() { get<number>('/x'); }",
+            "import { get } from './x';\nasync function go() { await get<number>('/x'); }",
+        ),
+        (
+            "logical not",
+            "typescript",
+            "function ok<T>(): boolean { return true; }\nfunction go() { if (ok<number>()) {} }",
+            "function ok<T>(): boolean { return true; }\nfunction go() { if (!ok<number>()) {} }",
+        ),
+        (
+            "typeof",
+            "typescript",
+            "import { get } from './x';\nfunction go() { get<number>(); }",
+            "import { get } from './x';\nfunction go() { typeof get<number>(); }",
+        ),
+        (
+            "delete",
+            "typescript",
+            "import { get } from './x';\nfunction go() { get<number>().a; }",
+            "import { get } from './x';\nfunction go() { delete get<number>().a; }",
+        ),
+    ];
+    let calls = |code: &str, language: &str| -> Vec<(String, String, Option<String>)> {
+        extract_relations(code, language)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| (r.source_name, r.target_name, r.metadata))
+            .collect()
+    };
+    let mut failures = Vec::new();
+    for (label, language, plain, with_operator) in table {
+        let want = calls(plain, language);
+        let got = calls(with_operator, language);
+        if want.is_empty() {
+            failures.push(format!("{label}: the plain spelling records no call"));
+        } else if got != want {
+            failures.push(format!("{label}: got {got:?}\n    want {want:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 fn test_python_receiver_type_propagation_from_ctor_assignment() {
     // Issue #32 cause 2: `recv.method()` whose receiver is fixed by a single

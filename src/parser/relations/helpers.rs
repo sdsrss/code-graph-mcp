@@ -6,10 +6,27 @@ use super::super::node_text;
 
 pub(super) const MAX_SUBTREE_DEPTH: usize = 32;
 
+/// The callee of a call node: its `function` field, seen through a
+/// tree-sitter-typescript precedence quirk (D#720). With type arguments,
+/// `await f<T>(x)` parses as a call whose `function` is `await_expression(f)`,
+/// and `!f<T>(x)`, `typeof f<T>(x)`, `delete f<T>(x)` as one whose `function`
+/// is `unary_expression(f)`. Both are the call `f<T>(x)`: an operator applied
+/// to the callee itself needs parentheses, which parse as
+/// `parenthesized_expression`.
+pub(super) fn call_function<'t>(call: &tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+    let function = call.child_by_field_name("function")?;
+    if call.child_by_field_name("type_arguments").is_none() {
+        return Some(function);
+    }
+    match function.kind() {
+        "await_expression" => function.named_child(0),
+        "unary_expression" => function.child_by_field_name("argument"),
+        _ => Some(function),
+    }
+}
+
 pub(super) fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
-    let function = node
-        .child_by_field_name("function")
-        .or_else(|| node.named_child(0))?;
+    let function = call_function(node).or_else(|| node.named_child(0))?;
 
     match function.kind() {
         "identifier" | "simple_identifier" => Some(node_text(&function, source).to_string()),
@@ -120,7 +137,7 @@ pub(crate) fn extract_callee(
         // routed through the receiver-aware branch, which falls back to the
         // identical default resolution when the receiver is not a namespace).
         if matches!(language, "javascript" | "typescript" | "tsx") {
-            if let Some(function) = node.child_by_field_name("function") {
+            if let Some(function) = call_function(node) {
                 if function.kind() == "member_expression" {
                     if let (Some(obj), Some(prop)) = (
                         function.child_by_field_name("object"),
