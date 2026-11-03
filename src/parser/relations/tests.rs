@@ -5054,6 +5054,118 @@ fn test_js_renamed_import_call_shapes() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// D#712: a bare call whose name is on the cross-file noise list (`get`,
+/// `read`, `join`) and whose binding is a top-level named import from a
+/// relative path is recorded like a renamed import (D#120), so the resolver
+/// binds the export in that file instead of dropping the call as noise. Other
+/// names, packages, type imports, default imports and local bindings leave the
+/// call as it was.
+#[test]
+fn test_js_noise_named_import_call_shapes() {
+    let imp = |spec: &str, export: &str| {
+        Some(format!(
+            r#"{{"js_module":"{spec}","q":"imp","v":"{export}"}}"#
+        ))
+    };
+    #[allow(clippy::type_complexity)]
+    let table: &[(&str, &str, &str, Vec<(&str, &str, Option<String>)>)] = &[
+        (
+            "named import, noise name",
+            "typescript",
+            "import { get, post } from '../request';\nfunction go(): void { get(); post(); }",
+            vec![
+                ("go", "get", imp("../request", "get")),
+                ("go", "post", None),
+            ],
+        ),
+        (
+            "javascript, barrel path",
+            "javascript",
+            "import { read } from '../state/index.js';\nfunction go() { read(); }",
+            vec![("go", "read", imp("../state/index.js", "read"))],
+        ),
+        (
+            "seen from a nested function",
+            "javascript",
+            "import { join } from './paths';\nfunction go() { function inner() { join(); } }",
+            vec![("inner", "join", imp("./paths", "join"))],
+        ),
+        (
+            "explicit alias equal to the name",
+            "javascript",
+            "import { get as get } from './x';\nfunction go() { get(); }",
+            vec![("go", "get", imp("./x", "get"))],
+        ),
+        (
+            "node builtin package (dropped as before)",
+            "javascript",
+            "import { join } from 'path';\nfunction go() { join(); }",
+            vec![],
+        ),
+        (
+            "package specifier",
+            "javascript",
+            "import { get } from 'lodash';\nfunction go() { get(); }",
+            vec![("go", "get", Some(r#"{"q":"pkg","v":"lodash"}"#.to_string()))],
+        ),
+        (
+            "type-only import",
+            "typescript",
+            "import type { get } from './x';\nfunction go(): void { get(); }",
+            vec![("go", "get", None)],
+        ),
+        (
+            "default import",
+            "javascript",
+            "import get from './x';\nfunction go() { get(); }",
+            vec![("go", "get", None)],
+        ),
+        (
+            "require destructuring (not taken)",
+            "javascript",
+            "const { get } = require('./x');\nfunction go() { get(); }",
+            vec![("<module>", "require", None), ("go", "get", None)],
+        ),
+        (
+            "parameter shadows",
+            "javascript",
+            "import { get } from './x';\nfunction go(get) { get(); }",
+            vec![("go", "get", None)],
+        ),
+        (
+            "local shadows",
+            "javascript",
+            "import { read } from './x';\nfunction go() { const read = () => 1; read(); }",
+            vec![("go", "read", None)],
+        ),
+        (
+            "member call keeps its own path",
+            "javascript",
+            "import { get } from './x';\nfunction go(m) { m.get(); }",
+            vec![("go", "get", Some(r#"{"q":"member"}"#.to_string()))],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, language, code, want) in table {
+        let relations = extract_relations(code, language).unwrap();
+        let got: Vec<(&str, &str, Option<String>)> = relations
+            .iter()
+            .filter(|r| r.relation == REL_CALLS)
+            .map(|r| {
+                (
+                    r.source_name.as_str(),
+                    r.target_name.as_str(),
+                    r.metadata.clone(),
+                )
+            })
+            .collect();
+        if &got != want {
+            failures.push(format!("{label}: got {got:?}\n    want {want:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 fn test_python_receiver_type_propagation_from_ctor_assignment() {
     // Issue #32 cause 2: `recv.method()` whose receiver is fixed by a single

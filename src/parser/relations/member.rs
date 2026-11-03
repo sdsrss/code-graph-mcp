@@ -32,8 +32,10 @@ thread_local! {
     static IMPORT_BOUND: RefCell<HashMap<String, Option<String>>> = RefCell::new(HashMap::new());
     /// JS/TS local names the current file binds, somewhere, to another name's
     /// export (`b` in `import { a as b }`, `const { a: b } = require()`,
-    /// `const b = require().a`). Only a prefilter: whether a call's `b` IS that
-    /// binding is decided at the call by [`js_renamed_import_call`].
+    /// `const b = require().a`), or to a noise-named export of a relative path
+    /// (`get` in `import { get } from './request'`, D#712). Only a prefilter:
+    /// whether a call's `b` IS that binding is decided at the call by
+    /// [`js_renamed_import_call`].
     static RENAMED_IMPORTS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     /// [`binding_in`]'s answer per scope node id and name, all but the
     /// `for (… of …)` head, which depends on where the name is read: a scope is
@@ -229,14 +231,15 @@ fn collect(
     }
 }
 
-/// Every local name a renamed-import binding introduces anywhere in the file.
+/// Every local name a renamed-import binding, or a noise-named import
+/// ([`noise_named_specifier`]), introduces anywhere in the file.
 fn collect_renamed(node: tree_sitter::Node, source: &str, out: &mut HashSet<String>, depth: usize) {
     if depth > 256 {
         return;
     }
     match node.kind() {
         "import_specifier" => {
-            if let Some((local, _, _)) = renamed_specifier(node, source) {
+            if let Some((local, _, _)) = import_call_specifier(node, source) {
                 out.insert(local);
             }
             return;
@@ -277,6 +280,49 @@ fn collect_renamed(node: tree_sitter::Node, source: &str, out: &mut HashSet<Stri
             collect_renamed(c, source, out, depth + 1);
         }
     }
+}
+
+/// The (local, export, specifier) a call through this import specifier is
+/// recorded under: a renamed import (D#120), or a noise-named one (D#712).
+fn import_call_specifier(
+    spec: tree_sitter::Node,
+    source: &str,
+) -> Option<(String, String, String)> {
+    renamed_specifier(spec, source).or_else(|| noise_named_specifier(spec, source))
+}
+
+/// `import { get } from './request'` (a value import of a relative path, not
+/// renamed) whose name is on the JS cross-file noise list (`get`, `read`,
+/// `join`): (`get`, `get`, `./request`) (D#712). The resolver drops a bare
+/// call of such a name that has no same-file target as a stdlib method, so a
+/// call through this import is recorded like a renamed one and binds the
+/// export in the file it names. Other names resolve by name, and the
+/// post-passes repoint them to what the import binds; a package's names bind
+/// nothing either way.
+fn noise_named_specifier(
+    spec: tree_sitter::Node,
+    source: &str,
+) -> Option<(String, String, String)> {
+    let name = spec.child_by_field_name("name")?;
+    if name.kind() != "identifier" || has_type_keyword(spec) {
+        return None;
+    }
+    let local = node_text(&name, source);
+    if spec
+        .child_by_field_name("alias")
+        .is_some_and(|alias| node_text(&alias, source) != local)
+        || !crate::domain::is_cross_file_call_noise(local, "javascript")
+    {
+        return None;
+    }
+    let statement = ancestor(spec, "import_statement")?;
+    if has_type_keyword(statement) {
+        return None;
+    }
+    let module = statement.child_by_field_name("source")?;
+    let module = node_text(&module, source).trim_matches(['"', '\'', '`']);
+    (module.starts_with("./") || module.starts_with("../"))
+        .then(|| (local.to_string(), local.to_string(), module.to_string()))
 }
 
 /// `import { a as b } from 's'` (a value import, not `import type`): (`b`,
@@ -376,7 +422,9 @@ fn renamed_require_binding(
 }
 
 /// The export and specifier a JS/TS bare call `b()` reaches through a renamed
-/// import (D#120): `b` must be bound, by the NEAREST enclosing declaration of
+/// import (D#120), or through a noise-named one (`get()` after `import { get }
+/// from './request'`, D#712, [`noise_named_specifier`]): `b` must be bound, by
+/// the NEAREST enclosing declaration of
 /// it, to `import { a as b } from 's'`, `const { a: b } = require('s')` or
 /// `const b = require('s').a` — so a parameter, a local, a function, class,
 /// catch or loop variable, or a hoisted `var` named `b` in between shadows it,
@@ -821,7 +869,7 @@ fn declares(stmt: tree_sitter::Node, name: &str, source: &str) -> Option<Option<
                             .or_else(|| n.child_by_field_name("name"));
                         if local.is_some_and(|l| node_text(&l, source) == name) {
                             found = Some(
-                                renamed_specifier(n, source)
+                                import_call_specifier(n, source)
                                     .map(|(_, export, module)| (export, module)),
                             );
                         }

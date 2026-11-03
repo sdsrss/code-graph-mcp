@@ -270,10 +270,19 @@ pub(super) fn js_import_pending_name(metadata: Option<&str>, target_name: &str) 
 /// a missing file leaves an `<external>` sentinel named after the symbol, not
 /// the specifier, so no file appearing later re-extracts the importer.)
 ///
+/// A file that exports no such function but re-exports the name (a barrel,
+/// D#712) is followed to the file its re-export names: `export { a } from
+/// './x'` (or an import of `a` the file publishes), else the one `export *`
+/// source that has it — JavaScript exports a name two `export *` sources share
+/// from neither. Only the re-export's specifier is followed, never the node its
+/// `imports` edge was bound to by name. At most [`MAX_JS_REEXPORT_HOPS`] files.
+///
 /// Read from the database, after every batch's nodes and `exports` edges are
 /// in: the batch pass always defers these calls, and a file's `exports` edges
 /// to its own nodes are all bound in its own batch, so `exports` may memoize a
-/// file for the whole pass.
+/// file for the whole pass. A barrel's `imports` edges can be bound later in
+/// the deferred pass than a call through it; that call is buffered, and the
+/// pending sweep that ends the run, with a memo of its own, binds it.
 pub(super) fn js_import_targets(
     conn: &rusqlite::Connection,
     exports: &mut JsExports,
@@ -288,11 +297,66 @@ pub(super) fn js_import_targets(
         let relative = module.starts_with("./") || module.starts_with("../");
         return Ok(relative.then(Vec::new));
     };
+    let mut seen = HashSet::new();
+    js_export_through_reexports(conn, exports, file, export, all_file_paths, &mut seen).map(Some)
+}
+
+/// How many files [`js_import_targets`] follows re-exports through.
+const MAX_JS_REEXPORT_HOPS: usize = 8;
+
+fn js_export_through_reexports(
+    conn: &rusqlite::Connection,
+    exports: &mut JsExports,
+    file: String,
+    export: &str,
+    all_file_paths: &HashSet<String>,
+    seen: &mut HashSet<String>,
+) -> Result<Vec<i64>> {
+    if seen.len() >= MAX_JS_REEXPORT_HOPS || !seen.insert(file.clone()) {
+        return Ok(Vec::new());
+    }
     if !exports.by_file.contains_key(&file) {
         let loaded = JsFileExports::load(conn, &file)?;
         exports.by_file.insert(file.clone(), loaded);
     }
-    Ok(Some(exports.by_file[&file].targets(export)))
+    let own = exports.by_file[&file].targets(export);
+    if !own.is_empty() {
+        return Ok(own);
+    }
+    let resolve =
+        |spec: &str| super::js_modules::resolve_js_specifier_path(spec, &file, all_file_paths);
+    let (named, stars): (Vec<String>, Vec<String>) = {
+        let f = &exports.by_file[&file];
+        (
+            f.reexports
+                .iter()
+                .filter(|(name, _)| name == export)
+                .filter_map(|(_, spec)| resolve(spec))
+                .collect(),
+            f.star_reexports
+                .iter()
+                .filter_map(|spec| resolve(spec))
+                .collect(),
+        )
+    };
+    for next in named {
+        let ids = js_export_through_reexports(conn, exports, next, export, all_file_paths, seen)?;
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+    }
+    let mut found: Option<Vec<i64>> = None;
+    for next in stars {
+        let ids = js_export_through_reexports(conn, exports, next, export, all_file_paths, seen)?;
+        if ids.is_empty() {
+            continue;
+        }
+        if found.is_some() {
+            return Ok(Vec::new());
+        }
+        found = Some(ids);
+    }
+    Ok(found.unwrap_or_default())
 }
 
 /// Per-pass memo for [`js_import_targets`]: each file's exports, read once.
@@ -312,12 +376,16 @@ pub(super) struct JsExports {
 /// `(node, name, published as, is a function, start line, end line)`.
 type JsExported = (i64, String, Option<String>, bool, i64, i64);
 
-/// What one file's `<module>` exports, and the spans that make a function
-/// nested.
+/// What one file's `<module>` exports, the spans that make a function
+/// nested, and what it may re-export.
 struct JsFileExports {
     exported: Vec<JsExported>,
     /// `(node, start line, end line)` of the file's functions, methods, classes.
     spans: Vec<(i64, i64, i64)>,
+    /// `(name, specifier)` of each named import of the `<module>`.
+    reexports: Vec<(String, String)>,
+    /// The specifier of each `export * from '…'`.
+    star_reexports: Vec<String>,
 }
 
 impl JsFileExports {
@@ -343,7 +411,31 @@ impl JsFileExports {
             )?
             .query_map([file], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        Ok(Self { exported, spans })
+        let mut reexports = Vec::new();
+        let mut star_reexports = Vec::new();
+        let rows = conn
+            .prepare_cached(&js_reexport_sql())?
+            .query_map([file], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (name, spec, star) in rows {
+            if star {
+                star_reexports.push(spec);
+            } else {
+                reexports.push((name, spec));
+            }
+        }
+        Ok(Self {
+            exported,
+            spans,
+            reexports,
+            star_reexports,
+        })
     }
 
     /// The top-level functions published as `export`: through an export map
@@ -395,6 +487,24 @@ impl JsFileExports {
 /// drove the D#120 version from `idx_edges_relation`, scanning every `exports`
 /// edge of the repo per call (review BLOCKER: +113% on a 5,000-file tree).
 /// Pinned by `test_js_export_map_query_seeks_the_module_node_edges`.
+/// [`JsFileExports::load`]'s re-export query: each `imports` edge of file
+/// `?1`'s `<module>` that names a specifier, with the name it imports and
+/// whether it is an `export * from` (target `<module>`). Same loop order as
+/// [`js_export_map_sql`], for the same reason.
+pub(super) fn js_reexport_sql() -> String {
+    format!(
+        "SELECT t.name, json_extract(e.metadata, '$.js_module'),
+                COALESCE(json_extract(e.metadata, '$.q') = '{}', 0)
+         FROM files f
+         CROSS JOIN nodes m ON m.file_id = f.id AND m.name = '<module>'
+         CROSS JOIN edges e ON e.source_id = m.id AND e.relation = '{}'
+         CROSS JOIN nodes t ON t.id = e.target_id
+         WHERE f.path = ?1 AND json_extract(e.metadata, '$.js_module') IS NOT NULL",
+        crate::domain::IMPORT_Q_STAR_REEXPORT,
+        crate::domain::REL_IMPORTS
+    )
+}
+
 pub(super) fn js_export_map_sql() -> String {
     format!(
         "SELECT n.id, n.name, json_extract(e.metadata, '$.as'), n.type = 'function',

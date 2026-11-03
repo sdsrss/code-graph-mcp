@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 127
+because JavaScript and TypeScript call edges are added (below). The MCP server
+rebuilds the index when it starts; from the command line,
+`code-graph-mcp reindex` does. To pin the binary back:
+`npm i -g @sdsrs/code-graph@0.184.0`, then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### fix: a call of an imported `get`, `read` or `join` has an edge
+
+`get(url)` after `import { get } from '../request'` had no `calls` edge, so
+`impact get --file src/api/request.ts` said "0 callers". A bare call with no
+target in its own file was dropped when its name was on the list of
+standard-library method names kept out of name matching (`get`, `read`,
+`write`, `join`, `close`, `push`, `map`, …), and that list was applied whether
+or not the file imported the name. Such a call now binds the function the
+import names, in the file its relative path resolves to, as a call through a
+renamed import (`import { get as fetchIt }`) already did. That lookup now also
+follows the file's re-exports: `export { read } from './crud.js'`, and the one
+`export * from` source that has the name (JavaScript exports a name two
+`export *` sources share from neither), up to 8 files deep. This applies to
+renamed imports through such a file too, which never bound before.
+
+Still dropped: such a call through a default import, a `require`, a package
+(`import { join } from 'path'`), or a TypeScript `import type`.
+
+SCIP oracle, before (0.184.0) and after, on the same copy of each project;
+precision over the edges at the default confidence floor, recall at it:
+
+| Project | Gold pairs | Recall | Precision |
+|---|---|---|---|
+| a Vue/TS frontend | 575 | 83.5% → 93.0% | 99.6% → 99.3% |
+| a JS CLI with a barrel `index.js` | 1,247 | 92.1% → 96.3% | 96.3% → 96.5% |
+| hono 4.6.14 | 1,145 | 80.4% → 80.9% | 97.3% → 97.3% |
+| express 4.21.2, and three other JS/TS projects | 69 – 8,993 | unchanged | unchanged |
+
+The frontend's two new edges the oracle scored wrong are calls the source
+makes (`return get<{ … }>(…)` spread over several lines). Of its 40 remaining
+misses the oracle lists 38, all `await get<T>(…)`: a TypeScript shape that
+loses the call whatever its name, a separate defect. `impact get --file
+frontend/src/api/request.ts` there went from "0 callers, Risk: UNKNOWN" to 56
+direct callers.
+
 ### fix: the startup repair runs without waiting for a tool call
 
 The MCP server's startup repair reaps orphan vectors, compacts the vector

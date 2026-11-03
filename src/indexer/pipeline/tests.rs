@@ -11629,6 +11629,128 @@ fn test_js_renamed_import_export_added_later_matches_rebuild() {
     );
 }
 
+/// D#712: imported functions named like stdlib methods (`get`, `read`,
+/// `write`, `close`), called bare, directly and through barrels.
+const D712_TREE: &[(&str, &str)] = &[
+    (
+        "src/api/request.ts",
+        "export function get(url: string) { return url }\nexport function post(url: string) { return url }\n",
+    ),
+    (
+        "src/api/user.ts",
+        "import { get, post } from './request'\nexport function loadUser(id: string) { return get(id) }\nexport function saveUser(id: string) { return post(id) }\n",
+    ),
+    (
+        "src/state/crud.js",
+        "export function read(p) { return p }\nexport function write(p) { return p }\n",
+    ),
+    ("src/state/index.js", "export { read } from './crud.js';\n"),
+    ("src/star/index.js", "export * from '../state/crud.js';\n"),
+    ("src/star2/a.js", "export function close() {}\n"),
+    ("src/star2/b.js", "export function close() {}\n"),
+    (
+        "src/star2/index.js",
+        "export * from './a.js';\nexport * from './b.js';\n",
+    ),
+    // Two same-named functions elsewhere, which a by-name guess could pick.
+    ("tests/helpers.js", "export function read() {}\nexport function get() {}\n"),
+    (
+        "src/orch/exec.js",
+        "import { read } from '../state/index.js';\nimport { write } from '../star/index.js';\nimport { close } from '../star2/index.js';\nexport function runTask(p) { read(p); write(p); return close() }\n",
+    ),
+    (
+        "src/orch/ren.js",
+        "import { read as rd } from '../state/index.js';\nexport function viaRename(p) { return rd(p) }\n",
+    ),
+];
+
+fn check_d712_edges(edges: &[String], when: &str) {
+    let has = |e: &str| edges.iter().any(|x| x == e);
+    let lost: Vec<&str> = [
+        "src/api/user.ts.loadUser --calls--> src/api/request.ts.get",
+        "src/api/user.ts.saveUser --calls--> src/api/request.ts.post",
+        // `export { read } from './crud.js'`
+        "src/orch/exec.js.runTask --calls--> src/state/crud.js.read",
+        // `export * from '../state/crud.js'`
+        "src/orch/exec.js.runTask --calls--> src/state/crud.js.write",
+        // A renamed import (D#120) through the same barrel.
+        "src/orch/ren.js.viaRename --calls--> src/state/crud.js.read",
+    ]
+    .into_iter()
+    .filter(|e| !has(e))
+    .collect();
+    let bound: Vec<&str> = [
+        "src/api/user.ts.loadUser --calls--> tests/helpers.js.get",
+        "src/orch/exec.js.runTask --calls--> tests/helpers.js.read",
+        // Two `export *` sources of `close`: JavaScript exports neither.
+        "src/orch/exec.js.runTask --calls--> src/star2/a.js.close",
+        "src/orch/exec.js.runTask --calls--> src/star2/b.js.close",
+    ]
+    .into_iter()
+    .filter(|e| has(e))
+    .collect();
+    assert!(
+        lost.is_empty() && bound.is_empty(),
+        "{when}: lost {lost:#?}\nbound {bound:#?}\n{edges:#?}"
+    );
+}
+
+/// D#712: a bare call of an imported `get` / `read` binds the export the import
+/// names, following named and `export *` re-exports, instead of being dropped
+/// as stdlib noise — on a full index and after every file is touched in turn.
+#[test]
+fn test_js_noise_named_import_calls_bind_through_barrels() {
+    let (project, _d, db) = fresh_index_of(D712_TREE);
+    check_d712_edges(&edge_set(&db), "full index");
+    for (f, _) in D712_TREE {
+        let body = fs::read_to_string(project.path().join(f)).unwrap();
+        fs::write(project.path().join(f), format!("{body}\n")).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        check_d712_edges(&edge_set(&db), &format!("after {f} changed"));
+    }
+    let files: Vec<(&str, String)> = D712_TREE
+        .iter()
+        .map(|(f, _)| (*f, fs::read_to_string(project.path().join(f)).unwrap()))
+        .collect();
+    let files: Vec<(&str, &str)> = files.iter().map(|(f, b)| (*f, b.as_str())).collect();
+    let (_p2, _d2, control) = fresh_index_of(&files);
+    assert_eq!(
+        call_edges_with_confidence(&db),
+        call_edges_with_confidence(&control),
+        "every file touched must equal a rebuild"
+    );
+}
+
+/// D#712: the re-exported function's file changes so that it no longer defines
+/// the name, then defines it again; the call follows as a rebuild does.
+#[test]
+fn test_js_noise_named_import_through_barrel_matches_rebuild() {
+    assert_incremental_matches_rebuild(
+        D712_TREE,
+        &[(
+            "src/state/crud.js",
+            Some("export function write(p) { return p }\n"),
+        )],
+    );
+    let without: Vec<(&str, &str)> = D712_TREE
+        .iter()
+        .map(|(f, b)| {
+            if *f == "src/state/crud.js" {
+                (*f, "export function write(p) { return p }\n")
+            } else {
+                (*f, *b)
+            }
+        })
+        .collect();
+    assert_incremental_matches_rebuild(
+        &without,
+        &[(
+            "src/state/crud.js",
+            Some("export function read(p) { return p }\nexport function write(p) { return p }\n"),
+        )],
+    );
+}
+
 /// D#120 F6: the export map changed so that only a class method shares the
 /// export's name; and the exporting file deleted, then restored.
 #[test]
@@ -11697,6 +11819,8 @@ fn test_js_renamed_import_is_scoped() {
 /// it scanned every `exports` edge in the repo per call — 999 calls over
 /// 20,000 `exports` edges took a 5,000-file index from 1.83 s to 3.89 s. With
 /// no statistics (every fresh index), it must seek the file's `<module>` edges.
+/// The re-export lookup (D#712) runs beside it, once per file, and is held to
+/// the same plan.
 #[test]
 fn test_js_export_map_query_seeks_the_module_node_edges() {
     let db_dir = TempDir::new().unwrap();
@@ -11712,26 +11836,31 @@ fn test_js_export_map_query_seeks_the_module_node_edges() {
     if stats > 0 {
         db.conn().execute_batch("DELETE FROM sqlite_stat1").unwrap();
     }
-    let sql = format!("EXPLAIN QUERY PLAN {}", super::resolve::js_export_map_sql());
-    let mut stmt = db.conn().prepare(&sql).unwrap();
-    let n = stmt.parameter_count();
-    let plan: Vec<String> = stmt
-        .query_map(
-            rusqlite::params_from_iter(std::iter::repeat_n("x", n)),
-            |r| r.get::<_, String>(3),
-        )
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    assert!(
-        plan.iter()
-            .any(|l| l.starts_with("SEARCH e ") && l.contains("(source_id=? AND relation=?)")),
-        "{plan:#?}"
-    );
-    assert!(
-        !plan.iter().any(|l| l.contains("idx_edges_relation")),
-        "{plan:#?}"
-    );
+    for query in [
+        super::resolve::js_export_map_sql(),
+        super::resolve::js_reexport_sql(),
+    ] {
+        let sql = format!("EXPLAIN QUERY PLAN {query}");
+        let mut stmt = db.conn().prepare(&sql).unwrap();
+        let n = stmt.parameter_count();
+        let plan: Vec<String> = stmt
+            .query_map(
+                rusqlite::params_from_iter(std::iter::repeat_n("x", n)),
+                |r| r.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|l| l.starts_with("SEARCH e ") && l.contains("(source_id=? AND relation=?)")),
+            "{query}\n{plan:#?}"
+        );
+        assert!(
+            !plan.iter().any(|l| l.contains("idx_edges_relation")),
+            "{query}\n{plan:#?}"
+        );
+    }
 }
 
 /// D#120 review HIGH-1: an ESM renamed import whose file is missing at index
