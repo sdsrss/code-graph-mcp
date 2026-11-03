@@ -14759,7 +14759,7 @@ fn a_big_run_rebinds_a_module_attribute_call_of_an_earlier_batch() {
 // definition of another module. Bound by its name, it took the caller's own
 // same-named definition (`logging.FileHandler.emit(self, r)` in
 // `logging/handlers.py` bound all 8 `emit`s of that file). Unless the file
-// also binds the name otherwise (`"rb"`) or may itself be the module, such a
+// also binds the name otherwise or may reach its own module (`"loc"`), such a
 // call no longer binds into its own file, and binds nothing else instead.
 #[test]
 fn a_python_module_call_does_not_bind_the_callers_own_definition() {
@@ -14796,18 +14796,17 @@ fn a_python_module_call_does_not_bind_the_callers_own_definition() {
         .into_iter()
         .filter(|r| r.contains(".main --calls"))
         .collect();
+    // Sorted rows; what keeps each same-file bind is said at the end of its row.
     let want = [
-        // Through ext: ext's own definitions only (D#518 binds `ext.go()`).
-        // A `P.X()` call is D#518's: a module without `X` leaves its by-name bind.
+        // A `P.X()` call is D#518's: `ext.gone()` runs nothing (`ext` has no
+        // `gone`), and the bind into app.py is BASE's, left as it was.
         r#"app.py.main --calls[extracted]{"attr":"gone","q":"module","v":"ext"}--> app.py.gone"#,
         r#"app.py.main --calls[inferred]{"attr":"go","q":"module","v":"ext"}--> ext.py.go"#,
         r#"app.py.main --calls[inferred]{"q":"module","v":"ext"}--> ext.py.helper"#,
-        // The rebound name and the patched module keep the same-file bind.
-        r#"lib/selfmod.py.main --calls[extracted]{"q":"module","v":"selfmod"}--> lib/selfmod.py.go"#,
-        r#"patched.py.main --calls[extracted]{"q":"module","rb":1,"v":"ext"}--> patched.py.go"#,
-        // A package may name itself.
-        r#"pkg/__init__.py.main --calls[extracted]{"q":"module","v":"pkg"}--> pkg/__init__.py.go"#,
-        r#"rebound.py.main --calls[extracted]{"q":"module","rb":1,"v":"ext"}--> rebound.py.go"#,
+        r#"lib/selfmod.py.main --calls[extracted]{"loc":1,"q":"module","v":"selfmod"}--> lib/selfmod.py.go"#, // may be `selfmod`
+        r#"patched.py.main --calls[extracted]{"loc":1,"q":"module","v":"ext"}--> patched.py.go"#, // `ext.go = go`
+        r#"pkg/__init__.py.main --calls[extracted]{"loc":1,"q":"module","v":"pkg"}--> pkg/__init__.py.go"#, // is `pkg`
+        r#"rebound.py.main --calls[extracted]{"loc":1,"q":"module","v":"ext"}--> rebound.py.go"#, // `ext = make()`
     ];
     assert_eq!(rows, want);
 }
@@ -14821,14 +14820,23 @@ fn a_python_module_call_into_its_own_file_matches_a_rebuild_incrementally() {
     let app_rebound =
         "import ext\n\ndef go():\n    pass\n\ndef main():\n    ext = make()\n    ext.sub.go()\n";
     let ext = ("ext.py", "def go():\n    pass\n");
+    let own_bind = |rows: &[String]| rows.iter().any(|r| r.ends_with("--> app.py.go"));
     // The other binding appears, then goes.
-    assert_incremental_graph_matches_rebuild(
+    let rows = assert_incremental_graph_matches_rebuild(
         &[ext, ("app.py", app)],
         &[("app.py", Some(app_rebound))],
     );
-    assert_incremental_graph_matches_rebuild(
+    assert!(
+        own_bind(&rows),
+        "rebound: the same-file bind is back: {rows:?}"
+    );
+    let rows = assert_incremental_graph_matches_rebuild(
         &[ext, ("app.py", app_rebound)],
         &[("app.py", Some(app))],
+    );
+    assert!(
+        !own_bind(&rows),
+        "imports only: no same-file bind: {rows:?}"
     );
     // The module becomes the project's, then stops being it.
     assert_incremental_graph_matches_rebuild(&[("app.py", app)], &[(ext.0, Some(ext.1))]);
@@ -14838,4 +14846,60 @@ fn a_python_module_call_into_its_own_file_matches_a_rebuild_incrementally() {
         &[("app.py", app)],
         &[("app.py", None), ("lib/ext.py", Some(app))],
     );
+}
+
+// D#700(2b), review round 1 (F1, F2): what a call through an imported name
+// reaches is the import's target followed by the call's attribute chain
+// (`import a` + `a.mod.go()` reaches `a.mod`; `from c import mod` + `mod.go()`
+// reaches `c.mod`), and any of the name's imports may be the one in force. A
+// call that may reach the caller's own module keeps its same-file bind: Python
+// runs the file's own definition in every kept case below.
+#[test]
+fn a_python_module_call_into_the_callers_own_module_keeps_its_bind() {
+    let go = "\n\ndef go():\n    pass\n\nclass Klass:\n    def run(self):\n        pass\n\ndef main():\n    ";
+    let a = format!("import a{go}a.mod.go()\n");
+    let b = format!("import b.mod{go}b.mod.go()\n");
+    let c = format!("from c import mod{go}mod.go()\n");
+    let d = format!("import d{go}d.mod.go()\n");
+    let e = format!("from e.f import mod as m{go}m.Klass.run(None)\n");
+    let multi =
+        format!("import pkg.mod as m\n\ndef other():\n    import ext as m{go}m.Klass.run(None)\n");
+    let next = format!("import ext{go}ext.sub.go()\n");
+    let stub_self = format!("import ext2{go}ext2.sub.go()\n");
+    let files: Vec<(&str, &str)> = vec![
+        ("ext.py", "def go():\n    pass\n"),
+        ("ext2.py", "def go():\n    pass\n"),
+        ("a/__init__.py", ""),
+        ("a/mod.py", &a),
+        ("b/__init__.py", ""),
+        ("b/mod.py", &b),
+        ("c/__init__.py", ""),
+        ("c/mod.py", &c),
+        ("src/d/__init__.py", ""),
+        ("src/d/mod.py", &d),
+        ("e/__init__.py", ""),
+        ("e/f/__init__.py", ""),
+        ("e/f/mod.py", &e),
+        ("pkg/__init__.py", ""),
+        ("pkg/mod.py", &multi),
+        // Neither `next` nor a stub of another module is `ext`.
+        ("next.py", &next),
+        ("stubs/other.pyi", &next),
+        ("stubs/ext2.pyi", &stub_self),
+    ];
+    let (_p, _d, db) = fresh_index_of(&files);
+    let rows: Vec<String> = graph_rows(&db)
+        .into_iter()
+        .filter(|r| r.contains(".main --calls"))
+        .collect();
+    let want = [
+        r#"a/mod.py.main --calls[extracted]{"loc":1,"q":"module","v":"a"}--> a/mod.py.go"#,
+        r#"b/mod.py.main --calls[extracted]{"loc":1,"q":"module","v":"b"}--> b/mod.py.go"#,
+        r#"c/mod.py.main --calls[extracted]{"loc":1,"q":"module","v":"c"}--> c/mod.py.go"#,
+        r#"e/f/mod.py.main --calls[extracted]{"loc":1,"q":"module","v":"e.f"}--> e/f/mod.py.run"#,
+        r#"pkg/mod.py.main --calls[extracted]{"loc":1,"q":"module","v":"ext"}--> pkg/mod.py.run"#,
+        r#"src/d/mod.py.main --calls[extracted]{"loc":1,"q":"module","v":"d"}--> src/d/mod.py.go"#,
+        r#"stubs/ext2.pyi.main --calls[extracted]{"loc":1,"q":"module","v":"ext2"}--> stubs/ext2.pyi.go"#,
+    ];
+    assert_eq!(rows, want);
 }

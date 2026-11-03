@@ -596,7 +596,8 @@ fn pre_parse_batch(
 
         let parsed_nodes = extract_nodes_from_tree(&tree, &source, language);
         let module_is_test = crate::parser::treesitter::file_is_test_code(&tree, &source, language);
-        let relations = extract_relations_from_tree(&tree, &source, language);
+        let relations =
+            extract_relations_from_tree(&tree, &source, language, Some(rel_path.as_str()));
         let cpp_fields = if language == "cpp" {
             cpp_class_fields(&tree, &source)
         } else {
@@ -2468,10 +2469,7 @@ fn resolve_batch_relations(
                 // deferred pass needs no twin: a call reaches it only with no
                 // same-file candidate, and a file's nodes are all in its batch.
                 if rel.relation == REL_CALLS
-                    && super::resolve::module_call_skips_own_file(
-                        rel.metadata.as_deref(),
-                        &pf.rel_path,
-                    )
+                    && super::resolve::module_call_skips_own_file(rel.metadata.as_deref())
                 {
                     continue;
                 }

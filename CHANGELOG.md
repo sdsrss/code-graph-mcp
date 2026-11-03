@@ -30,10 +30,13 @@ of these hold:
   or not), and the file only reads attributes rooted at it: `getattr(ext, …)`,
   `f(ext)`, `class D(ext.Base)`, annotations, default values (`def f(x=ext.X)`),
   `ext.tbl[0] = 1`, and so on.
-- The caller's file cannot itself be that module: its path, as dotted
-  segments, neither is the module's name nor ends with it (`lib/ext.py` and
-  `ext/__init__.py` may be `ext`, so their calls through `ext` resolve as
-  before).
+- Nothing the name reaches may be the caller's own module. What a call
+  reaches is what one of the name's imports binds followed by the call's
+  attribute chain: `import a` and `a.mod.go()` reach `a.mod`, `from c import
+  mod` and `mod.go()` reach `c.mod`. In `a/mod.py` or `src/a/mod.py` that is
+  the file itself, so those calls resolve as before; so do calls through `ext`
+  in `lib/ext.py` or `ext/__init__.py`, and through any name one of whose
+  imports is relative (`from . import ext`, `from . import *`).
 
 Nothing is bound in place of the dropped edge; a call whose first name has no
 same-named definition in the caller's file resolves as before. Everything else
@@ -44,9 +47,9 @@ the name (`ext.go = go`, `del ext.go`, `ext.sub.go += 1`), and a direct
 `ext.go()` call on a name that holds one plain-imported module everywhere in
 the file (since 0.176.0 it binds what `from ext import go` would).
 
-Measured against 0.183.0: the Python standard library loses 497 call edges
-and flask 7, all same-file; hono, leveldb, cobra and gin keep every edge, and
-no edge is added or relabelled on any of the six. On the standard library the
+Measured against 0.183.0: the Python standard library loses 517 call edges
+(497 caller–callee pairs) and flask 7, all same-file; hono, leveldb, cobra and
+gin keep every edge, and no edge is added or relabelled on any of the six. On the standard library the
 SCIP oracle's default floor (`extracted` + `inferred`) goes from 10,996 of
 14,329 judged edges correct (76.7%) to 10,971 of 13,879 (79.0%): 2,908 wrong
 edges instead of 3,333. The 25 correct pairs it loses, and the 5 gold calls
@@ -60,11 +63,13 @@ batches of five runs).
 ### Not covered
 
 - A name rebound or patched at run time: `setattr(ext, "go", go)`,
-  `globals()["ext"] = …`, `vars(ext)["go"] = go`, `sys.modules`, `exec`. On
-  5,995 generated files run under CPython, every call the new rule stopped
-  binding while Python ran the file's own `go` used one of the first three.
-- A module that hands the caller's own definition back, such as
-  `os.path.join` called inside `posixpath.py`.
+  `globals()["ext"] = …`, `vars(ext)["go"] = go`, `ext.__dict__["go"] = go`,
+  `mock.patch`, `sys.modules`, `exec`. On 5,995 generated files run under
+  CPython, every call the new rule stopped binding while Python ran the
+  file's own `go` used one of the first three.
+- A module that hands the caller's own definition back: `os.path.join`
+  called inside `posixpath.py`, or nltk's `chunk/util.py` calling
+  `nltk.chunk.tagstr2tree`, which `nltk/chunk/__init__.py` imports from it.
 - A direct `ext.go()` call on a name that holds one plain-imported module
   everywhere in the file, where `from ext import go` would find nothing, keeps
   its bind into the caller's file (15 wrong edges at the default floor in the

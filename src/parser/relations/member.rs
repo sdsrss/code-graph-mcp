@@ -51,10 +51,10 @@ thread_local! {
     /// Python names that hold one module everywhere in the file, and that
     /// module ([`py_module_names`]). Per file: reset by `reset_import_bound`.
     static PY_MODULE_NAMES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
-    /// Python import-bound names the file also binds some other way, or
-    /// writes an attribute chain of ([`py_rebound_imports`]). Per file: reset
-    /// by `reset_import_bound`.
-    static PY_REBOUND_IMPORTS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    /// Python import-bound names a call through which may run a definition of
+    /// the file itself ([`py_local_imports`]). Per file: reset by
+    /// `reset_import_bound`.
+    static PY_LOCAL_IMPORTS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     /// The file's Python classes for `C.m()` calls ([`py_class_names`]). Per
     /// file: reset by `reset_import_bound`.
     static PY_CLASSES: RefCell<PyClasses> = RefCell::new(PyClasses::default());
@@ -65,7 +65,14 @@ thread_local! {
 }
 
 /// Collect the file's import-bound names. MUST run once per file before its walk.
-pub(super) fn reset_import_bound(root: tree_sitter::Node, source: &str, family: &str) {
+/// `rel_path`: the file's project-relative path, `None` when no file is behind
+/// the source ([`py_local_imports`]).
+pub(super) fn reset_import_bound(
+    root: tree_sitter::Node,
+    source: &str,
+    family: &str,
+    rel_path: Option<&str>,
+) {
     let mut names = HashMap::new();
     let mut renamed = HashSet::new();
     if matches!(family, "python" | "javascript" | "typescript" | "tsx") {
@@ -74,16 +81,16 @@ pub(super) fn reset_import_bound(root: tree_sitter::Node, source: &str, family: 
     if matches!(family, "javascript" | "typescript" | "tsx") {
         collect_renamed(root, source, &mut renamed, 0);
     }
-    let (modules, rebound) = if family == "python" && names.values().any(Option::is_some) {
+    let (modules, local) = if family == "python" && names.values().any(Option::is_some) {
         (
             py_module_names(root, source, &names),
-            py_rebound_imports(root, source, &names),
+            py_local_imports(root, source, &names, rel_path),
         )
     } else {
         (HashMap::new(), HashSet::new())
     };
     PY_MODULE_NAMES.with(|m| *m.borrow_mut() = modules);
-    PY_REBOUND_IMPORTS.with(|r| *r.borrow_mut() = rebound);
+    PY_LOCAL_IMPORTS.with(|r| *r.borrow_mut() = local);
     let classes = if family == "python" {
         py_class_names(root, source)
     } else {
@@ -1033,9 +1040,10 @@ pub(super) fn python_untyped_receiver_meta(
 /// recorded for a synthetic import of `X` from that module (D#518): the call
 /// then binds what `from M import X` would, through the same import machinery.
 ///
-/// `"rb":1` (D#700) marks a name the file also binds otherwise, or writes an
-/// attribute chain of ([`PY_REBOUND_IMPORTS`]): only such a call may run one of
-/// the file's own definitions, so only it keeps a same-file bind elsewhere.
+/// `"loc":1` (D#700) marks a call through a name that may run one of the
+/// file's own definitions ([`PY_LOCAL_IMPORTS`]): the file binds the name
+/// otherwise, writes an attribute chain of it, or reaches its own module
+/// through it. Only such a call keeps a same-file bind in the resolver.
 pub(super) fn python_module_call_meta(call: tree_sitter::Node, source: &str) -> Option<String> {
     let function = call.child_by_field_name("function")?;
     if function.kind() != "attribute" {
@@ -1051,15 +1059,15 @@ pub(super) fn python_module_call_meta(call: tree_sitter::Node, source: &str) -> 
     }
     let name = node_text(&root, source);
     let module = IMPORT_BOUND.with(|b| b.borrow().get(name).cloned())??;
-    let rebound = PY_REBOUND_IMPORTS.with(|r| r.borrow().contains(name));
+    let local = PY_LOCAL_IMPORTS.with(|r| r.borrow().contains(name));
     let attr = function
         .child_by_field_name("attribute")
         .filter(|a| object.kind() == "identifier" && a.kind() == "identifier")
         .map(|a| node_text(&a, source).to_string())
         .filter(|_| PY_MODULE_NAMES.with(|m| m.borrow().get(name) == Some(&module)));
     let mut meta = serde_json::json!({ "q": "module", "v": module });
-    if rebound {
-        meta["rb"] = 1.into();
+    if local {
+        meta["loc"] = 1.into();
     }
     let Some(attr) = attr else {
         return Some(meta.to_string());
@@ -1136,24 +1144,44 @@ fn py_module_names(
     }
 }
 
-/// The names of `bound` (the file's import bindings) that a call through them
-/// may NOT resolve away from the file (D#700): some occurrence of the name is
-/// neither inside an import statement nor a read ([`py_class_name_is_read`],
-/// the allow-list `C.m()` uses), or an attribute chain rooted at the name sits
-/// where no read does (`m.f = g`, `del m.f`, `m.a.f += 1`, `for m.i in …`).
-/// Every name binding Python has — a parameter, `def`, `class`, any assignment
-/// or loop target, `as`, walrus, `del`, `global`, a match capture, `type` — is
-/// no read, so a name left out is one only imports bind, whose attributes the
-/// file only reads.
+/// The names of `bound` (the file's import bindings) a call through which may
+/// run a definition of the file itself (D#700):
+/// - some occurrence of the name is neither inside an import statement nor a
+///   read ([`py_import_name_is_read`]): every name binding Python has — a
+///   parameter, `def`, `class`, any assignment or loop target, `as`, walrus,
+///   `del`, `global`, a match capture, `type` — is no read;
+/// - an attribute chain rooted at the name sits where no read does (`m.f = g`,
+///   `del m.f`, `m.a.f += 1`, `for m.i in …`);
+/// - an occurrence may reach the file's own module: what one of the name's
+///   imports binds, followed by the occurrence's attribute chain, has a
+///   leading part that may be the module the file is (`import a` and
+///   `a.mod.go()` in `a/mod.py`; `from c import mod` and `mod.go()` in
+///   `c/mod.py`), or one of the imports is relative. Without `rel_path`, or
+///   for a file no `.py`/`.pyi` name makes a module, this leg is skipped.
 ///
 /// One cursor walk, no recursion: a deep expression cannot overflow it.
-fn py_rebound_imports(
+fn py_local_imports(
     root: tree_sitter::Node,
     source: &str,
     bound: &HashMap<String, Option<String>>,
+    rel_path: Option<&str>,
 ) -> HashSet<String> {
+    // The file's module as dotted segments under the project root; any suffix
+    // of them may be the module under some import root. A file no `.py` or
+    // `.pyi` name gives is no module anything can import.
+    let caller: Option<Vec<&str>> = rel_path
+        .and_then(|p| {
+            ["/__init__.py", "/__init__.pyi", ".py", ".pyi"]
+                .iter()
+                .find_map(|suffix| p.strip_suffix(suffix))
+        })
+        .map(|stem| stem.split('/').collect());
+    let targets = caller
+        .as_ref()
+        .map(|_| py_import_targets(root, source, bound))
+        .unwrap_or_default();
     let no_classes: HashSet<usize> = HashSet::new();
-    let mut rebound: HashSet<String> = HashSet::new();
+    let mut local: HashSet<String> = HashSet::new();
     // `tops[i]`: the index of the nearest ancestor at or above `i` that is no
     // container, as `py_class_name_is_read` expects.
     let mut ancestors: Vec<tree_sitter::Node> = Vec::new();
@@ -1164,12 +1192,19 @@ fn py_rebound_imports(
         if node.kind() == "identifier" {
             let name = node_text(&node, source);
             if bound.contains_key(name)
-                && !rebound.contains(name)
+                && !local.contains(name)
                 && !py_in_import(&ancestors)
                 && (!py_import_name_is_read(node, &ancestors, &tops, &no_classes)
-                    || py_attribute_chain_written(node, &ancestors, &tops, &no_classes))
+                    || py_attribute_chain_written(node, &ancestors, &tops, &no_classes)
+                    || caller.as_ref().is_some_and(|caller| {
+                        py_reaches_module(
+                            targets.get(name).map(Vec::as_slice).unwrap_or_default(),
+                            &py_chain_segments(node, &ancestors, source, caller.len()),
+                            caller,
+                        )
+                    }))
             {
-                rebound.insert(name.to_string());
+                local.insert(name.to_string());
             }
         }
         if cursor.goto_first_child() {
@@ -1184,12 +1219,132 @@ fn py_rebound_imports(
         }
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
-                return rebound;
+                return local;
             }
             ancestors.pop();
             tops.pop();
         }
     }
+}
+
+/// What each import binding of a name in `bound` binds it to, as a dotted path
+/// (D#700): `import a.b` binds `a` to `a`, `import a.b as m` binds `m` to
+/// `a.b`, `from p import n [as m]` binds `n` (`m`) to `p.n`; a relative import
+/// to `None`. `from p import *` may bind any of the names, to `p.<name>`.
+fn py_import_targets(
+    root: tree_sitter::Node,
+    source: &str,
+    bound: &HashMap<String, Option<String>>,
+) -> HashMap<String, Vec<Option<String>>> {
+    let text = |n: tree_sitter::Node| node_text(&n, source).to_string();
+    let mut targets: HashMap<String, Vec<Option<String>>> = HashMap::new();
+    let mut stars: Vec<Option<String>> = Vec::new();
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        let is_from = node.kind() == "import_from_statement";
+        let descend = if is_from || node.kind() == "import_statement" {
+            let module = node.child_by_field_name("module_name");
+            let from = module.filter(|m| m.kind() == "dotted_name").map(text);
+            for i in 0..node.named_child_count() {
+                let Some(c) = node.named_child(i) else {
+                    continue;
+                };
+                if Some(c.id()) == module.map(|m| m.id()) {
+                    continue;
+                }
+                let (name, path) = match c.kind() {
+                    // `import a.b` binds `a`; `from p import n` binds `n`.
+                    "dotted_name" => match c.named_child(0) {
+                        Some(first) => (text(first), text(first)),
+                        None => continue,
+                    },
+                    "aliased_import" => match (
+                        c.child_by_field_name("alias"),
+                        c.child_by_field_name("name"),
+                    ) {
+                        (Some(alias), Some(name)) => (text(alias), text(name)),
+                        _ => continue,
+                    },
+                    "wildcard_import" => {
+                        stars.push(from.clone());
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let target = if is_from {
+                    from.as_ref().map(|m| format!("{m}.{path}"))
+                } else {
+                    Some(path)
+                };
+                targets.entry(name).or_default().push(target);
+            }
+            false
+        } else {
+            true
+        };
+        if descend && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                for star in &stars {
+                    for name in bound.keys() {
+                        let target = star.as_ref().map(|m| format!("{m}.{name}"));
+                        targets.entry(name.clone()).or_default().push(target);
+                    }
+                }
+                return targets;
+            }
+        }
+    }
+}
+
+/// The attribute names after `node` in the chain it is the object of (through
+/// parentheses), at most `limit` of them: `a.mod.go` → `["mod", "go"]`.
+fn py_chain_segments<'s>(
+    node: tree_sitter::Node,
+    ancestors: &[tree_sitter::Node],
+    source: &'s str,
+    limit: usize,
+) -> Vec<&'s str> {
+    let (mut at, mut object, mut segments) = (ancestors.len(), node, Vec::new());
+    while segments.len() < limit {
+        let Some(&parent) = at.checked_sub(1).map(|i| &ancestors[i]) else {
+            break;
+        };
+        match parent.kind() {
+            "parenthesized_expression" => {}
+            "attribute" if is_node(parent.child_by_field_name("object"), object) => {
+                match parent.child_by_field_name("attribute") {
+                    Some(attr) => segments.push(node_text(&attr, source)),
+                    None => break,
+                }
+            }
+            _ => break,
+        }
+        at -= 1;
+        object = parent;
+    }
+    segments
+}
+
+/// Whether a leading part of one of `targets` followed by `chain` may be the
+/// file's own module. `caller` is the file's dotted segments under the project
+/// root; under some import root the file is the module any trailing part of
+/// them names. An unknown target (a relative import) may be anything.
+fn py_reaches_module(targets: &[Option<String>], chain: &[&str], caller: &[&str]) -> bool {
+    targets.iter().any(|target| {
+        let Some(target) = target else {
+            return true;
+        };
+        let path: Vec<&str> = target
+            .split('.')
+            .chain(chain.iter().copied())
+            .take(caller.len())
+            .collect();
+        (1..=path.len()).any(|k| caller.ends_with(&path[..k]))
+    })
 }
 
 /// Whether the attribute chain `node` (a read name) is the object of — through
@@ -1216,7 +1371,7 @@ fn py_attribute_chain_written(
 }
 
 /// [`py_class_name_is_read`], plus a parameter's default value (`def f(x=m.X)`,
-/// evaluated where the `def` runs): only for [`py_rebound_imports`], so the
+/// evaluated where the `def` runs): only for [`py_local_imports`], so the
 /// `C.m()` rule keeps its own list. The parameter's name is a binding.
 fn py_import_name_is_read(
     node: tree_sitter::Node,

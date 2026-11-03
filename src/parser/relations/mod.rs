@@ -152,14 +152,19 @@ pub struct ParsedRelation {
 
 pub fn extract_relations(source: &str, language: &str) -> Result<Vec<ParsedRelation>> {
     let tree = super::treesitter::parse_tree(source, language)?;
-    Ok(extract_relations_from_tree(&tree, source, language))
+    Ok(extract_relations_from_tree(&tree, source, language, None))
 }
 
 /// Extract relations from a pre-parsed tree (avoids re-parsing).
+///
+/// `rel_path` is the file's project-relative path. A Python call through an
+/// imported name that may reach the file's own module is told apart by it
+/// (D#700); with `None` (no file behind the source) that check is skipped.
 pub fn extract_relations_from_tree(
     tree: &tree_sitter::Tree,
     source: &str,
     language: &str,
+    rel_path: Option<&str>,
 ) -> Vec<ParsedRelation> {
     let mut relations = Vec::new();
     let config = LanguageConfig::for_language(language);
@@ -173,7 +178,7 @@ pub fn extract_relations_from_tree(
     rust_use::reset();
     rust_receiver::reset();
     rust_impls::reset();
-    member::reset_import_bound(tree.root_node(), source, config.name);
+    member::reset_import_bound(tree.root_node(), source, config.name, rel_path);
     receiver::reset();
     walk_for_relations(
         tree.root_node(),

@@ -2134,7 +2134,7 @@ fn main() {
 }
 "#;
     let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
-    let relations = extract_relations_from_tree(&tree, source, "rust");
+    let relations = extract_relations_from_tree(&tree, source, "rust", None);
     let imports: Vec<&ParsedRelation> = relations
         .iter()
         .filter(|r| r.relation == REL_IMPORTS)
@@ -2193,7 +2193,7 @@ use somecrate::helpers::assist;
 fn main() {}
 "#;
     let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
-    let relations = extract_relations_from_tree(&tree, source, "rust");
+    let relations = extract_relations_from_tree(&tree, source, "rust", None);
     let imports: Vec<&ParsedRelation> = relations
         .iter()
         .filter(|r| r.relation == REL_IMPORTS)
@@ -2264,7 +2264,7 @@ mod tests {
 }
 "#;
     let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
-    let relations = extract_relations_from_tree(&tree, source, "rust");
+    let relations = extract_relations_from_tree(&tree, source, "rust", None);
     let meta = |n: &str| {
         relations
             .iter()
@@ -2320,7 +2320,7 @@ func main() {
 }
 "#;
     let tree = crate::parser::treesitter::parse_tree(source, "go").unwrap();
-    let relations = extract_relations_from_tree(&tree, source, "go");
+    let relations = extract_relations_from_tree(&tree, source, "go", None);
     let imports: Vec<&ParsedRelation> = relations
         .iter()
         .filter(|r| r.relation == REL_IMPORTS)
@@ -2348,7 +2348,7 @@ use mylib::io::Read as _;
 fn main() {}
 "#;
     let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
-    let relations = extract_relations_from_tree(&tree, source, "rust");
+    let relations = extract_relations_from_tree(&tree, source, "rust", None);
     let imports: Vec<&str> = relations
         .iter()
         .filter(|r| r.relation == REL_IMPORTS)
@@ -7542,7 +7542,7 @@ fn run() {
 }
 "#;
     let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
-    let relations = extract_relations_from_tree(&tree, source, "rust");
+    let relations = extract_relations_from_tree(&tree, source, "rust", None);
     let calls: Vec<&str> = relations
         .iter()
         .filter(|r| r.relation == REL_CALLS)
@@ -7580,7 +7580,7 @@ fn run() {
 }
 "#;
     let tree = crate::parser::treesitter::parse_tree(source, "rust").unwrap();
-    let relations = extract_relations_from_tree(&tree, source, "rust");
+    let relations = extract_relations_from_tree(&tree, source, "rust", None);
     let calls: Vec<&str> = relations
         .iter()
         .filter(|r| r.relation == REL_CALLS)
@@ -8756,11 +8756,90 @@ fn a_call_on_a_python_module_name_names_the_module_attribute() {
     assert!(from_import.is_some(), "{:?}", call_meta(mixed, "python"));
 }
 
+/// D#700(2b), review round 1: with the file's path, a name is marked `"loc"`
+/// when what one of its imports binds, followed by an occurrence's attribute
+/// chain, may be the file's own module (`pkg/mod.py` is `pkg.mod`, or `mod`
+/// under a deeper import root), or when one of its imports is relative.
+#[test]
+fn a_python_module_call_that_may_reach_its_own_module_is_marked() {
+    let meta_at = |src: &str, path: Option<&str>| -> String {
+        let tree = crate::parser::treesitter::parse_tree(src, "python").unwrap();
+        extract_relations_from_tree(&tree, src, "python", path)
+            .into_iter()
+            .find(|r| r.relation == REL_CALLS && r.target_name == "go")
+            .and_then(|r| r.metadata)
+            .unwrap_or_else(|| panic!("no go() call: {src}"))
+    };
+    let at = Some("pkg/mod.py");
+    let kept: &[(&str, &str)] = &[
+        ("another module", "import pkg.other\npkg.other.go()\n"),
+        ("the package", "import pkg\npkg.go()\n"),
+        (
+            "from-import of another",
+            "from pkg import other\nother.go()\n",
+        ),
+        ("unrelated", "import ext\next.sub.go()\n"),
+        ("alias of another", "import ext as mod\nmod.go()\n"),
+        (
+            "star of another",
+            "from other import *\nimport ext\next.go()\n",
+        ),
+        (
+            "attribute named like it",
+            "import pkg as mod\nx = o.mod.y\nmod.go()\n",
+        ),
+    ];
+    for (shape, src) in kept {
+        let meta = meta_at(src, at);
+        assert!(!meta.contains(r#""loc""#), "{shape}: {meta}");
+    }
+    let marked: &[(&str, &str)] = &[
+        ("package, chain", "import pkg\npkg.mod.go()\n"),
+        ("dotted import", "import pkg.mod\npkg.mod.go()\n"),
+        ("from-import", "from pkg import mod\nmod.go()\n"),
+        (
+            "from-import alias, deeper",
+            "from pkg import mod as m\nm.Klass.go()\n",
+        ),
+        ("deeper import root", "import mod\nmod.go()\n"),
+        (
+            "one of two imports",
+            "import ext as m\n\ndef f():\n    import pkg.mod as m\nm.go()\n",
+        ),
+        (
+            "read elsewhere",
+            "import pkg\nx = pkg.mod.X\npkg.other.go()\n",
+        ),
+        (
+            "relative import too",
+            "from . import ext\nimport ext\next.go()\n",
+        ),
+        ("relative star", "from . import *\nimport ext\next.go()\n"),
+        (
+            "star from the package",
+            "from pkg import *\nimport ext as mod\nmod.go()\n",
+        ),
+    ];
+    for (shape, src) in marked {
+        let meta = meta_at(src, at);
+        assert!(meta.contains(r#""loc":1"#), "{shape}: {meta}");
+    }
+    // `pkg/__init__.py` and a stub are modules too; a path that makes no
+    // module, and no path at all, take no mark from the module they reach.
+    assert!(meta_at("import pkg\npkg.go()\n", Some("pkg/__init__.py")).contains(r#""loc":1"#));
+    assert!(meta_at("import pkg\npkg.mod.go()\n", Some("pkg/mod.pyi")).contains(r#""loc":1"#));
+    for path in [Some("pkg/mod"), None] {
+        let meta = meta_at("import pkg\npkg.mod.go()\n", path);
+        assert!(!meta.contains(r#""loc""#), "{path:?}: {meta}");
+    }
+}
+
 /// D#700(2b): a call through an imported name (`{"q":"module"}`) carries
-/// `"rb":1` when the file binds that name some other way, or writes an
-/// attribute chain rooted at it: only then may the call run one of the file's
-/// own definitions. A name only imports bind, and only read otherwise, keeps
-/// the metadata it had.
+/// `"loc":1` when the file binds that name some other way, or writes an
+/// attribute chain rooted at it: the call may then run one of the file's own
+/// definitions. (A name that can reach the file's own module carries it too:
+/// `a_python_module_call_into_the_callers_own_module_keeps_its_bind`.) A name
+/// only imports bind, and only read otherwise, keeps the metadata it had.
 #[test]
 fn a_python_module_call_marks_a_root_the_file_rebinds() {
     // Each shape calls `go` through the name `m` (or `C`).
@@ -8792,6 +8871,7 @@ fn a_python_module_call_marks_a_root_the_file_rebinds() {
             "try:\n    import m\nexcept ImportError:\n    import n as m\nm.go()\n",
         ),
         ("keyword and attribute named m", "import m\no.m(m=1)\nm.go()\n"),
+        ("attribute named m written", "import m\no.m = 1\no.x.m = 2\nm.go()\n"),
         (
             "attribute read, subscript write",
             "import m\nm.tbl[0] = 1\nx = m.a.b\nm.go()\n",
@@ -8806,7 +8886,7 @@ fn a_python_module_call_marks_a_root_the_file_rebinds() {
         let calls = call_meta(src, "python");
         let meta = meta_of(&calls, "go").unwrap_or_else(|| panic!("{shape}: {calls:?}"));
         assert!(meta.contains(r#""q":"module""#), "{shape}: {meta}");
-        assert!(!meta.contains(r#""rb""#), "{shape}: {meta}");
+        assert!(!meta.contains(r#""loc""#), "{shape}: {meta}");
     }
     let marked: &[(&str, &str)] = &[
         ("module assignment", "import m\nm = None\nm.go()\n"),
@@ -8864,6 +8944,6 @@ fn a_python_module_call_marks_a_root_the_file_rebinds() {
         let calls = call_meta(src, "python");
         let meta = meta_of(&calls, "go").unwrap_or_else(|| panic!("{shape}: {calls:?}"));
         assert!(meta.contains(r#""q":"module""#), "{shape}: {meta}");
-        assert!(meta.contains(r#""rb":1"#), "{shape}: {meta}");
+        assert!(meta.contains(r#""loc":1"#), "{shape}: {meta}");
     }
 }
