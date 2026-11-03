@@ -121,3 +121,9 @@
 - 按名字标记，不按调用标记：同一调用方经同一名字的几次调用 metadata 一致，不会在 BASE 只有一行的地方拆出两行。
 - 标记键改名为 `"loc"`（可能在本文件解析），因为它不再只表示"重新绑定"；尚未发布，改名没有代价。
 - 解析阶段只剩"`q` 为 module、没有 `loc`、没有 `attr`"一条，路径判断删掉，不保留两处来源。
+
+## 第 1 轮修复的实现（`33f5bbb6`）
+
+- RED：新索引测试 `a_python_module_call_into_the_callers_own_module_keeps_its_bind`（F1 的 5 种写法、F2、`next.py`、两个 `.pyi`）在 3fc7cdee 上失败：F1、F2 全部被拿掉，`stubs/other.pyi` 被保留（M7）。
+- 带路径的解析器测试 `a_python_module_call_that_may_reach_its_own_module_is_marked`：保持 7 种、标记 10 种，外加 `__init__.py`、`.pyi`、无模块路径、无路径。它写在实现之后，所以逐条做了变异：未知目标、星号导入、链长上限、`ends_with`、只比全长、`/__init__.py` 后缀、`.pyi` 后缀、从属性名起算的链（两处）都被抓到；`from` 分支的 `text(c)` 是等价变异（`from p import n` 的 `n` 只能是单个标识符），已删掉那一支。
+- 全量 `cargo test --no-fail-fast` 2,384 通过、0 失败、7 忽略；clippy 两种特性组合通过；pre-commit 通过。

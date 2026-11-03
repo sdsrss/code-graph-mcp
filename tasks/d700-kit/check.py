@@ -13,7 +13,10 @@ cases_dir, base_dir, head_dir = sys.argv[1:4]
 meta = json.load(open(os.path.join(cases_dir, "cases.json")))
 
 def truth(name):
-    p = subprocess.run([sys.executable, "-E", "-s", name], cwd=cases_dir, capture_output=True, text=True, timeout=20)
+    # A case inside a package runs as that module (`-m pkg2.c00001`), so its
+    # imports of the package resolve as they would in the project.
+    args = ["-m", name[:-3].replace("/", ".")] if "/" in name else [name]
+    p = subprocess.run([sys.executable, "-E", "-s", *args], cwd=cases_dir, capture_output=True, text=True, timeout=20)
     out = [l for l in p.stdout.split("\n") if l]
     return out[-1].split()[0] if out else "NONE"
 
@@ -24,13 +27,13 @@ def edges(repo):
         FROM edges e JOIN nodes s ON s.id = e.source_id JOIN files sf ON sf.id = s.file_id
         JOIN nodes t ON t.id = e.target_id JOIN files tf ON tf.id = t.file_id
         WHERE e.relation = 'calls' AND s.name = 'main'"""):
-        # `"rb"` is HEAD's new mark on an unchanged call: compare without it.
+        # `"loc"` is HEAD's new mark on an unchanged call: compare without it.
         try:
             m = json.loads(meta_) if meta_ else None
         except ValueError:
             m = None
         if isinstance(m, dict):
-            m.pop("rb", None)
+            m.pop("loc", None)
             meta_ = json.dumps(m, sort_keys=True, separators=(",", ":"))
         out[sp].add((tp, tn, meta_))
     return out
@@ -42,7 +45,7 @@ for name, m in sorted(meta.items()):
     b = {x for x in base[name] if x[0] == name and x[1] == "go"}
     h = {x for x in head[name] if x[0] == name and x[1] == "go"}
     added = head[name] - base[name]
-    kinds = "+".join(sorted({k for k, _, _ in m["occ"]})) or "none"
+    kinds = ("pkg:" if m.get("pkg") else "") + ("+".join(sorted({k for k, _, _ in m["occ"]})) or "none")
     if added:
         verdict = "ADDED"
     elif b and not h:

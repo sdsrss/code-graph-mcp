@@ -10,7 +10,7 @@ Spec: `tasks/specs/d700-py-module-call-own-file.md`.
 - `check.py CASES BASE_REPO HEAD_REPO`: copies of OUT indexed by the two
   binaries (`git init` + commit first). WRONG = HEAD stopped binding into the
   file while CPython ran the file's `go`; ADDED = a HEAD edge from `main` BASE
-  lacks (`"rb"` is ignored when comparing metadata).
+  lacks (`"loc"` is ignored when comparing metadata).
 
 Corpora, oracle recipe and scoring: `tasks/d370g-kit/README.md` and the
 stdlib-oracle memory. The `score.sh` used here is the d370g one with
@@ -20,6 +20,6 @@ stdlib-oracle memory. The `score.sh` used here is the d370g one with
   `tasks/d370g-kit/parity/parity.py` (point its `B`/`work`/`home` roots at a
   new directory first). `q03` shows a pre-existing imports gap (D#702),
   identical on 0.183.0.
-- `perf/timeit.py ROUNDS DIR...`: interleaved full index of each DIR with
-  `bin/base-src` and `bin/head-src` (paths inside), median wall/CPU and max RSS
-  per child via `os.wait4`.
+- `perf/timeit.py ROUNDS BASE_BIN HEAD_BIN DIR...`: interleaved full index of
+  each DIR with the two binaries, median wall/CPU and max RSS per child via
+  `os.wait4`.

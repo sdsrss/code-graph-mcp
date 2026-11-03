@@ -1,5 +1,10 @@
 """gen.py OUT N SEED: one-call Python files for D#700(2b), checked by check.py.
 
+About a third of the cases sit inside package `pkg2/` and import a name that
+may reach the case's own module (`import pkg2` + `pkg2.<self>.go()`, `from pkg2
+import <self> as R`, ...) or a sibling (`pkg2.other`), as review round 1 asked:
+a root-level case file never reaches itself through an import.
+
 Each case file `cNNNNN.py` imports a name R (5 import forms), defines its own
 `go` (and a class `Local` whose `go`/`sub` lead to it), adds 0-2 extra
 occurrences of R (bindings, attribute writes, reads, dynamic patches) at module
@@ -17,7 +22,19 @@ LIB = {
     "ext2.py": 'def go():\n    print("EXT2")\n\nclass sub:\n    go = staticmethod(go)\n',
     "pkg/__init__.py": "",
     "pkg/ext.py": 'def go():\n    print("PKG")\n\nclass sub:\n    go = staticmethod(go)\n',
+    "pkg2/__init__.py": "",
+    "pkg2/other.py": 'def go():\n    print("OTHER")\n\nclass sub:\n    go = staticmethod(go)\n',
 }
+# In package pkg2, as module pkg2.<SELF>: (import line, R, call shapes).
+SELF_IMPORTS = [
+    # `pkg2.<self>` exists once something imported it, as in real code.
+    ("import pkg2\nimport pkg2.SELF as _loaded", "pkg2", ["pkg2.SELF.go()", "pkg2.SELF.Local.go()", "pkg2.other.go()"]),
+    ("import pkg2.SELF", "pkg2", ["pkg2.SELF.go()", "pkg2.SELF.Local.go()"]),
+    ("import pkg2.SELF as R", "R", ["R.go()", "R.Local.go()"]),
+    ("from pkg2 import SELF as R", "R", ["R.go()", "R.sub.go()"]),
+    ("from pkg2 import other as R", "R", ["R.go()", "R.sub.go()"]),
+    ("from pkg2 import SELF", "SELF", ["SELF.go()"]),
+]
 # (import line, R, call shapes)
 IMPORTS = [
     ("import ext as R", "R", ["R.go()", "R.sub.go()"]),
@@ -60,8 +77,11 @@ def indent(s, n):
     return "\n".join(" " * n + l for l in s.split("\n"))
 
 def case(i):
-    imp, R, calls = rnd.choice(IMPORTS)
+    in_pkg = rnd.random() < 0.35
+    imp, R, calls = rnd.choice(SELF_IMPORTS if in_pkg else IMPORTS)
     call = rnd.choice(calls)
+    me = f"c{i:05d}"
+    imp, R, call = imp.replace("SELF", me), R.replace("SELF", me), call.replace("SELF", me)
     occ = [(k, s.replace("R", R) if R != "R" else s, rnd.choice(["mod", "main", "fn"]))
            for k, s in rnd.sample(OCC, rnd.choice([0, 1, 1, 2]))]
     # `R` inside templates is the placeholder; protect identifiers containing R.
@@ -75,8 +95,8 @@ def case(i):
         else:
             main_pre.append(s)
     body = "".join("    try:\n" + indent(s, 8) + "\n    except Exception:\n        pass\n" for s in main_pre)
-    src += "def main():\n" + body + "    try:\n        " + call + "\n    except Exception as e:\n        print('ERR', type(e).__name__)\n\nmain()\n"
-    return src, {"import": imp, "call": call, "occ": [[k, s, w] for k, s, w in occ]}
+    src += "def main():\n" + body + "    try:\n        " + call + "\n    except Exception as e:\n        print('ERR', type(e).__name__)\n\nif __name__ == '__main__':\n    main()\n"
+    return src, {"import": imp, "call": call, "occ": [[k, s, w] for k, s, w in occ], "pkg": in_pkg}
 
 os.makedirs(OUT, exist_ok=True)
 for name, body in LIB.items():
@@ -89,7 +109,7 @@ for i in range(N):
         compile(src, "c", "exec")
     except SyntaxError:
         continue
-    name = f"c{i:05d}.py"
+    name = ("pkg2/" if m["pkg"] else "") + f"c{i:05d}.py"
     open(os.path.join(OUT, name), "w").write(src)
     meta[name] = m
 json.dump(meta, open(os.path.join(OUT, "cases.json"), "w"), indent=0)
