@@ -8887,34 +8887,55 @@ fn a_python_module_call_reach_holds_for_review_round_two_shapes() {
         "deep import"
     );
 
-    let within = |label: &str, code: String| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let tree = crate::parser::treesitter::parse_tree(&code, "python").unwrap();
-            let _ = tx.send(extract_relations_from_tree(
-                &tree,
-                &code,
-                "python",
-                Some("pkg/mod.py"),
-            ));
-        });
-        rx.recv_timeout(std::time::Duration::from_secs(60))
-            .unwrap_or_else(|_| panic!("{label} took over 60 s"))
+    // Inputs stay under the indexer's 1 MiB file cap: a 2.6 MB one outran
+    // tree-sitter's 5 s parse timeout on a Windows debug build. Names come many
+    // to a line so that a quadratic product stays large: names x stars is
+    // 2.1e9 here (the per-name star expansion this replaced: 60 s at 1.6e9),
+    // targets x occurrences 7.0e9 (no deduplication: 16 s at 1.6e9). A
+    // quadratic loop cheaper per step can still pass: these guard the shapes
+    // measured, they do not prove linearity.
+    let within =
+        |label: &str, code: String| {
+            assert!(code.len() < 1 << 20, "{label}: {} bytes", code.len());
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::parser::treesitter::parse_tree(&code, "python").map(
+                    |tree| extract_relations_from_tree(&tree, &code, "python", Some("pkg/mod.py")),
+                ));
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                Ok(Ok(relations)) => relations,
+                Ok(Err(e)) => panic!("{label}: {e}"),
+                Err(_) => panic!("{label} took over 60 s"),
+            }
+        };
+    let short = |mut i: usize| {
+        let mut name = String::from("z");
+        loop {
+            name.push(char::from_digit((i % 36) as u32, 36).unwrap());
+            i /= 36;
+            if i == 0 {
+                return name;
+            }
+        }
     };
-    let n = 40_000;
-    let mut stars = String::new();
-    for i in 0..n {
-        stars += &format!("import m{i}\nfrom s{i} import *\n");
+    let names: Vec<String> = (0..80_000).map(short).collect();
+    let mut stars: String = names
+        .chunks(100)
+        .map(|line| format!("import {}\n", line.join(", ")))
+        .collect();
+    for i in 0..26_000 {
+        stars += &format!("from {} import *\n", short(i));
     }
-    stars += "m0.x.go()\n";
+    stars += "z0.x.go()\n";
     assert!(!within("star imports x names", stars).is_empty());
-    // Quadratic here took 16 s at 40,000 in a debug build: 120,000 is ~150 s.
-    let n = 120_000;
-    let repeat = format!(
-        "{}{}",
-        "import pkg\n".repeat(n),
-        "pkg.other.go()\n".repeat(n)
-    );
+    let targets = (0..1_000)
+        .map(|_| format!("import {}\n", vec!["pkg"; 100].join(", ")))
+        .collect::<String>();
+    let reads = (0..700)
+        .map(|_| format!("x = ({},)\n", vec!["pkg.a"; 100].join(", ")))
+        .collect::<String>();
+    let repeat = format!("{targets}{reads}pkg.other.go()\n");
     assert!(!within("repeated imports", repeat).is_empty());
 }
 
