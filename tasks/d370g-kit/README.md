@@ -1,9 +1,18 @@
-# D#370(g) kit (Python `C.m()` owner rule, withdrawn 2026-11-02)
+# D#370(g) kit (Python `C.m()` owner rule)
 
 The scripts, parity scenarios and review case files of `/var/tmp/d370`, kept
-for the redesign before that directory was deleted. The withdrawn code is on
-branch `d370g-py-class-call` (5 commits on top of 6f4e17de); the spec with all
-three review rounds is `tasks/specs/d370g-py-class-qualified-call.md`.
+for the redesign before that directory was deleted. The first design was
+withdrawn after three review rounds (its code is on branch
+`d370g-py-class-call`); the redesign (185f4ce8 and the 0.183.0 pre-tag review
+repairs) was checked first against CPython with `enum/` and shipped in
+0.183.0. The spec with every review round is
+`tasks/specs/d370g-py-class-qualified-call.md`.
+
+`enum/`: `gen.py SEED N OUT` generates one-call files, `truth.py` runs each with
+CPython, `check.py TRUTH BASE_DIR HEAD_DIR` judges HEAD's edges against the
+truth and BASE (`--attribute` groups failures by feature), `why.py` attributes
+wrong and refused answers, `memrepro.py` reproduces the pre-tag review's
+metaclass memory growth.
 
 Scripts hard-code `/var/tmp/d370` (and the round-1/2 tools `/var/tmp/d370-review*`):
 point their roots at a new directory first. Binaries, indexes, corpora copies,
@@ -49,3 +58,5 @@ scip-clang 0.4.0 beside it; `SCIP_TOOLS_BIN` points at `node_modules/.bin`.
 0.182.0: 11,003/15,827 correct (69.5%), 4,824 wrong, recall 10,764/12,375.
 Withdrawn 001b74a9: 10,993/13,905 (79.1%), 2,912 wrong, same recall, edge set
 −1,923 / +0; flask, hono, leveldb, gin, cobra identical.
+0.183.0 (redesign): 10,996/14,329 (76.7%), 3,333 wrong, same recall, edge set
+−1,499 / +0; the same five identical.

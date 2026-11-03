@@ -1187,11 +1187,67 @@ fn test_python_call_on_a_module_level_class_binds_the_mro_owner() {
             "from abc import ABCMeta\nclass A(metaclass=ABCMeta):\n    def m(self): pass\nclass C(A): pass\n",
             Some("A"),
         ),
+        // Pre-tag review of 0.183.0: a metaclass's `__new__`, `__prepare__` or
+        // `__init__` can drop `m` too, so one of the file declines outright.
         (
             "a metaclass of the file without m",
             "class M(type):\n    def other(cls): pass\nclass C(metaclass=M):\n    def m(self): pass\n",
+            None,
+        ),
+        (
+            "a metaclass of the file popping m",
+            "class M(type):\n    def __new__(mcs, n, b, ns):\n        ns.pop(\"m\")\n        return super().__new__(mcs, n, b, ns)\nclass C(metaclass=M):\n    def m(self): pass\n",
+            None,
+        ),
+        (
+            "one imported metaclass inherited twice",
+            "from abc import ABCMeta\nclass A(metaclass=ABCMeta): pass\nclass B(A): pass\nclass D(A): pass\nclass C(B, D):\n    def m(self): pass\n",
             Some("C"),
         ),
+        (
+            "two imported metaclasses",
+            "from abc import ABCMeta\nfrom x import N\nclass A(metaclass=ABCMeta): pass\nclass B(metaclass=N): pass\nclass C(A, B):\n    def m(self): pass\n",
+            None,
+        ),
+        // Assigning `__bases__` or `__class__` moves the MRO or the metaclass.
+        (
+            "bases assigned",
+            "class A:\n    def m(self): pass\nclass B:\n    def m(self): pass\nclass C(A): pass\nC.__bases__ = (B,)\n",
+            None,
+        ),
+        (
+            "a base's bases assigned",
+            "class A:\n    def m(self): pass\nclass B: pass\nclass C(B, A): pass\nB.__bases__ = (A,)\n",
+            None,
+        ),
+        (
+            "class assigned",
+            "class M(type): pass\nclass C:\n    def m(self): pass\nC.__class__ = M\n",
+            None,
+        ),
+        // `exec` / `locals()` in a header runs in the class body too.
+        (
+            "exec in a default",
+            "class C:\n    def m(self): pass\n    def z(self, a=exec(\"m = 1\")): pass\n",
+            None,
+        ),
+        (
+            "locals in a decorator",
+            "class C:\n    def m(self): pass\n    @inject(locals())\n    def z(self): pass\n",
+            None,
+        ),
+        (
+            "exec in a lambda default",
+            "class C:\n    def m(self): pass\n    f = lambda a=exec(\"m = 1\"): a\n",
+            None,
+        ),
+        // `class A[T]` has an implicit `Generic` base after its others.
+        (
+            "a type-parameter class before the owner",
+            "class A[T]:\n    def x(self): pass\nclass B:\n    def m(self): pass\nclass C(A, B): pass\n",
+            None,
+        ),
+
         (
             "a metaclass with __getattribute__",
             "class M(type):\n    def __getattribute__(cls, n): pass\nclass C(metaclass=M):\n    def m(self): pass\n",
@@ -1294,6 +1350,20 @@ fn test_python_call_on_a_module_level_class_binds_the_mro_owner() {
         (
             "a mangled class",
             "class __C:\n    def m(self): pass\nclass A:\n    def run(self):\n        __C.m(self)\n",
+            "m",
+            None,
+        ),
+        (
+            "a mangled name spelled out",
+            "class B:\n    def _C__m(self): pass\nclass C(B):\n    def __m(self): pass\nclass A:\n    def run(self):\n        C._C__m(self)\n",
+            "_C__m",
+            Some("C"),
+        ),
+        // A module-level read before the class statement sees the star
+        // import's `C`, not this class.
+        (
+            "a call before the class statement",
+            "from ext import *\nC.m(None)\nclass C:\n    def m(self): pass\n",
             "m",
             None,
         ),

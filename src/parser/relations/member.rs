@@ -1188,9 +1188,9 @@ fn is_node(field: Option<tree_sitter::Node>, node: tree_sitter::Node) -> bool {
 /// the file and never a subclass's override. When that class is decided inside
 /// this file ([`py_class_lookup`]), the call carries the `super()` qualifier
 /// naming it, which binds that class's own method (`recv_type_targets` without
-/// dispatch, the caller's file's among same-named classes; a function nested in
-/// one of its methods under the same name is indexed as `X.m` too and bound
-/// with it), and `"own":1`: no other file can move that answer. Anything the
+/// dispatch, the caller's file's among same-named classes; a class that also
+/// nests a `def m` in another method, which the index names `X.m` too, is left
+/// undecided), and `"own":1`: no other file can move that answer. Anything the
 /// file cannot decide keeps the old untyped member call. Before, such a call
 /// bound every same-named method of the file (`Widget.__init__(self)` → every
 /// `__init__`).
@@ -1297,16 +1297,6 @@ struct PyClasses {
 /// longer one, or with as many bases, stays undecided.
 const PY_MRO_CAP: usize = 64;
 
-/// A metaclass a class has or inherits from a class of the file.
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum PyMeta {
-    /// One of the file's classes, by id.
-    File(usize),
-    /// Anything else, by its text (an import such as `ABCMeta`): taken to
-    /// define no data descriptor and no `__getattribute__`.
-    Outside(String),
-}
-
 /// The C3 linearizations of a file's classes ([`py_linearize`]).
 struct PyLinear {
     /// The classes in source order: a class's index is its id in an MRO. Id
@@ -1316,14 +1306,17 @@ struct PyLinear {
     /// Per class: its MRO as ids, itself first and `object` last — None where
     /// Python refuses the class (an inconsistent order, a duplicate base) or
     /// where it is past [`PY_MRO_CAP`] — whether a base in its hierarchy is one
-    /// the rule cannot see (`blind`), and the metaclasses it has or inherits.
+    /// the rule cannot see, or a metaclass is one of the file's or two differ
+    /// (`blind`), and the one metaclass from outside the file it has or
+    /// inherits, as a leaf id (`ABCMeta`): taken to answer nothing before the
+    /// class's own body does.
     of: HashMap<String, PyLinearClass>,
 }
 
 struct PyLinearClass {
     mro: Option<Vec<usize>>,
     blind: bool,
-    metas: HashSet<PyMeta>,
+    meta: Option<usize>,
 }
 
 /// The class whose `m` a call `C.m()` runs, decided inside this file: the
@@ -1331,39 +1324,30 @@ struct PyLinearClass {
 /// with one `def` and binds it no other way. None — keep the old resolution —
 /// when `C` is not a class of [`py_class_names`], when Python refuses `C` or
 /// its MRO is past [`PY_MRO_CAP`], when a base in its hierarchy is one the rule
-/// cannot see ([`PyLinear`]) or carries another class keyword, when it has
-/// two metaclasses or one of the file's that binds `m` or `__getattribute__`,
-/// when the MRO reaches `object` or a base the file does not define before
-/// the `def`, or a class binding `m` some other way, assigning or deleting it
-/// from outside, writing its namespace opaquely, or nesting a `def m`.
+/// cannot see ([`PyLinear`]), carries another class keyword or a metaclass of
+/// the file, or inherits two metaclasses, when a class of its MRO has
+/// `__bases__` or `__class__` assigned, when the MRO reaches `object` or a
+/// base the file does not define before the `def`, or a class binding `m` some
+/// other way, assigning or deleting it from outside, writing its namespace
+/// opaquely, or nesting a `def m`.
 fn py_class_lookup(state: &PyClasses, class: &str, method: &str) -> Option<String> {
     let linear = state.linear.as_ref()?;
     let lin = linear.of.get(class)?;
-    if lin.blind || lin.metas.len() > 1 {
+    if lin.blind {
         return None;
     }
     let mro = lin.mro.as_ref()?;
-    let binds = |name: &str, m: &str| {
-        let k = &state.classes[name];
-        k.opaque
-            || k.methods.contains(m)
-            || k.other.contains(m)
-            || state.patched.contains(&(name.to_string(), m.to_string()))
+    let patched = |name: &str, attr: &str| {
+        state
+            .patched
+            .contains(&(name.to_string(), attr.to_string()))
     };
-    for meta in &lin.metas {
-        if let PyMeta::File(j) = meta {
-            let meta_lin = &linear.of[&linear.names[*j]];
-            if meta_lin.blind || !meta_lin.metas.is_empty() {
-                return None;
-            }
-            for &x in meta_lin.mro.as_ref()? {
-                if let Some(name) = linear.names.get(x) {
-                    if binds(name, method) || binds(name, "__getattribute__") {
-                        return None;
-                    }
-                }
-            }
-        }
+    if mro
+        .iter()
+        .filter_map(|&x| linear.names.get(x))
+        .any(|name| patched(name, "__bases__") || patched(name, "__class__"))
+    {
+        return None;
     }
     for &x in mro {
         let name = linear.names.get(x)?; // `object`, or a base the file does not define
@@ -1433,27 +1417,26 @@ fn py_linearize(classes: &HashMap<String, PyClass>, rebound: &HashSet<String>) -
                 r
             })
             .collect();
-        let mut metas: HashSet<PyMeta> = HashSet::new();
+        // A metaclass of the file can drop or replace `m` (`__new__`,
+        // `__prepare__`, `__init__`): blind. One from outside is a leaf id,
+        // kept once per class (two different ones: blind).
+        let mut meta: Option<usize> = None;
         match &c.metaclass {
             None => {}
-            Some(PyBase::Name(n)) if id.contains_key(n.as_str()) => {
-                metas.insert(PyMeta::File(id[n.as_str()]));
-            }
+            Some(PyBase::Name(n)) if id.contains_key(n.as_str()) => blind = true,
             Some(m) => match resolve(m) {
-                Some(_) => {
-                    let text = match m {
-                        PyBase::Name(n) | PyBase::Rooted(_, n) => n.clone(),
-                        PyBase::Other => String::new(),
-                    };
-                    metas.insert(PyMeta::Outside(text));
-                }
+                Some(leaf) => meta = Some(leaf),
                 None => blind = true,
             },
         }
         for &b in &bases {
             if b < i {
                 blind |= out[b].blind;
-                metas.extend(out[b].metas.iter().cloned());
+                match (meta, out[b].meta) {
+                    (None, inherited) => meta = inherited,
+                    (Some(x), Some(y)) if x != y => blind = true,
+                    _ => {}
+                }
             }
         }
         let mut seen = HashSet::new();
@@ -1483,7 +1466,7 @@ fn py_linearize(classes: &HashMap<String, PyClass>, rebound: &HashSet<String>) -
                 None
             }
         };
-        out.push(PyLinearClass { mro, blind, metas });
+        out.push(PyLinearClass { mro, blind, meta });
         id.insert(name.as_str(), i);
     }
     let of = names.iter().cloned().zip(out).collect();
@@ -1620,13 +1603,24 @@ fn py_class_names(root: tree_sitter::Node, source: &str) -> PyClasses {
     // the nearest ancestor at or above `i` that is no container.
     let mut ancestors: Vec<tree_sitter::Node> = Vec::new();
     let mut tops: Vec<usize> = Vec::new();
+    // `fns[i]`: how many of `ancestors[..=i]` are a def or a lambda.
+    let mut fns: Vec<usize> = Vec::new();
     let mut cursor = root.walk();
     loop {
         let node = cursor.node();
         match node.kind() {
             "identifier" => {
                 let name = node_text(&node, source);
-                let candidate = defs.contains_key(name) && !rejected.contains(name);
+                let mut candidate = defs.contains_key(name) && !rejected.contains(name);
+                // Run while the module loads, before the class statement: the
+                // name is still a star import's (or unbound).
+                if candidate
+                    && fns.last().copied().unwrap_or(0) == 0
+                    && defs[name].first().is_some_and(|&at| node.start_byte() < at)
+                {
+                    rejected.insert(name.to_string());
+                    candidate = false;
+                }
                 if candidate || roots.contains(name) {
                     let read = py_class_name_is_read(node, &ancestors, &tops, &module_defs);
                     if !read {
@@ -1662,9 +1656,10 @@ fn py_class_names(root: tree_sitter::Node, source: &str) -> PyClasses {
                 if let (Some(class), Some(def), false) =
                     (class, node.child_by_field_name("name"), direct)
                 {
+                    let class = node_text(&class, source);
                     state.nested.insert((
-                        node_text(&class, source).to_string(),
-                        node_text(&def, source).to_string(),
+                        class.to_string(),
+                        py_mangle(class, node_text(&def, source).to_string()),
                     ));
                 }
             }
@@ -1677,6 +1672,8 @@ fn py_class_names(root: tree_sitter::Node, source: &str) -> PyClasses {
             } else {
                 i
             });
+            let scope = matches!(node.kind(), "function_definition" | "lambda") as usize;
+            fns.push(fns.last().copied().unwrap_or(0) + scope);
             ancestors.push(node);
             continue;
         }
@@ -1700,6 +1697,7 @@ fn py_class_names(root: tree_sitter::Node, source: &str) -> PyClasses {
             }
             ancestors.pop();
             tops.pop();
+            fns.pop();
         }
     }
 }
@@ -1822,6 +1820,10 @@ fn py_class_shape(class: tree_sitter::Node, source: &str) -> PyClass {
             }
         }
     }
+    // `class A[T]` gets `typing.Generic` as its last base.
+    if class.child_by_field_name("type_parameters").is_some() {
+        shape.bases.push(PyBase::Name("\0Generic".to_string()));
+    }
     let Some(body) = class.child_by_field_name("body") else {
         return shape;
     };
@@ -1852,7 +1854,7 @@ fn py_class_shape(class: tree_sitter::Node, source: &str) -> PyClass {
             }
         }
     }
-    shape.opaque |= ["locals", "vars", "exec", "eval"]
+    shape.opaque |= PY_NAMESPACE_WRITERS
         .iter()
         .any(|n| shape.other.contains(*n));
     for (name, n) in defs {
@@ -1862,7 +1864,27 @@ fn py_class_shape(class: tree_sitter::Node, source: &str) -> PyClass {
             shape.other.insert(name);
         }
     }
+    // Python stores a `__x` the body binds as `_C__x`.
+    if let Some(name) = class.child_by_field_name("name") {
+        let class = node_text(&name, source);
+        shape.methods = shape.methods.drain().map(|n| py_mangle(class, n)).collect();
+        shape.other = shape.other.drain().map(|n| py_mangle(class, n)).collect();
+    }
     shape
+}
+
+/// Builtins through which a class body can bind names its text does not show.
+const PY_NAMESPACE_WRITERS: [&str; 4] = ["locals", "vars", "exec", "eval"];
+
+/// `name` as class `class`'s body stores it: a `__x` (not `__x__`) becomes
+/// `_C__x`, the class name's leading underscores dropped.
+fn py_mangle(class: &str, name: String) -> String {
+    let stem = class.trim_start_matches('_');
+    if name.starts_with("__") && !name.ends_with("__") && !stem.is_empty() {
+        format!("_{stem}{name}")
+    } else {
+        name
+    }
 }
 
 /// For a class-body statement `__slots__ = …`: Some(the names it lists) when
@@ -1952,10 +1974,12 @@ fn py_names_in(stmt: tree_sitter::Node, source: &str, out: &mut HashSet<String>)
     }
 }
 
-/// The names a walrus binds in the header of a `def` or a class (`stmt`, or one
-/// under a decorator): its decorators, defaults, annotations and bases run in
-/// the enclosing scope, so `def z(self, a=(m := f))` in a class body binds `m`
-/// in the class. Its body is a scope of its own and is not entered.
+/// The names a walrus binds in the header of a `def`, a lambda or a class
+/// (`stmt`, or one under a decorator), and the namespace writers it names
+/// (`locals`, `vars`, `exec`, `eval`): its decorators, defaults, annotations
+/// and bases run in the enclosing scope, so `def z(self, a=(m := f))` in a
+/// class body binds `m` in the class. Its body is a scope of its own and is
+/// not entered.
 fn py_header_walrus(stmt: tree_sitter::Node, source: &str, out: &mut HashSet<String>) {
     let def = match stmt.kind() {
         "decorated_definition" => stmt.child_by_field_name("definition"),
@@ -1970,6 +1994,12 @@ fn py_header_walrus(stmt: tree_sitter::Node, source: &str, out: &mut HashSet<Str
         if node.kind() == "named_expression" {
             if let Some(name) = node.child_by_field_name("name") {
                 out.insert(node_text(&name, source).to_string());
+            }
+        }
+        if node.kind() == "identifier" {
+            let name = node_text(&node, source);
+            if PY_NAMESPACE_WRITERS.contains(&name) {
+                out.insert(name.to_string());
             }
         }
         if Some(node.id()) != body && cursor.goto_first_child() {
