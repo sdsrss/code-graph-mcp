@@ -192,7 +192,13 @@ input names neither.
 Replaying 1,348 source reads from two weeks of sessions (29 sessions, 99
 transcripts of which 70 are subagents') through both rules: 19 overviews before, 7 of them to a context
 that had not read five files of the directory itself (a parent and its
-subagents adding up); 14 after, each to the context that did.
+subagents adding up); 14 after, each to the context that did. The replay is a
+model, not a record: of the 20 overviews the hook actually sent in those
+projects, it reproduces 3 in the same transcript and directory. It counts only
+`Read` and `sed -n N,Mp FILE` reads resolved against the session's directory
+(a command that starts with `cd elsewhere;` or reads through `cat FILE |`
+escapes it), and finds each read's project from the indexes on disk today (the
+worktrees 8 of the 20 were sent in are gone).
 
 ### fix: the startup repair runs without waiting for a tool call
 
