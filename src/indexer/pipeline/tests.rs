@@ -15148,6 +15148,28 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
             "#[cfg(unix)]\nfn h() {}\n#[cfg(windows)]\nfn h() {}\nfn c() {\n    h();\n}\n",
             &["c@5 -> h@2", "c@5 -> h@4"],
         ),
+        // A JS/TS bare call never reaches a class or object member, so once it
+        // sees a lexical definition a same-named method is no candidate either.
+        (
+            "js: class method beside a function",
+            "a.js",
+            "function run() {}\nclass A {\n  run() {}\n  go() { run(); }\n}\n",
+            &["go@4 -> run@1"],
+        ),
+        (
+            "js: object-literal methods beside a describe-local arrow",
+            "t.test.js",
+            "const s = () => new R({\n  read() {},\n});\ndescribe('a', () => {\n  const read = (r) => r;\n  \
+             function w() { read(1); }\n  const t = new R({ read() {} });\n});\n",
+            &["w@6 -> read@5"],
+        ),
+        (
+            "ts: static method beside a function",
+            "a.ts",
+            "function now(): number { return 1; }\nclass D {\n  static now(): number { return 2; }\n  \
+             go(): number { return now(); }\n}\n",
+            &["go@4 -> now@1"],
+        ),
     ];
     let mut failures = Vec::new();
     for (label, path, code, want) in table {
@@ -15160,17 +15182,18 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// D#714 A3, rows the rule must leave as they were before it: a method or an
-/// object member of the same name as a lexical definition is no lexical
-/// binding, and the rule only drops lexical definitions.
+/// D#714 A3, rows the rule must leave as they were before it: outside JS/TS a
+/// method of the same name as a lexical definition stays a candidate (a Python
+/// class body's bare call does reach an earlier def of that body), and a call
+/// that sees no lexical definition keeps every candidate, a member too.
 #[test]
 fn a_same_name_member_is_left_to_the_other_rules() {
     let table: &[(&str, &str, &str, &[&str])] = &[
         (
-            "js: class method beside a function",
+            "js: class method, no lexical definition visible",
             "a.js",
-            "function run() {}\nclass A {\n  run() {}\n  go() { run(); }\n}\n",
-            &["go@4 -> run@1", "go@4 -> run@3"],
+            "class A {\n  run() {}\n  go() { run(); }\n}\n",
+            &["go@3 -> run@2"],
         ),
         (
             "js: object member beside a function",

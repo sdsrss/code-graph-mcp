@@ -317,6 +317,12 @@ impl FileParsed {
             })
         });
     }
+
+    /// The node type of one of this file's nodes, None for another file's.
+    fn node_type_of(&self, id: i64) -> Option<&str> {
+        let i = self.node_ids.iter().position(|n| *n == id)?;
+        self.node_types.get(i).map(String::as_str)
+    }
 }
 
 /// The counters Phase 1a bumps from rayon worker threads, so they are atomics
@@ -2579,8 +2585,11 @@ fn resolve_batch_relations(
 /// definitions whose scope sees the call, the innermost stay: `app()` in one
 /// `describe` callback binds that callback's `const app`, not the next one's,
 /// and a local `const ok` shadows the top-level `function ok`. A candidate
-/// that is no lexical binding (a method, an object member) stays, and so does
-/// every candidate when the call sees none: the rule only takes from the set.
+/// that is no lexical binding stays, except a JS/TS method once the call sees
+/// a lexical definition: a bare call there never reaches a class or object
+/// member, while a Python class body's bare call does reach an earlier def of
+/// that body. Every candidate stays when the call sees none: the rule only
+/// takes from the set, and the definition it sees is always kept.
 fn visible_same_file_targets(targets: Vec<i64>, rel: &ParsedRelation, pf: &FileParsed) -> Vec<i64> {
     let Some(at) = rel.call_at else {
         return targets;
@@ -2594,12 +2603,12 @@ fn visible_same_file_targets(targets: Vec<i64>, rel: &ParsedRelation, pf: &FileP
     else {
         return targets;
     };
+    let members_unreachable = matches!(pf.language.as_str(), "javascript" | "typescript" | "tsx");
     targets
         .into_iter()
-        .filter(|id| {
-            pf.node_scopes
-                .get(id)
-                .is_none_or(|scope| scope.sees(at) && scope.width() == innermost)
+        .filter(|id| match pf.node_scopes.get(id) {
+            Some(scope) => scope.sees(at) && scope.width() == innermost,
+            None => !(members_unreachable && pf.node_type_of(*id) == Some("method")),
         })
         .collect()
 }
