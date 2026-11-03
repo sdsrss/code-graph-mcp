@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.185.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 132
 because JavaScript and TypeScript call and import edges are added or moved,
@@ -126,7 +126,8 @@ function, a `function () {}` callback, a closure), must contain the call, and
 of the definitions it sees, the innermost. This applies to JavaScript and
 TypeScript `function` declarations and `const f = () => …`, to a Python `def`
 not in a class, and to a Rust `fn` not in an `impl` or `trait`. Methods and
-object members keep being candidates as before, and a call that sees none of
+object members keep being candidates as before (in JavaScript and TypeScript,
+until the call sees a definition: next section), and a call that sees none of
 the definitions keeps every one of them. No edge is added.
 
 SCIP oracle, before and after, on the same copy of each project; precision
@@ -149,6 +150,23 @@ did not move; 43 call edges are gone, each from a function to a helper of the
 same name that another function defines for itself (`fn walk` inside several
 test functions of `tests/hardening.rs`, `const norm` in two functions of
 `pre-grep-guide.js`).
+
+### fix: a JavaScript call that sees its definition binds no method
+
+In JavaScript and TypeScript a bare call never reaches a class or object
+method, yet a test file holding `const read = (rel) => …` and four `new
+Readable({ read() {} })` streams had each `read(rel)` recorded as calling the
+four `read() {}` methods too. When a bare call sees a definition of its name
+by the rule of the previous section, a same-named method of its file is no
+longer a candidate. A call that sees no definition keeps every candidate as
+before. Python and Rust keep theirs: a Python class body's bare call does
+reach an earlier `def` of that body.
+
+SCIP oracle, the build just before this change (it includes every section
+above) and this one, on the same copy of each project: on the JS plugin with many `describe` files the 4 edges above
+are gone, all scored wrong (precision 8,955/8,987 = 99.64% → 8,955/8,983 =
+99.69%, recall unchanged). On the other ten projects of the tables above and
+on this repository, no edge changed.
 
 ### change: `path.exists()` on an untyped receiver is `ambiguous`
 
@@ -250,6 +268,19 @@ watcher still starts at the first tool call.
   `.code-graph/recommendations.jsonl` as `"action":"observe"` with
   `"reason":"no-ast-context"`, as the skip of a grep that already showed the
   pattern is.
+
+### Not covered
+
+- A JavaScript call through a local that destructures a method, `const { read }
+  = store; read()` in a file that also defines `function read`, now binds only
+  that function, which the local shadows; before, it bound the method
+  `store.read` too. On the corpora above no other edge changed.
+- In Python a bare call inside a method still binds a same-named method of its
+  file beside the module function it sees (`def h()` and `class C: def h(self)`,
+  with `h()` in another method of `C`).
+- The grep hook reads hit-shaped lines anywhere in the command's output: in
+  `ls src/a.js && grep -rn "Sym" src/`, a grep that printed nothing, the path
+  `ls` printed counts, and an answer with only file-level hits is skipped.
 
 ## 0.184.0
 
