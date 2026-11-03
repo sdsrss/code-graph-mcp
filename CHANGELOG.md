@@ -2,18 +2,25 @@
 
 ## 0.185.0
 
-**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 132
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 134
 because JavaScript and TypeScript call and import edges are added or moved,
 same-file call edges are dropped and some Python call edges are labelled
 `ambiguous` (below). The MCP server
 rebuilds the index when it starts; from the command line,
-`code-graph-mcp reindex` does. Two plugin hook outputs no longer appear: the
-prompt hook's `[code-graph:hint]` line, and the grep hook's "AST-aware view"
-when it places no hit inside a function or class (last section); there is
-nothing to do about either. To pin the binary back, which also brings both
-back: `npm i -g @sdsrs/code-graph@0.184.0`, then delete
+`code-graph-mcp reindex` does. To pin the binary back:
+`npm i -g @sdsrs/code-graph@0.184.0`, then delete
 `~/.cache/code-graph/bin/code-graph-mcp` and set
 `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+**Two plugin hook outputs no longer appear:** the prompt hook's
+`[code-graph:hint]` line, and the grep hook's "AST-aware view" when it places
+no hit inside a function or class (last section). There is nothing to do
+about either. Pinning the binary does not bring them back: both come from the
+plugin's own scripts. To run the 0.184.0 plugin: `claude plugin marketplace
+remove code-graph-mcp`, then `claude plugin marketplace add
+sdsrss/code-graph-mcp#v0.184.0` and `claude plugin install
+code-graph-mcp@code-graph-mcp` (adding the tag over the existing marketplace
+is refused), and keep `CODE_GRAPH_NO_AUTO_UPDATE=1` set as for the binary.
 
 ### fix: a call of an imported `get`, `read` or `join` has an edge
 
@@ -28,7 +35,8 @@ renamed import (`import { get as fetchIt }`) already did. That lookup now also
 follows the file's re-exports: `export { read } from './crud.js'`, and the one
 `export * from` source that has the name (JavaScript exports a name two
 `export *` sources share from neither), up to 8 files deep. This applies to
-renamed imports through such a file too, which never bound before.
+renamed imports through such a file too, which never bound before. A renamed
+re-export (`export { read as load } from`) is not followed.
 
 Still dropped: such a call through a default import, a `require`, a package
 (`import { join } from 'path'`), or a TypeScript `import type`.
@@ -92,11 +100,18 @@ functions elsewhere in the project: in one project, test files' helpers. The
 calls of `init()` through that import followed it; the SCIP oracle scored 42
 calls into a test helper as wrong, and the 42 calls into `crud.js` were
 missing.
-Such an import now binds what the file's re-exports lead to: `export { … }
+Such an import now binds what the file's re-exports lead to: `export { name }
 from`, the one `export * from` source that has the name, and re-exports of
-re-exports, up to 8 files. D#712 above follows the same re-exports for the
-calls of a noise-named or renamed import; this applies to every named import. An import that no
-re-export answers binds as before.
+re-exports, up to 8 files deep. D#712 above follows the same re-exports for
+the calls of a noise-named or renamed import; this applies to every named
+import. An import that no re-export answers binds as before. An incremental
+run that changes what a file re-exports, or what one of its re-exports leads
+to, now also re-extracts the files that import a changed name from it (any
+name, when its `export *` sources changed), round after round down a chain. On a
+copy of hono, adding and removing an `export *` line in
+`src/helper/ssg/index.ts` took 51–62 ms per incremental run before this and
+92–98 ms after (6 runs each, `--no-embed`); adding and removing an import in
+`src/hono-base.ts`, 74–81 ms both.
 
 SCIP oracle, before and after, on the same copy of each project:
 
@@ -106,8 +121,11 @@ SCIP oracle, before and after, on the same copy of each project:
 | hono 4.6.14 | 1,145 | 81.1% → 81.1% | 97.3% → 97.4% |
 | express 4.21.2, and four other JS/TS projects | 69 – 9,000 | unchanged | unchanged |
 
-hono loses 134 import and 22 call edges, gsd-lite 100 and 42; every one was a
-same-named target beside one that stays (`import { serveStatic } from
+hono loses 145 import and 22 call edges and gains 3 import edges, each now
+bound through a barrel to the definition (`toSSG` through
+`helper/ssg/index.ts`); 22 of its `references` edges go from `inferred` to
+`ambiguous`. gsd-lite loses 100 import and 42 call edges. Every edge lost was
+a same-named target beside one that stays (`import { serveStatic } from
 '../../src/adapter/bun'` had bound five `serveStatic` functions and now binds
 `bun/serve-static.ts`'s), and on neither is an import or a call left
 without a target.
@@ -123,9 +141,14 @@ ok` too, and a function that does not define `ok` as calling the local one.
 Such a call now binds only the definitions it can see by the language's
 scoping: the innermost function around a definition, named or not (an arrow
 function, a `function () {}` callback, a closure), must contain the call, and
-of the definitions it sees, the innermost. This applies to JavaScript and
-TypeScript `function` declarations and `const f = () => …`, to a Python `def`
-not in a class, and to a Rust `fn` not in an `impl` or `trait`. Methods and
+of the definitions it sees, the innermost. A JavaScript or TypeScript
+`const`/`let` in a nested block (an `if`, a loop body or head, a `catch`) and a Rust
+`fn` item in a nested block are seen only inside that block; a JavaScript
+`function` declaration in a nested block, which sloppy code also binds in the
+enclosing function, narrows nothing, and a `var` is its function's. This
+applies to JavaScript and TypeScript `function` declarations and `const f = ()
+=> …`, to a Python `def` not in a class, and to a Rust `fn` not in an `impl`
+or `trait`. Methods and
 object members keep being candidates as before (in JavaScript and TypeScript,
 until the call sees a definition: next section), and a call that sees none of
 the definitions keeps every one of them. No edge is added.
@@ -149,7 +172,8 @@ On this repository (Rust, with JS and Python tooling) the oracle's judged edges
 did not move; 43 call edges are gone, each from a function to a helper of the
 same name that another function defines for itself (`fn walk` inside several
 test functions of `tests/hardening.rs`, `const norm` in two functions of
-`pre-grep-guide.js`).
+`pre-grep-guide.js`). The nested-block and loop-head rules came after these numbers;
+on every project above and on this repository they move no edge.
 
 ### fix: a JavaScript call that sees its definition binds no method
 
@@ -181,9 +205,12 @@ now `ambiguous`: below the default confidence floor, shown with
 `--min-confidence ambiguous`. Names of the mapping, sequence and file
 protocols (`items`, `get`, `update`, `append`, `sort`, `read`, `seek`), which
 project classes implement, keep `inferred`, and so do `match`, `start` and
-`end`. A call on a receiver of known class keeps its label, and so does a
-same-file call the confidence pass leaves `extracted` (one through a
-parameter or local); other languages are unchanged.
+`end`. A call whose receiver the index types (an annotated parameter or
+local, `p: Path`) keeps its label, and so does a same-file call the
+confidence pass leaves `extracted` (one through a parameter or local); other
+languages are unchanged. A call on a constructor call's result in another
+file (`Store().exists()`) is not typed that way and is relabelled like an
+untyped receiver.
 
 SCIP oracle, before and after, on the same copy of each project:
 
@@ -238,10 +265,12 @@ handshake:
 |---|---|---|---|
 | 3,488 vectors, 0.184.0 | 78,848 → 81,920 | 148 → 153 MB | did not run |
 | same, this build | 78,848 → 4,096 | 148 → 32 MB | 0.4 s |
-| 19,912 vectors, current version, this build | 245,760 → 19,456 | 588 → 246 MB | 1.5 s |
+| a second index, current version, this build | 245,760 → 19,456 | 588 → 246 MB | 1.5 s |
 
-An existing index is compacted the next time its MCP server starts. The file
-watcher still starts at the first tool call.
+An existing index is compacted the next time its MCP server starts, unless
+another process writes to it during the repair (a CLI `incremental-index`):
+the repair then logs `database is locked` and is not tried again until the
+server next starts. The file watcher still starts at the first tool call.
 
 ### change: two hook outputs that went unused are gone
 
@@ -259,11 +288,11 @@ watcher still starts at the first tool call.
   sits in. In the same period and projects, 15 of its 21 grep answers placed
   no hit below the file: 10 were the file list of a `grep -l`, 5 marked every
   hit `→ module <file>`, and none followed an empty output.
-  Such an answer is now skipped when the command's output shows a grep hit (a
-  line starting `path:` or `NN:`, or a bare path as `-l` prints it). After a
-  grep that printed no hit, or when the hook cannot read the output, it is
-  added as before, and so is an answer with one hit inside a function or
-  class. Replayed over those 21 answers, 14 are skipped; the 6 with a
+  Such an answer is now skipped when a line of the command's output has a
+  grep hit's shape (it starts `path:` or `NN:`, or is a bare path as `-l`
+  prints it). When no line has that shape, or the hook cannot read the
+  output, it is added as before, and so is an answer with one hit inside a
+  function or class. Replayed over those 21 answers, 14 are skipped; the 6 with a
   function or class stay, and so does 1 whose output had no such line. A skip is recorded in
   `.code-graph/recommendations.jsonl` as `"action":"observe"` with
   `"reason":"no-ast-context"`, as the skip of a grep that already showed the
@@ -278,9 +307,19 @@ watcher still starts at the first tool call.
 - In Python a bare call inside a method still binds a same-named method of its
   file beside the module function it sees (`def h()` and `class C: def h(self)`,
   with `h()` in another method of `C`).
-- The grep hook reads hit-shaped lines anywhere in the command's output: in
-  `ls src/a.js && grep -rn "Sym" src/`, a grep that printed nothing, the path
-  `ls` printed counts, and an answer with only file-level hits is skipped.
+- The grep hook reads hit-shaped lines anywhere in the command's output, so
+  a line another command printed counts as a hit: in `ls src/a.js && grep -rn
+  "Sym" src/`, where the grep printed nothing, the path `ls` printed does,
+  and so can an `echo "Searching..."`, a version such as `v26.8.1`, or a
+  `grep: lib/: No such file or directory` merged into stdout. An answer with
+  only file-level hits is then skipped.
+- `return 1 + await post<number>('/w')`: a typed call under `await` that is
+  itself an operand of a binary expression still has no `calls` edge
+  (`flag || await post<T>()` and a ternary do).
+- In Python a `global` declaration is not modelled: with a module-level `def
+  helper()` and a `setup()` that declares `global helper` and defines its own
+  `def helper()`, a `helper()` call in another function binds only the
+  module-level one; 0.184.0 bound both.
 
 ## 0.184.0
 
