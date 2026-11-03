@@ -15,3 +15,11 @@ Spec: `tasks/specs/d700-py-module-call-own-file.md`.
 Corpora, oracle recipe and scoring: `tasks/d370g-kit/README.md` and the
 stdlib-oracle memory. The `score.sh` used here is the d370g one with
 `W=/var/tmp/d700`, an absolute binary path, and Python/JS scoring only.
+
+- `parity/q01`–`q05`: incremental-vs-fresh scenarios for this rule, run with
+  `tasks/d370g-kit/parity/parity.py` (point its `B`/`work`/`home` roots at a
+  new directory first). `q03` shows a pre-existing imports gap (D#702),
+  identical on 0.183.0.
+- `perf/timeit.py ROUNDS DIR...`: interleaved full index of each DIR with
+  `bin/base-src` and `bin/head-src` (paths inside), median wall/CPU and max RSS
+  per child via `os.wait4`.
