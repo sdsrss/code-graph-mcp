@@ -1192,10 +1192,13 @@ fn py_module_names(
 ///   `a.mod.go()` in `a/mod.py`; `from c import mod` and `mod.go()` in
 ///   `c/mod.py`), or one of the imports is relative. Without `rel_path`, or
 ///   for a file no `.py`/`.pyi` name makes a module, this leg is skipped; an
-///   import below `collect`'s depth cap takes every name;
-/// - the file writes, on any object, an attribute named like a link of an
-///   attribute chain rooted at the name: the module may be patched through
-///   another name (`alias = m; alias.f = g`, `def install(x): x.f = g`).
+///   import below `collect`'s depth cap takes every name.
+///
+/// A module patched any other way — through another name (`alias = m;
+/// alias.f = g`), a segment of an import's path, a `__getattr__` hook,
+/// `setattr`, another file — is not traced (review round 3 of D#700: the
+/// cases are open-ended, and tracing one slice kept only wrong edges on
+/// seven corpora).
 ///
 /// One cursor walk, no recursion: a deep expression cannot overflow it.
 fn py_local_imports(
@@ -1260,10 +1263,6 @@ fn py_local_imports(
             }
         }
     }
-    // Attribute names the file writes on any object, and per name the links
-    // of the chains rooted at it (F1 of review round 2).
-    let mut written: HashSet<&str> = HashSet::new();
-    let mut links: HashMap<&str, HashSet<&str>> = HashMap::new();
     let no_classes: HashSet<usize> = HashSet::new();
     // `tops[i]`: the index of the nearest ancestor at or above `i` that is no
     // container, as `py_class_name_is_read` expects.
@@ -1272,31 +1271,20 @@ fn py_local_imports(
     let mut cursor = root.walk();
     loop {
         let node = cursor.node();
-        if node.kind() == "attribute"
-            && !py_import_name_is_read(node, &ancestors, &tops, &no_classes)
-        {
-            if let Some(attr) = node.child_by_field_name("attribute") {
-                written.insert(node_text(&attr, source));
-            }
-        }
         if node.kind() == "identifier" {
             let name = node_text(&node, source);
-            if bound.contains_key(name) && !local.contains(name) && !py_in_import(&ancestors) {
-                if !py_import_name_is_read(node, &ancestors, &tops, &no_classes)
+            if bound.contains_key(name)
+                && !local.contains(name)
+                && !py_in_import(&ancestors)
+                && (!py_import_name_is_read(node, &ancestors, &tops, &no_classes)
                     || py_attribute_chain_written(node, &ancestors, &tops, &no_classes)
-                {
-                    local.insert(name.to_string());
-                } else {
-                    let chain = py_chain_segments(node, &ancestors, source, usize::MAX);
-                    if rests
-                        .get(name)
-                        .is_some_and(|rests| rests.iter().any(|r| chain.starts_with(r)))
-                    {
-                        local.insert(name.to_string());
-                    } else {
-                        links.entry(name).or_default().extend(chain);
-                    }
-                }
+                    || rests.get(name).is_some_and(|rests| {
+                        let longest = rests.iter().map(|r| r.len()).max().unwrap_or(0);
+                        let chain = py_chain_segments(node, &ancestors, source, longest);
+                        rests.iter().any(|r| chain.starts_with(r))
+                    }))
+            {
+                local.insert(name.to_string());
             }
         }
         if cursor.goto_first_child() {
@@ -1311,11 +1299,6 @@ fn py_local_imports(
         }
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
-                for (name, links) in links {
-                    if links.iter().any(|link| written.contains(link)) {
-                        local.insert(name.to_string());
-                    }
-                }
                 return local;
             }
             ancestors.pop();
