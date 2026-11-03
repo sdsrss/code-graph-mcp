@@ -23,3 +23,8 @@ stdlib-oracle memory. The `score.sh` used here is the d370g one with
 - `perf/timeit.py ROUNDS BASE_BIN HEAD_BIN DIR...`: interleaved full index of
   each DIR with the two binaries, median wall/CPU and max RSS per child via
   `os.wait4`.
+
+Seeds behind the numbers (the generator gained dimensions as the review went
+on, so a seed reproduces only with the `gen.py` of its commit): seeds 1 and 2
+(3,000 each) with `gen.py` at `3fc7cdee`; seed 3 (3,000, in-package cases) at
+`2e427cd3`; seed 4 (2,000) and seed 5 (600, `alias`) at `d3add736`.

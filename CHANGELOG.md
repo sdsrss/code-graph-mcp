@@ -43,34 +43,40 @@ same-named definition in the caller's file resolves as before. Everything else
 resolves as before too: a name the file also binds some other way (an
 assignment, a parameter, `def`, `class`, a loop or `with … as` target,
 `global`, `del`, a match capture), a file that writes an attribute rooted at
-the name (`ext.go = go`, `del ext.go`, `ext.sub.go += 1`), a file that writes,
-on any object, an attribute named like a link of the call (`alias.go = go`
-after `alias = ext`, `mod.go = go` in a function handed `ext`), and a direct
+the name (`ext.go = go`, `del ext.go`, `ext.sub.go += 1`), and a direct
 `ext.go()` call on a name that holds one plain-imported module everywhere in
 the file (since 0.176.0 it binds what `from ext import go` would).
 
-Measured against 0.183.0: the Python standard library loses 490 call edges
-(470 caller–callee pairs), nltk 3.9.2 167 (155) and flask 3, all same-file;
-hono, leveldb, cobra and gin keep every edge, and no edge is added or
-relabelled on any of the seven. On the standard library the
+Measured against 0.183.0: the Python standard library loses 517 call edges
+(497 caller–callee pairs), nltk 3.9.2 170 (158) and flask 7, all same-file;
+hono, leveldb, cobra and gin keep every edge. On none of the seven is an edge
+added or its confidence label changed; 303 standard-library edges that stay
+carry the new `"loc":1` metadata key. On the standard library the
 SCIP oracle's default floor (`extracted` + `inferred`) goes from 10,996 of
-14,329 judged edges correct (76.7%) to 10,971 of 13,902 (78.9%): 2,931 wrong
+14,329 judged edges correct (76.7%) to 10,971 of 13,879 (79.0%): 2,908 wrong
 edges instead of 3,333. The 25 correct pairs it loses, and the 5 gold calls
 its recall loses, are all explicit base-class calls (`logging.Handler.close(self)`,
 `Widget.destroy(self)`) that the oracle credits to a subclass override in the
 caller's file; Python runs the base class's method there. 54 standard-library
 definitions whose only recorded callers were such calls now show no caller.
-A full standard-library index took 3.0–3.7% more CPU time (two interleaved
-batches of five runs).
+A full standard-library index took 1.3–2.7% more CPU time than 0.183.0 built
+from source (two interleaved batches of five runs), and 0.2% less than the
+released 0.183.0 binary (one batch).
 
 ### Not covered
 
-- A name rebound or patched at run time: `setattr(ext, "go", go)`,
+- A module patched at run time in a way other than writing an attribute
+  rooted at the call's own name: `setattr(ext, "go", go)`,
   `globals()["ext"] = …`, `vars(ext)["go"] = go`, `ext.__dict__["go"] = go`,
+  a write through another name (`alias = ext; alias.go = go`, a function
+  handed `ext`, a list holding it, a second import of it), a write to a
+  segment of the import's path (`pkg.b = K` before `from pkg import b`), a
+  `__getattr__` or `__class__` hook, a patch made in another file,
   `mock.patch`, `sys.modules`, `exec`. On 11,588 generated files run under
-  CPython (1,973 of them inside a package they import, 600 patching the
+  CPython (1,973 of them inside a package they import, 792 patching the
   module through another name), every call the new rule stopped binding
-  while Python ran the file's own `go` used one of the first three.
+  while Python ran the file's own `go` used `setattr`, `globals()`, `vars()`
+  or a write through another name.
 - A module that hands the caller's own definition back: `os.path.join`
   called inside `posixpath.py`, nltk's `chunk/util.py` calling
   `nltk.chunk.tagstr2tree`, which `nltk/chunk/__init__.py` imports from it,
@@ -88,6 +94,9 @@ batches of five runs).
   as m1`, `import ext as m2`, `m1.flag = 0`), can store the same call edge
   twice, once with the new `"loc"` metadata key; `refs`, `impact` and
   `callgraph` list it once.
+- A file whose syntax tree nests deeper than the import scan reads (one
+  expression adding 300 terms is enough; 200 is not) keeps every call
+  through an imported name as before.
 
 ## 0.183.0
 
