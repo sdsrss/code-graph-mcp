@@ -309,7 +309,7 @@ pub(super) fn js_import_targets(
         &mut seen,
         &own,
     )
-    .map(Some)
+    .map(|found| Some(found.into_ids()))
 }
 
 /// What a named JS import of `name` binds when `file`, the file its specifier
@@ -351,6 +351,7 @@ pub(super) fn js_import_edge_targets(
         &mut seen,
         &own,
     )
+    .map(JsReexport::into_ids)
 }
 
 /// How many files deep [`js_import_targets`] follows re-exports: a chain of
@@ -360,14 +361,45 @@ pub(super) fn js_import_edge_targets(
 /// file visited, which stopped a ten-source barrel at its eighth).
 const MAX_JS_REEXPORT_HOPS: usize = 8;
 
-/// The nodes `own` finds for `export` in `file`, else in the first file one
-/// of its re-exports of that name leads to, else in the one `export *` source
-/// that has it. `depth` is how many re-exports led to `file`. `seen` holds the
-/// least depth each file was walked at in this lookup: a file is walked again
-/// only from nearer the importer, where the bound cuts less below it (round 2
-/// of that review, LOW-2: a file met first at the end of a long path hid what
-/// a shorter one reached, so the order of `export *` lines decided the edge).
-/// Two `export *` sources that lead to the same nodes are one binding.
+/// What [`js_export_through_reexports`] finds for a name in one file.
+enum JsReexport {
+    /// The nodes the name binds.
+    Found(Vec<i64>),
+    /// The file neither defines it nor re-exports it.
+    Missing,
+    /// Not walked here: the file was walked nearer the importer in this
+    /// lookup, or lies past the depth bound, so what it holds is answered
+    /// there (ECMAScript's `ResolveExport` returns null for a module already
+    /// in its resolve set).
+    Elsewhere,
+    /// Two `export *` sources lead to different definitions.
+    Ambiguous,
+}
+
+impl JsReexport {
+    fn into_ids(self) -> Vec<i64> {
+        match self {
+            JsReexport::Found(ids) => ids,
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// What `export` binds in `file`, by ECMAScript's `ResolveExport`: the nodes
+/// `own` finds there, else what a re-export of that name leads to, else what
+/// its `export *` sources agree on. `depth` is how many re-exports led to
+/// `file`. `seen` holds the least depth each file was walked at in this
+/// lookup: a file is walked again only from nearer the importer, where the
+/// bound cuts less below it (round 2 of that review, LOW-2: a file met first
+/// at the end of a long path hid what a shorter one reached).
+///
+/// A re-export of the name answered elsewhere is the answer: the `export *`
+/// sources are not asked, as ECMAScript returns an indirect export's
+/// resolution as it is (round 3, F1: they were asked, and the order of
+/// `export *` lines decided the edge). One whose target lacks the name falls
+/// through to them, because the file's plain imports read as re-exports here.
+/// Two `export *` sources leading to the same nodes are one binding; leading
+/// to different ones, the name is ambiguous, in every barrel above too.
 #[allow(clippy::too_many_arguments)]
 fn js_export_through_reexports(
     conn: &rusqlite::Connection,
@@ -378,9 +410,9 @@ fn js_export_through_reexports(
     depth: usize,
     seen: &mut HashMap<String, usize>,
     own: &dyn Fn(&JsFileExports, &str) -> Vec<i64>,
-) -> Result<Vec<i64>> {
+) -> Result<JsReexport> {
     if depth >= MAX_JS_REEXPORT_HOPS || seen.get(&file).is_some_and(|d| *d <= depth) {
-        return Ok(Vec::new());
+        return Ok(JsReexport::Elsewhere);
     }
     seen.insert(file.clone(), depth);
     if !exports.by_file.contains_key(&file) {
@@ -389,11 +421,11 @@ fn js_export_through_reexports(
     }
     let here = own(&exports.by_file[&file], &file);
     if !here.is_empty() {
-        return Ok(here);
+        return Ok(JsReexport::Found(here));
     }
     let resolve =
         |spec: &str| super::js_modules::resolve_js_specifier_path(spec, &file, all_file_paths);
-    let (named, stars): (Vec<String>, Vec<String>) = {
+    let (mut named, stars): (Vec<String>, Vec<String>) = {
         let f = &exports.by_file[&file];
         (
             f.reexports
@@ -407,8 +439,13 @@ fn js_export_through_reexports(
                 .collect(),
         )
     };
+    // One row per edge: an import bound by name to two namesakes is two rows
+    // of one file, whose second visit would read as answered elsewhere.
+    let mut once = HashSet::new();
+    named.retain(|next| once.insert(next.clone()));
+    let mut elsewhere = false;
     for next in named {
-        let ids = js_export_through_reexports(
+        match js_export_through_reexports(
             conn,
             exports,
             next,
@@ -417,14 +454,18 @@ fn js_export_through_reexports(
             depth + 1,
             seen,
             own,
-        )?;
-        if !ids.is_empty() {
-            return Ok(ids);
+        )? {
+            JsReexport::Missing => {}
+            JsReexport::Elsewhere => elsewhere = true,
+            answer => return Ok(answer),
         }
+    }
+    if elsewhere {
+        return Ok(JsReexport::Elsewhere);
     }
     let mut found: Option<Vec<i64>> = None;
     for next in stars {
-        let ids = js_export_through_reexports(
+        match js_export_through_reexports(
             conn,
             exports,
             next,
@@ -433,16 +474,23 @@ fn js_export_through_reexports(
             depth + 1,
             seen,
             own,
-        )?;
-        if ids.is_empty() || found.as_ref() == Some(&ids) {
-            continue;
+        )? {
+            JsReexport::Found(ids) => {
+                if found.as_ref().is_some_and(|f| *f != ids) {
+                    return Ok(JsReexport::Ambiguous);
+                }
+                found = Some(ids);
+            }
+            JsReexport::Ambiguous => return Ok(JsReexport::Ambiguous),
+            JsReexport::Elsewhere => elsewhere = true,
+            JsReexport::Missing => {}
         }
-        if found.is_some() {
-            return Ok(Vec::new());
-        }
-        found = Some(ids);
     }
-    Ok(found.unwrap_or_default())
+    Ok(match found {
+        Some(ids) => JsReexport::Found(ids),
+        None if elsewhere => JsReexport::Elsewhere,
+        None => JsReexport::Missing,
+    })
 }
 
 /// Per-pass memo for [`js_import_targets`]: each file's exports, read once.

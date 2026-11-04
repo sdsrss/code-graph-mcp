@@ -15229,12 +15229,21 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
             &["a@2 -> h@1"],
         ),
         // A TS namespace body is no nested block: an exported member is seen
-        // in every block of the merged namespace (round 2, LOW-3).
+        // in every block of the merged namespace (round 2, LOW-3). Its members
+        // are then seen file-wide, so the top-level `f`, which TypeScript does
+        // not bind here, stays a candidate, as in 0.184.0.
         (
             "ts: a const of a merged namespace (kept)",
             "a.ts",
             "function f(): number { return 1; }\nnamespace N {\n  export const f = (): number => 2;\n}\n\
              namespace N {\n  export function g(): number { return f(); }\n}\n",
+            &["g@6 -> f@1", "g@6 -> f@3"],
+        ),
+        (
+            "ts: a const of a merged legacy `module` (kept)",
+            "a.ts",
+            "function f(): number { return 1; }\nmodule M {\n  export const f = (): number => 2;\n}\n\
+             module M {\n  export function g(): number { return f(); }\n}\n",
             &["g@6 -> f@1", "g@6 -> f@3"],
         ),
         // A JS/TS bare call never reaches a class or object member, so once it
@@ -15660,6 +15669,69 @@ fn a_barrel_only_edit_rebinds_its_importers_as_a_rebuild_does() {
                 ("state.ts", Some("export { get } from './crud.js';\n")),
             ],
         ),
+        // Pre-tag review of 0.185.0, round 3. The top barrel sorts, and so is
+        // indexed and scanned, before the one it re-exports: one pass over the
+        // `export *` edges reaches only the middle.
+        (
+            "the bottom of a three-level export * chain retargeted",
+            vec![
+                crud,
+                crud2,
+                decoy,
+                (
+                    "app.js",
+                    "import { init, get } from './a-top.js';\nexport function main() { return init() + get(); }\n",
+                ),
+                ("a-top.js", "export * from './b-mid.js';\n"),
+                ("b-mid.js", "export * from './c-bot.js';\n"),
+                ("c-bot.js", "export { init, get } from './crud.js';\n"),
+            ],
+            vec![(
+                "c-bot.js",
+                Some("export { init, get } from './crud2.js';\n"),
+            )],
+        ),
+        (
+            "a file appears that hides a directory's index",
+            vec![
+                crud,
+                crud2,
+                decoy,
+                (
+                    "app.js",
+                    "import { init, get } from './state';\nexport function main() { return init() + get(); }\n",
+                ),
+                ("state/index.js", "export { init, get } from '../crud.js';\n"),
+            ],
+            vec![("state.js", Some("export { init, get } from './crud2.js';\n"))],
+        ),
+        // Re-extracting `m.js` and `app.js` moves their rows behind the
+        // others', so a lookup that depends on row order reads differently.
+        (
+            "a named re-export beside an export * source, edited with its importer",
+            vec![
+                crud,
+                crud2,
+                decoy,
+                app,
+                ("index.js", "export * from './A.js';\nexport * from './m.js';\n"),
+                ("A.js", "export * from './crud.js';\n"),
+                (
+                    "m.js",
+                    "export { init } from './crud.js';\nexport * from './crud2.js';\n",
+                ),
+            ],
+            vec![
+                (
+                    "m.js",
+                    Some("export { init } from './crud.js';\nexport * from './crud2.js';\n// e\n"),
+                ),
+                (
+                    "app.js",
+                    Some("import { init, get } from './index.js';\nexport function main() { return init() + get(); }\n// e\n"),
+                ),
+            ],
+        ),
     ];
     let mut failures = Vec::new();
     for (label, before, after) in cases {
@@ -15943,6 +16015,196 @@ fn a_reexport_lookup_does_not_depend_on_which_export_star_comes_first() {
         if got != ["app.js.main --calls--> p.js.init"] {
             failures.push(format!("{label}: {got:?}"));
         }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Pre-tag review of 0.185.0, round 3 (F1): a named re-export whose target
+/// the lookup had already walked came back empty and was then answered by the
+/// file's `export *` sources, which ECMAScript never asks once a name has an
+/// indirect export; and two `export *` sources disagreeing inside a barrel
+/// counted as "not found" there, so a barrel above could still bind one.
+/// Which `export *` line came first decided both. Node binds `a.js`'s `f` in
+/// the first two shapes and rejects the third (conflicting star exports).
+#[test]
+fn a_named_reexport_answered_elsewhere_is_not_retried_through_export_star() {
+    let app = (
+        "app.js".to_string(),
+        "import { f as g } from './index.js';\nexport function main() { return g(); }\n"
+            .to_string(),
+    );
+    let def = |p: &str| {
+        (
+            p.to_string(),
+            "export function f() { return 1; }\n".to_string(),
+        )
+    };
+    let star = |p: &str, specs: &[&str]| {
+        let body: String = specs
+            .iter()
+            .map(|s| format!("export * from './{s}.js';\n"))
+            .collect();
+        (p.to_string(), body)
+    };
+    let m = (
+        "m.js".to_string(),
+        "export { f } from './a.js';\nexport * from './c.js';\n".to_string(),
+    );
+    let calls = |tree: &[(String, String)]| -> Vec<String> {
+        let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+        let (_p, _d, db) = fresh_index_of(&files);
+        edge_set(&db)
+            .into_iter()
+            .filter(|e| e.starts_with("app.js.main --calls"))
+            .collect()
+    };
+    let mut failures = Vec::new();
+    for (label, tree) in [
+        (
+            "the named target walked first through another barrel",
+            vec![
+                app.clone(),
+                def("a.js"),
+                def("c.js"),
+                m.clone(),
+                star("index.js", &["p", "a", "m"]),
+                star("p.js", &["m"]),
+            ],
+        ),
+        (
+            "a barrel of `a` before the one naming it",
+            vec![
+                app.clone(),
+                def("a.js"),
+                def("c.js"),
+                m.clone(),
+                star("index.js", &["A", "m"]),
+                star("A.js", &["a"]),
+            ],
+        ),
+        (
+            "the one naming it before a barrel of `a`",
+            vec![
+                app.clone(),
+                def("a.js"),
+                def("c.js"),
+                m.clone(),
+                star("index.js", &["m", "A"]),
+                star("A.js", &["a"]),
+            ],
+        ),
+        (
+            "the named target reaches `a` by an export * walked first",
+            vec![
+                app.clone(),
+                def("a.js"),
+                def("c.js"),
+                (
+                    "m.js".to_string(),
+                    "export { f } from './B.js';\nexport * from './c.js';\n".to_string(),
+                ),
+                star("index.js", &["A", "m"]),
+                star("A.js", &["a"]),
+                star("B.js", &["a"]),
+            ],
+        ),
+    ] {
+        let got = calls(&tree);
+        if got != ["app.js.main --calls--> a.js.f"] {
+            failures.push(format!("{label}: {got:?}"));
+        }
+    }
+    // Conflicting star exports in `p`: no binding, whatever the line order.
+    for (index, p) in [
+        (["p", "y"], ["x", "y"]),
+        (["p", "y"], ["y", "x"]),
+        (["y", "p"], ["x", "y"]),
+        (["y", "p"], ["y", "x"]),
+    ] {
+        let tree = vec![
+            app.clone(),
+            def("x.js"),
+            def("y.js"),
+            star("index.js", &index),
+            star("p.js", &p),
+        ];
+        let got = calls(&tree);
+        if !got.is_empty() {
+            failures.push(format!("ambiguous, index {index:?}, p {p:?}: {got:?}"));
+        }
+    }
+    // A named re-export is the answer even when it is no binding: one that
+    // leads to the conflict above, or past the depth bound, is not answered
+    // by the file's own `export *` source instead.
+    let named_then_star = |p: &str, target: &str| {
+        (
+            p.to_string(),
+            format!("export {{ f }} from './{target}.js';\nexport * from './c.js';\n"),
+        )
+    };
+    let ambiguous_named = vec![
+        app.clone(),
+        def("x.js"),
+        def("y.js"),
+        def("c.js"),
+        star("index.js", &["m"]),
+        named_then_star("m.js", "p"),
+        star("p.js", &["x", "y"]),
+    ];
+    let got = calls(&ambiguous_named);
+    if !got.is_empty() {
+        failures.push(format!("named re-export of an ambiguous name: {got:?}"));
+    }
+    // index.js and f1.js .. f5.js re-export `f` by name; f6.js names f7.js and
+    // takes c.js by `export *`; f7.js names f8.js, the ninth file of the
+    // chain, past the bound of eight.
+    let mut past_bound = vec![app.clone(), def("c.js"), def("f9.js")];
+    past_bound.push((
+        "index.js".to_string(),
+        "export { f } from './f1.js';\n".to_string(),
+    ));
+    for i in 1..6 {
+        past_bound.push((
+            format!("f{i}.js"),
+            format!("export {{ f }} from './f{}.js';\n", i + 1),
+        ));
+    }
+    past_bound.push(named_then_star("f6.js", "f7"));
+    past_bound.push((
+        "f7.js".to_string(),
+        "export { f } from './f8.js';\n".to_string(),
+    ));
+    past_bound.push((
+        "f8.js".to_string(),
+        "export { f } from './f9.js';\n".to_string(),
+    ));
+    let got = calls(&past_bound);
+    if !got.is_empty() {
+        failures.push(format!("named re-export past the bound: {got:?}"));
+    }
+    // A plain import of a name its file lacks re-exports nothing; the `export
+    // *` source answers. Its by-name fallback binds both namesakes, so the
+    // import reads as two rows of one specifier, and the second visit of
+    // `p.js` must not stand for an answer.
+    let import_then_star = vec![
+        app.clone(),
+        def("c.js"),
+        def("x.js"),
+        (
+            "p.js".to_string(),
+            "export function other() {}\n".to_string(),
+        ),
+        star("index.js", &["m"]),
+        (
+            "m.js".to_string(),
+            "import { f } from './p.js';\nexport * from './c.js';\n".to_string(),
+        ),
+    ];
+    let got = calls(&import_then_star);
+    if got != ["app.js.main --calls--> c.js.f"] {
+        failures.push(format!(
+            "plain import of a missing name beside export *: {got:?}"
+        ));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
