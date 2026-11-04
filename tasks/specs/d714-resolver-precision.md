@@ -106,3 +106,19 @@
 - LOW：删除 barrel 不重抽导入方（按本轮之后的文件集解析）；深度上限加"每次查找只访问一次"依赖顺序；TS 合并命名空间被当嵌套块、丢正确边；测试钉不住块收窄和深度边界；`for_in_statement` 条目是死代码；四条文档说法不准（已改：gsd-lite 句子、带注解局部变量、grep 命中形状、测试注释差一）。
 - 计划中的修法（未动手）：漂移按 `export *` 边做传递闭包（经星号转出漂移文件的文件也算漂移，继承名字）；匹配时排除 `<module>` 名；被删文件按运行前的文件集解析；TS `internal_module` 的块不算嵌套块；补只含块内调用的测试行和深度边界测试；删 `for_in_statement`。验收：38 形状 0/38，12 语料边集不变，然后第 3 轮增量评审（越过两轮上限，需用户同意）。
 - 备选：按现状发版，6 种形状和过度拉取写进"未覆盖"，0.185.1 单独修。
+
+## 第 2 轮之后：用户选 A（2026-11-03）
+
+- 决定：用户回复"A"——现在修，38 形状 0/38、语料边集不变，再做第 3 轮增量评审（越过两轮上限，用户已同意），然后发版。
+- 实现（`resolve.rs`）：
+  - `importers_of_js_reexport_drift`：漂移名不再收 `<module>`（命名空间导入、`require`、默认导入不是重导出，遍历不读它们）；按 `export *` 边做传递闭包，经星号转出漂移文件的文件继承名字和星号标记，直到不再增长；导入方只看具名导入边（命名空间成员调用 `ns.f()` 绑该文件自己的节点，不走遍历）；规格同时按当前文件集和本轮开始时的文件集解析（快照表加 `existed` 列：本轮路径开始时是否在索引里）。
+  - `js_export_through_reexports`：`seen` 改为"每个文件走过的最小深度"，从更近处再遇到时重走（LOW-2）；两个 `export *` 源找到同一组节点算一个绑定（重走后菱形会被找两次）。
+- `treesitter.rs`：TS `internal_module` / `module` / `ambient_declaration` 的块不算嵌套块（LOW-3）；删 `for_in_statement`（LOW-7）。
+- INDEX_VERSION 135，指纹重生成。
+- 测试（先红后绿，红的输出在本会话）：屏障测试新增 7 种编辑（星号链中间换源、中间加具名、星号下具名换目标、星号环、删 barrel、删遮住目录 index 的文件、删星号源；前 6 种在旧代码上红）；`the_js_reexport_fanout_pulls_only_importers_a_rebuild_rebinds`（旧代码拉 `ns.js`、`req.js`、`star.js`）；`a_reexport_chain_is_followed_eight_files_deep_and_no_further`（旧代码也绿，钉深度边界）；`a_reexport_lookup_does_not_depend_on_which_export_star_comes_first`（旧代码"长路径在前"红）；A3 表加 6 行（块内/块后各一个调用、switch、Rust，TS 合并命名空间——最后一行旧代码红）。
+- 验证：评审矩阵 38/38 一致（`cg-r2fix`，md5 1cf75fba；同一工具对 `cg-85986fff` 在 star_chain_mid、barrel_deleted 上仍报 DIFF）；11 个语料目录全量重建 85986fff 对 r2fix 边集差 0 行。
+- 计时（6 次，`--no-embed`，0.184.0 / 85986fff / r2fix）：claude-mem-lite 在 `lib/git-state.mjs` 增删 `import * as` 112–121 / 285–313（重抽 18 个）/ 114–128 ms（不重抽）；hono 新增删一条 `export *` 57–70 / 87–102 / 93–105；删再恢复已有 `export * from './ssg'` 52–66 / 155–199 / 152–175；`hono-base.ts` 增删 import 99–110 / 90–109 / 95–114。
+- 另做 6 种形状（同 stem 换扩展名、星号菱形、菱形变歧义、三层星号链底层删除、改名导入经星号链、`require` 解构经星号链）：r2fix 全一致，85986fff 全不一致。
+- 变异（归档副本，独立 target，15 个）：14 个被杀；M15（忽略 `existed`）起初存活，加"同 stem 换扩展名"一例后被杀。M2（漂移名保留 `<module>`）输出等价、存活：它只省掉"本轮只动了 `<module>` 行"时对全部导入边的扫描，留着并注释。
+- 成熟方案核对：TypeScript 增量构建按"文件导出签名变了 → 重查引用它的文件，传递"做（exportedModulesMap / 签名传播；其 issue #63579、#64591 也是 `export *` 链上的增量漏传）。本实现同一形状，不另引库。
+- 下一步：第 3 轮增量评审（新 spawn，盲简报 `review3-brief.md`），范围 a2b24cbe..文档提交。

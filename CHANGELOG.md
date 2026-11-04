@@ -2,7 +2,7 @@
 
 ## 0.185.0
 
-**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 134
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 135
 because JavaScript and TypeScript call and import edges are added or moved,
 same-file call edges are dropped and some Python call edges are labelled
 `ambiguous` (below). The MCP server
@@ -34,7 +34,8 @@ import names, in the file its relative path resolves to, as a call through a
 renamed import (`import { get as fetchIt }`) already did. That lookup now also
 follows the file's re-exports: `export { read } from './crud.js'`, and the one
 `export * from` source that has the name (JavaScript exports a name two
-`export *` sources share from neither), up to 8 files deep. This applies to
+`export *` sources lead to different definitions of from neither), up to 8
+files deep. This applies to
 renamed imports through such a file too, which never bound before. A renamed
 re-export (`export { read as load } from`) is not followed.
 
@@ -106,12 +107,16 @@ re-exports, up to 8 files deep. D#712 above follows the same re-exports for
 the calls of a noise-named or renamed import; this applies to every named
 import. An import that no re-export answers binds as before. An incremental
 run that changes what a file re-exports, or what one of its re-exports leads
-to, now also re-extracts the files that import a changed name from it (any
-name, when its `export *` sources changed), round after round down a chain. On a
-copy of hono, adding and removing an `export *` line in
-`src/helper/ssg/index.ts` took 51–62 ms per incremental run before this and
-92–98 ms after (6 runs each, `--no-embed`); adding and removing an import in
-`src/hono-base.ts`, 74–81 ms both.
+to, or deletes such a file, now also re-extracts the files that import a
+changed name from it or from a file that re-exports it by `export *` (any
+name, when an `export *` set changed), round after round down a chain of named
+re-exports. A file that imports the whole module (`import * as ns`, `const m =
+require(…)`) is not re-extracted: `ns.f()` binds the module's own `f`. On a
+copy of hono (6 runs each, `--no-embed`), adding and removing a new `export *`
+line in `src/helper/ssg/index.ts` took 57–70 ms per incremental run before
+this and 93–105 ms after; removing and restoring its `export * from './ssg'`,
+52–66 and 152–175 ms; adding and removing an import in `src/hono-base.ts`,
+99–110 and 95–114 ms.
 
 SCIP oracle, before and after, on the same copy of each project:
 
@@ -143,8 +148,9 @@ Such a call now binds only the definitions it can see by the language's
 scoping: the innermost function around a definition, named or not (an arrow
 function, a `function () {}` callback, a closure), must contain the call, and
 of the definitions it sees, the innermost. A JavaScript or TypeScript
-`const`/`let` in a nested block (an `if`, a loop body or head, a `catch`) and a Rust
-`fn` item in a nested block are seen only inside that block; a JavaScript
+`const`/`let` in a nested block (an `if`, a `switch`, a loop body or a `for
+(…;;)` head, a `catch`; not a TypeScript `namespace` body, whose blocks merge)
+and a Rust `fn` item in a nested block are seen only inside that block; a JavaScript
 `function` declaration in a nested block, which sloppy code also binds in the
 enclosing function, narrows nothing, and a `var` is its function's. This
 applies to JavaScript and TypeScript `function` declarations and `const f = ()
@@ -305,6 +311,9 @@ server next starts. The file watcher still starts at the first tool call.
   = store; read()` in a file that also defines `function read`, now binds only
   that function, which the local shadows; before, it bound the method
   `store.read` too. On the corpora above no other edge changed.
+- A JavaScript `function` declaration in a nested block narrows nothing, so a
+  call in that block also binds a same-named method of its file (`if (x) {
+  function f() {} f(); }` beside `class A { f() {} }`), as 0.184.0 did.
 - In Python a bare call inside a method still binds a same-named method of its
   file beside the module function it sees (`def h()` and `class C: def h(self)`,
   with `h()` in another method of `C`).
