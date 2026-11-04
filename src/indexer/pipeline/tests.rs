@@ -15193,6 +15193,50 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
             "fn h() {}\nfn a(x: bool) {\n    if x {\n        fn h() {}\n        h();\n    }\n    h();\n}\n",
             &["a@2 -> h@1", "a@2 -> h@4"],
         ),
+        // One call each, inside the block or after it (round 2, LOW-5): a row
+        // with both calls also reads both edges when nothing narrows.
+        (
+            "js: a block-local const shadows inside its block",
+            "a.js",
+            "function send(x) { return x; }\nfunction handler(req) {\n  if (req.a) {\n    \
+             const send = (y) => y;\n    send(1);\n  }\n}\n",
+            &["handler@2 -> send@4"],
+        ),
+        (
+            "js: a block-local const is not seen after its block",
+            "a.js",
+            "function send(x) { return x; }\nfunction handler(req) {\n  if (req.a) {\n    \
+             const send = (y) => y;\n  }\n  return send(2);\n}\n",
+            &["handler@2 -> send@1"],
+        ),
+        (
+            "js: a const in a switch is not seen after it",
+            "a.js",
+            "function f() { return 1; }\nfunction g(x) {\n  switch (x) {\n    case 1:\n      \
+             const f = () => 2;\n      break;\n  }\n  return f();\n}\n",
+            &["g@2 -> f@1"],
+        ),
+        (
+            "rs: a nested-block item shadows inside its block",
+            "src/lib.rs",
+            "fn h() {}\nfn a(x: bool) {\n    if x {\n        fn h() {}\n        h();\n    }\n}\n",
+            &["a@2 -> h@4"],
+        ),
+        (
+            "rs: a nested-block item is not seen after its block",
+            "src/lib.rs",
+            "fn h() {}\nfn a(x: bool) {\n    if x {\n        fn h() {}\n    }\n    h();\n}\n",
+            &["a@2 -> h@1"],
+        ),
+        // A TS namespace body is no nested block: an exported member is seen
+        // in every block of the merged namespace (round 2, LOW-3).
+        (
+            "ts: a const of a merged namespace (kept)",
+            "a.ts",
+            "function f(): number { return 1; }\nnamespace N {\n  export const f = (): number => 2;\n}\n\
+             namespace N {\n  export function g(): number { return f(); }\n}\n",
+            &["g@6 -> f@1", "g@6 -> f@3"],
+        ),
         // A JS/TS bare call never reaches a class or object member, so once it
         // sees a lexical definition a same-named method is no candidate either.
         (
@@ -15425,7 +15469,7 @@ fn d714_barrel_edges(db: &Database) -> Vec<String> {
 /// Pre-tag review of 0.185.0, H1: an edit of a barrel alone (no definition
 /// added or removed anywhere) moves what its importers bind, as a rebuild
 /// shows. The importers were never re-extracted, so they kept the old target
-/// for good.
+/// for good. A deletion counts as an edit.
 #[test]
 fn a_barrel_only_edit_rebinds_its_importers_as_a_rebuild_does() {
     let crud = (
@@ -15501,6 +15545,102 @@ fn a_barrel_only_edit_rebinds_its_importers_as_a_rebuild_does() {
             ],
             vec![("index.js", Some("export * from './crud2.js';\n"))],
         ),
+        // Pre-tag review of 0.185.0, round 2: an `export *` row reads the
+        // same when what comes through it moves, so a barrel re-exporting the
+        // edited one by `export *` has to count as moved too.
+        (
+            "the middle of an export * chain swapped",
+            vec![
+                crud,
+                crud2,
+                decoy,
+                app,
+                ("index.js", "export * from './mid.js';\n"),
+                ("mid.js", "export * from './crud.js';\n"),
+            ],
+            vec![("mid.js", Some("export * from './crud2.js';\n"))],
+        ),
+        (
+            "the middle of an export * chain gains a named re-export",
+            vec![
+                crud,
+                crud2,
+                decoy,
+                app,
+                ("index.js", "export * from './mid.js';\n"),
+                ("mid.js", "export function other() {}\n"),
+            ],
+            vec![(
+                "mid.js",
+                Some("export function other() {}\nexport { init } from './crud2.js';\n"),
+            )],
+        ),
+        (
+            "a named re-export under an export * retargeted",
+            vec![
+                crud,
+                crud2,
+                decoy,
+                app,
+                ("index.js", "export * from './mid.js';\n"),
+                ("mid.js", "export { init, get } from './crud.js';\n"),
+            ],
+            vec![("mid.js", Some("export { init, get } from './crud2.js';\n"))],
+        ),
+        (
+            "an export * cycle with a source swapped",
+            vec![
+                crud,
+                crud2,
+                decoy,
+                app,
+                ("index.js", "export * from './a.js';\n"),
+                ("a.js", "export * from './index.js';\nexport * from './crud.js';\n"),
+            ],
+            vec![(
+                "a.js",
+                Some("export * from './index.js';\nexport * from './crud2.js';\n"),
+            )],
+        ),
+        // A deleted file is looked up among the files the run started from.
+        (
+            "a barrel deleted",
+            vec![
+                crud,
+                crud2,
+                decoy,
+                app,
+                ("index.js", "export { init, get } from './crud.js';\n"),
+            ],
+            vec![("index.js", None)],
+        ),
+        (
+            "an export * source deleted",
+            vec![
+                crud,
+                crud2,
+                decoy,
+                app,
+                ("index.js", "export * from './mid.js';\n"),
+                ("mid.js", "export { init, get } from './crud.js';\n"),
+            ],
+            vec![("mid.js", None)],
+        ),
+        (
+            "a file that hid a directory's index deleted",
+            vec![
+                crud,
+                crud2,
+                decoy,
+                (
+                    "app.js",
+                    "import { init, get } from './state';\nexport function main() { return init() + get(); }\n",
+                ),
+                ("state.js", "export { init, get } from './crud.js';\n"),
+                ("state/index.js", "export { init, get } from '../crud2.js';\n"),
+            ],
+            vec![("state.js", None)],
+        ),
     ];
     let mut failures = Vec::new();
     for (label, before, after) in cases {
@@ -15511,9 +15651,13 @@ fn a_barrel_only_edit_rebinds_its_importers_as_a_rebuild_does() {
             .collect();
         for (path, body) in after {
             tree.retain(|(p, _)| p != path);
-            let b = body.expect("edits only");
-            fs::write(project.path().join(path), b).unwrap();
-            tree.push((path.to_string(), b.to_string()));
+            match body {
+                Some(b) => {
+                    fs::write(project.path().join(path), b).unwrap();
+                    tree.push((path.to_string(), b.to_string()));
+                }
+                None => fs::remove_file(project.path().join(path)).unwrap(),
+            }
         }
         run_incremental_index(&db, project.path(), None, None).unwrap();
         let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
@@ -15578,6 +15722,210 @@ fn a_wide_export_star_barrel_is_followed_past_eight_sources() {
         !got.iter().any(|e| e.contains("helper.js")),
         "fell back to a namesake\n{got:#?}"
     );
+}
+
+/// Pre-tag review of 0.185.0, round 2 (MEDIUM-1): the H1 fan-out pulled every
+/// namespace importer and whole-module `require` of a file that only gained an
+/// `import * as` or a `require` of its own, though no re-export moved and a
+/// namespace member call binds the file's own nodes without the walk. It pulls
+/// the importers of a moved name, through `export *` barrels too.
+#[test]
+fn the_js_reexport_fanout_pulls_only_importers_a_rebuild_rebinds() {
+    let base: &[(&str, &str)] = &[
+        (
+            "crud.js",
+            "export function init() { return 1; }\nexport function get() { return 1; }\n",
+        ),
+        (
+            "crud2.js",
+            "export function init() { return 2; }\nexport function get() { return 2; }\n",
+        ),
+        (
+            "utils.js",
+            "export { init } from './crud.js';\nexport { get } from './crud.js';\n",
+        ),
+        (
+            "ns.js",
+            "import * as u from './utils.js';\nexport function a() { return u.init(); }\n",
+        ),
+        (
+            "req.js",
+            "const u = require('./utils.js');\nfunction b() { return u.init(); }\nmodule.exports = { b };\n",
+        ),
+        (
+            "named.js",
+            "import { init } from './utils.js';\nexport function c() { return init(); }\n",
+        ),
+        (
+            "getter.js",
+            "import { get } from './utils.js';\nexport function d() { return get(); }\n",
+        ),
+        ("star.js", "export * from './utils.js';\n"),
+        (
+            "top.js",
+            "import { init } from './star.js';\nexport function e() { return init(); }\n",
+        ),
+    ];
+    let pulled_by = |utils: &str| -> Vec<String> {
+        let (project, _d, db) = fresh_index_of(base);
+        fs::write(project.path().join("utils.js"), utils).unwrap();
+        index_files(
+            &db,
+            project.path(),
+            &["utils.js".to_string()],
+            &std::collections::HashMap::new(),
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        super::resolve::importers_of_js_reexport_drift(db.conn()).unwrap()
+    };
+    assert_eq!(
+        pulled_by(
+            "export { init } from './crud.js';\nexport { get } from './crud.js';\n\
+             import * as z from './crud2.js';\nconst y = require('./crud2.js');\n"
+        ),
+        Vec::<String>::new(),
+        "a namespace import or require of its own moves no re-export"
+    );
+    assert_eq!(
+        pulled_by("export { init } from './crud2.js';\nexport { get } from './crud.js';\n"),
+        vec!["named.js".to_string(), "top.js".to_string()],
+        "the importers of the moved name, directly and through `export *`"
+    );
+    assert_eq!(
+        pulled_by(
+            "export { init } from './crud.js';\nexport { get } from './crud.js';\n\
+             export * from './crud2.js';\n"
+        ),
+        vec![
+            "getter.js".to_string(),
+            "named.js".to_string(),
+            "top.js".to_string()
+        ],
+        "an `export *` set moved: every named importer, no namespace one"
+    );
+}
+
+/// Pre-tag review of 0.185.0, round 2 (LOW-6): the walk binds a name eight
+/// files down a chain of re-exports, named or `export *`, and stops there: a
+/// ninth file's definition is reached only by the by-name fallback.
+#[test]
+fn a_reexport_chain_is_followed_eight_files_deep_and_no_further() {
+    let mut failures = Vec::new();
+    for star in [false, true] {
+        for len in [8usize, 9] {
+            let mut tree: Vec<(String, String)> = (1..len)
+                .map(|i| {
+                    let body = if star {
+                        format!("export * from './f{}.js';\n", i + 1)
+                    } else {
+                        format!("export {{ init }} from './f{}.js';\n", i + 1)
+                    };
+                    (format!("f{i}.js"), body)
+                })
+                .collect();
+            tree.push((
+                format!("f{len}.js"),
+                format!("export function init() {{ return {len}; }}\n"),
+            ));
+            tree.push((
+                "helper.js".into(),
+                "export function init() { return 0; }\n".into(),
+            ));
+            tree.push((
+                "app.js".into(),
+                "import { init } from './f1.js';\nexport function main() { return init(); }\n"
+                    .into(),
+            ));
+            let files: Vec<(&str, &str)> =
+                tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+            let (_p, _d, db) = fresh_index_of(&files);
+            let got: Vec<String> = edge_set(&db)
+                .into_iter()
+                .filter(|e| e.starts_with("app.js.main --calls"))
+                .collect();
+            let want: Vec<String> = if len == 8 {
+                vec![format!("app.js.main --calls--> f{len}.js.init")]
+            } else {
+                vec![
+                    format!("app.js.main --calls--> f{len}.js.init"),
+                    "app.js.main --calls--> helper.js.init".to_string(),
+                ]
+            };
+            let mut got_sorted = got.clone();
+            got_sorted.sort();
+            let mut want_sorted = want.clone();
+            want_sorted.sort();
+            if got_sorted != want_sorted {
+                failures.push(format!(
+                    "star={star} len={len}: got {got_sorted:?}, want {want_sorted:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Pre-tag review of 0.185.0, round 2 (LOW-2): a file the walk first met at
+/// the end of a long `export *` path, where the depth bound cut what lies
+/// below it, was skipped when a shorter path reached it next, so which source
+/// line came first decided the edge. A file reached by two paths to one
+/// definition is no ambiguity.
+#[test]
+fn a_reexport_lookup_does_not_depend_on_which_export_star_comes_first() {
+    let chain: Vec<(String, String)> = vec![
+        ("a1.js".into(), "export * from './a2.js';\n".into()),
+        ("a2.js".into(), "export * from './a3.js';\n".into()),
+        ("a3.js".into(), "export * from './a4.js';\n".into()),
+        ("a4.js".into(), "export * from './a5.js';\n".into()),
+        ("a5.js".into(), "export * from './m.js';\n".into()),
+        ("short.js".into(), "export * from './m.js';\n".into()),
+        ("m.js".into(), "export * from './n.js';\n".into()),
+        ("n.js".into(), "export * from './p.js';\n".into()),
+        (
+            "p.js".into(),
+            "export function init() { return 1; }\n".into(),
+        ),
+        (
+            "helper.js".into(),
+            "export function init() { return 0; }\n".into(),
+        ),
+        (
+            "app.js".into(),
+            "import { init } from './index.js';\nexport function main() { return init(); }\n"
+                .into(),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, index) in [
+        (
+            "long path first",
+            "export * from './a1.js';\nexport * from './m.js';\n",
+        ),
+        (
+            "short path first",
+            "export * from './m.js';\nexport * from './a1.js';\n",
+        ),
+        (
+            "diamond",
+            "export * from './short.js';\nexport * from './m.js';\n",
+        ),
+    ] {
+        let mut tree = chain.clone();
+        tree.push(("index.js".into(), index.into()));
+        let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+        let (_p, _d, db) = fresh_index_of(&files);
+        let got: Vec<String> = edge_set(&db)
+            .into_iter()
+            .filter(|e| e.starts_with("app.js.main --calls"))
+            .collect();
+        if got != ["app.js.main --calls--> p.js.init"] {
+            failures.push(format!("{label}: {got:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]

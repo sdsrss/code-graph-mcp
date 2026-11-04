@@ -123,19 +123,22 @@ pub(crate) fn lexical_scope(def: &tree_sitter::Node, language: &str) -> Option<L
 
 /// A block scope of JS/TS or Rust that is not the body of a function kind of
 /// [`lexical_scope_kinds`] (a function's own body is its function's scope).
+/// Nor is a TS `namespace` / `declare module` / `declare global` body one: a
+/// namespace merges its blocks, and an exported member of one is seen in the
+/// others (pre-tag review of 0.185.0, round 2, LOW-3).
 fn is_nested_block(n: &tree_sitter::Node, language: &str, functions: &[&str]) -> bool {
     let blocks: &[&str] = match language {
-        // A `for (const f = …;;)` / `for (const x of …)` head binds in the loop.
-        "javascript" | "typescript" | "tsx" => &[
-            "statement_block",
-            "switch_body",
-            "for_statement",
-            "for_in_statement",
-        ],
+        // A `for (const f = …;;)` head binds in the loop. (A `for … of`/`in`
+        // head holds no declarator, so binds nothing a call could reach.)
+        "javascript" | "typescript" | "tsx" => &["statement_block", "switch_body", "for_statement"],
         "rust" => &["block"],
         _ => return false,
     };
-    blocks.contains(&n.kind()) && !n.parent().is_some_and(|p| functions.contains(&p.kind()))
+    const NAMESPACES: &[&str] = &["internal_module", "module", "ambient_declaration"];
+    blocks.contains(&n.kind())
+        && !n
+            .parent()
+            .is_some_and(|p| functions.contains(&p.kind()) || NAMESPACES.contains(&p.kind()))
 }
 
 /// D#714: where a bare call in a language [`lexical_scope`] covers starts,

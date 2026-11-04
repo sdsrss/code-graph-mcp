@@ -297,7 +297,7 @@ pub(super) fn js_import_targets(
         let relative = module.starts_with("./") || module.starts_with("../");
         return Ok(relative.then(Vec::new));
     };
-    let mut seen = HashSet::new();
+    let mut seen = HashMap::new();
     let own = |f: &JsFileExports, _: &str| f.targets(export);
     js_export_through_reexports(
         conn,
@@ -340,7 +340,7 @@ pub(super) fn js_import_edge_targets(
             })
             .unwrap_or_default()
     };
-    let mut seen = HashSet::new();
+    let mut seen = HashMap::new();
     js_export_through_reexports(
         conn,
         exports,
@@ -354,15 +354,20 @@ pub(super) fn js_import_edge_targets(
 }
 
 /// How many files deep [`js_import_targets`] follows re-exports: a chain of
-/// this many files, the importer's own target first. Each file is visited once
-/// per lookup, so a barrel with many `export *` sources is walked whole (the
-/// pre-tag review of 0.185.0, M2, found the bound counting every file visited,
-/// which stopped a ten-source barrel at its eighth).
+/// this many files, the importer's own target first. The bound is on depth,
+/// not on files visited, so a barrel with many `export *` sources is walked
+/// whole (the pre-tag review of 0.185.0, M2, found the bound counting every
+/// file visited, which stopped a ten-source barrel at its eighth).
 const MAX_JS_REEXPORT_HOPS: usize = 8;
 
 /// The nodes `own` finds for `export` in `file`, else in the first file one
 /// of its re-exports of that name leads to, else in the one `export *` source
-/// that has it. `depth` is how many re-exports led to `file`.
+/// that has it. `depth` is how many re-exports led to `file`. `seen` holds the
+/// least depth each file was walked at in this lookup: a file is walked again
+/// only from nearer the importer, where the bound cuts less below it (round 2
+/// of that review, LOW-2: a file met first at the end of a long path hid what
+/// a shorter one reached, so the order of `export *` lines decided the edge).
+/// Two `export *` sources that lead to the same nodes are one binding.
 #[allow(clippy::too_many_arguments)]
 fn js_export_through_reexports(
     conn: &rusqlite::Connection,
@@ -371,12 +376,13 @@ fn js_export_through_reexports(
     export: &str,
     all_file_paths: &HashSet<String>,
     depth: usize,
-    seen: &mut HashSet<String>,
+    seen: &mut HashMap<String, usize>,
     own: &dyn Fn(&JsFileExports, &str) -> Vec<i64>,
 ) -> Result<Vec<i64>> {
-    if depth >= MAX_JS_REEXPORT_HOPS || !seen.insert(file.clone()) {
+    if depth >= MAX_JS_REEXPORT_HOPS || seen.get(&file).is_some_and(|d| *d <= depth) {
         return Ok(Vec::new());
     }
+    seen.insert(file.clone(), depth);
     if !exports.by_file.contains_key(&file) {
         let loaded = JsFileExports::load(conn, &file)?;
         exports.by_file.insert(file.clone(), loaded);
@@ -428,7 +434,7 @@ fn js_export_through_reexports(
             seen,
             own,
         )?;
-        if ids.is_empty() {
+        if ids.is_empty() || found.as_ref() == Some(&ids) {
             continue;
         }
         if found.is_some() {
@@ -1970,11 +1976,13 @@ pub(super) fn snapshot_js_reexports<'a>(
     conn.execute_batch(
         "DROP TABLE IF EXISTS temp.cg_js_reexport_paths;
          DROP TABLE IF EXISTS temp.cg_js_reexport_before;
-         CREATE TEMP TABLE cg_js_reexport_paths (path TEXT PRIMARY KEY);",
+         CREATE TEMP TABLE cg_js_reexport_paths (path TEXT PRIMARY KEY, existed INTEGER NOT NULL);",
     )?;
     {
-        let mut stmt =
-            conn.prepare("INSERT OR IGNORE INTO cg_js_reexport_paths (path) VALUES (?1)")?;
+        let mut stmt = conn.prepare(
+            "INSERT OR IGNORE INTO cg_js_reexport_paths (path, existed)
+             VALUES (?1, EXISTS(SELECT 1 FROM files WHERE path = ?1))",
+        )?;
         for p in paths.filter(|p| super::js_modules::is_js_module_path(p)) {
             stmt.execute([p])?;
         }
@@ -1990,10 +1998,18 @@ pub(super) fn snapshot_js_reexports<'a>(
 /// H1): a re-export retargeted, added or removed, or one whose target moved
 /// further down a chain, changes what `import { name } from './barrel'` binds
 /// in files the run never opened, and with it the calls through that import.
-/// An importer is pulled when one of its imports of that file names a moved
-/// name, or the file's `export *` set moved (any name may come through it).
-/// The run's own files are left out: they were re-extracted against the new
-/// state. Drops the snapshot.
+///
+/// A file moves with the names whose rows changed, or with its whole `export
+/// *` set. A file that re-exports a moved one by `export *` moves the same way
+/// (round 2 of that review): its own row names only the next file, so it
+/// reads the same when what comes through it changes. An importer is pulled
+/// when it imports a moved name from a moved file, or any name from one whose
+/// `export *` set moved. A namespace import, a `require` or a default import
+/// (an edge to a `<module>` that is no `export *`) is neither a re-export nor
+/// an importer the walk serves: `ns.f()` binds the file's own `f`. A specifier
+/// is looked up among the files the run started from as well as the current
+/// ones, so the importers of a deleted file are found. The run's own files are
+/// left out: they were re-extracted against the new state. Drops the snapshot.
 pub(super) fn importers_of_js_reexport_drift(conn: &rusqlite::Connection) -> Result<Vec<String>> {
     let has_snapshot: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name = 'cg_js_reexport_before')",
@@ -2012,11 +2028,12 @@ pub(super) fn importers_of_js_reexport_drift(conn: &rusqlite::Connection) -> Res
     };
     let before = pairs("SELECT p, v FROM cg_js_reexport_before")?;
     let now = pairs(JS_REEXPORT_SELECT)?;
-    let in_run: HashSet<String> = {
-        let mut stmt = conn.prepare("SELECT path FROM cg_js_reexport_paths")?;
+    // This run's files, and whether each was in the index when it started.
+    let in_run: HashMap<String, bool> = {
+        let mut stmt = conn.prepare("SELECT path, existed FROM cg_js_reexport_paths")?;
         let rows = stmt
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<HashSet<String>>>()?;
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<HashMap<String, bool>>>()?;
         rows
     };
     conn.execute_batch(
@@ -2029,58 +2046,109 @@ pub(super) fn importers_of_js_reexport_drift(conn: &rusqlite::Connection) -> Res
         let mut parts = row.split('\u{1f}');
         let name = parts.next().unwrap_or_default();
         let q = parts.nth(1).unwrap_or_default();
-        let entry = drift.entry(path.clone()).or_default();
         if q == crate::domain::IMPORT_Q_STAR_REEXPORT {
-            entry.1 = true;
-        } else {
-            entry.0.insert(name.to_string());
+            drift.entry(path.clone()).or_default().1 = true;
+        } else if name != "<module>" {
+            drift
+                .entry(path.clone())
+                .or_default()
+                .0
+                .insert(name.to_string());
         }
     }
     if drift.is_empty() {
         return Ok(Vec::new());
     }
-    let all_paths: HashSet<String> = {
+    let now_paths: HashSet<String> = {
         let mut stmt = conn.prepare("SELECT path FROM files")?;
         let rows = stmt
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<HashSet<String>>>()?;
         rows
     };
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT f.path, json_extract(e.metadata, '$.js_module'), t.name
+    let mut before_paths = now_paths.clone();
+    for (path, existed) in &in_run {
+        if *existed {
+            before_paths.insert(path.clone());
+        } else {
+            before_paths.remove(path);
+        }
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT f.path, json_extract(e.metadata, '$.js_module'), t.name,
+                COALESCE(json_extract(e.metadata, '$.q') = '{}', 0)
          FROM edges e
          JOIN nodes s ON s.id = e.source_id
          JOIN files f ON f.id = s.file_id
          JOIN nodes t ON t.id = e.target_id
          WHERE e.relation = 'imports'
            AND json_extract(e.metadata, '$.js_module') IS NOT NULL",
-    )?;
-    let imports = stmt
+        crate::domain::IMPORT_Q_STAR_REEXPORT
+    ))?;
+    let rows = stmt
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, bool>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (importer, spec, name) in imports {
-        if in_run.contains(&importer) || out.contains(&importer) {
+    // Each `export *` as (file, the files it names); each named import as
+    // (importer, the files its specifier names, the name).
+    let mut stars: Vec<(String, Vec<String>)> = Vec::new();
+    let mut named: Vec<(String, Vec<String>, String)> = Vec::new();
+    for (importer, spec, name, star) in rows {
+        if !star && name == "<module>" {
             continue;
         }
-        let Some(target) =
-            super::js_modules::resolve_js_specifier_path(&spec, &importer, &all_paths)
-        else {
+        let mut targets: Vec<String> = Vec::new();
+        for paths in [&now_paths, &before_paths] {
+            let t = super::js_modules::resolve_js_specifier_path(&spec, &importer, paths);
+            if let Some(t) = t.filter(|t| !targets.contains(t)) {
+                targets.push(t);
+            }
+        }
+        if targets.is_empty() {
             continue;
-        };
-        if drift
-            .get(&target)
-            .is_some_and(|(names, star)| *star || names.contains(&name))
-        {
-            out.insert(importer);
+        }
+        if star {
+            stars.push((importer, targets));
+        } else {
+            named.push((importer, targets, name));
         }
     }
+    loop {
+        let mut grew = false;
+        for (file, targets) in &stars {
+            for t in targets {
+                let Some((names, star)) = drift.get(t).cloned() else {
+                    continue;
+                };
+                let entry = drift.entry(file.clone()).or_default();
+                let had = (entry.0.len(), entry.1);
+                entry.0.extend(names);
+                entry.1 |= star;
+                grew |= had != (entry.0.len(), entry.1);
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let out: std::collections::BTreeSet<String> = named
+        .into_iter()
+        .filter(|(importer, targets, name)| {
+            !in_run.contains_key(importer)
+                && targets.iter().any(|t| {
+                    drift
+                        .get(t)
+                        .is_some_and(|(names, star)| *star || names.contains(name))
+                })
+        })
+        .map(|(importer, ..)| importer)
+        .collect();
     Ok(out.into_iter().collect())
 }
 
