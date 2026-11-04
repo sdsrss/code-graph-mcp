@@ -15641,6 +15641,25 @@ fn a_barrel_only_edit_rebinds_its_importers_as_a_rebuild_does() {
             ],
             vec![("state.js", None)],
         ),
+        // The new file of the same stem resolves first in both the current and
+        // the merged file set; only the set the run started from names the old.
+        (
+            "a re-exporting file swapped for another extension",
+            vec![
+                crud,
+                crud2,
+                decoy,
+                (
+                    "app.js",
+                    "import { init } from './state';\nexport function main() { return init(); }\n",
+                ),
+                ("state.js", "export { init } from './crud.js';\n"),
+            ],
+            vec![
+                ("state.js", None),
+                ("state.ts", Some("export { get } from './crud.js';\n")),
+            ],
+        ),
     ];
     let mut failures = Vec::new();
     for (label, before, after) in cases {

@@ -2005,11 +2005,12 @@ pub(super) fn snapshot_js_reexports<'a>(
 /// reads the same when what comes through it changes. An importer is pulled
 /// when it imports a moved name from a moved file, or any name from one whose
 /// `export *` set moved. A namespace import, a `require` or a default import
-/// (an edge to a `<module>` that is no `export *`) is neither a re-export nor
-/// an importer the walk serves: `ns.f()` binds the file's own `f`. A specifier
-/// is looked up among the files the run started from as well as the current
-/// ones, so the importers of a deleted file are found. The run's own files are
-/// left out: they were re-extracted against the new state. Drops the snapshot.
+/// (an edge to a `<module>` that is no `export *`) is no importer the walk
+/// serves, `ns.f()` binds the file's own `f`, so the `<module>` such a row
+/// moves pulls nothing. A specifier is looked up among the files the run
+/// started from as well as the current ones, so the importers of a deleted
+/// file are found. The run's own files are left out: they were re-extracted
+/// against the new state. Drops the snapshot.
 pub(super) fn importers_of_js_reexport_drift(conn: &rusqlite::Connection) -> Result<Vec<String>> {
     let has_snapshot: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name = 'cg_js_reexport_before')",
@@ -2049,6 +2050,9 @@ pub(super) fn importers_of_js_reexport_drift(conn: &rusqlite::Connection) -> Res
         if q == crate::domain::IMPORT_Q_STAR_REEXPORT {
             drift.entry(path.clone()).or_default().1 = true;
         } else if name != "<module>" {
+            // A moved `<module>` row (`import * as`, `require`) would pull no
+            // importer below; leaving it out returns before the scan of every
+            // import edge when it is all the run moved.
             drift
                 .entry(path.clone())
                 .or_default()
