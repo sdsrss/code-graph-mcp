@@ -1,6 +1,6 @@
 # D#714：解析精度（同文件同名定义、内置方法名、barrel 导入）（2026-11-03）
 
-状态：A3 已提交（a82c3b54）；A4 已提交（644e8640，见"A4 模拟与决定"）；A2 剩余已实现（见"A2 实现"）。来源：`docs/plugin-usage-audit-2026-11-03.md` A2–A4，待办 D#714。
+状态：**已随 0.185.0 发布（2026-11-04，tag 4a56959a，INDEX_VERSION 136）**。A3（a82c3b54）、A4（644e8640）、A2 及其增量扇出经 4 轮预发评审；遍历的精确化留作 D#740，`export *` 先于目标存在留作 D#739。来源：`docs/plugin-usage-audit-2026-11-03.md` A2–A4，待办 D#714。
 
 ## A3：同一文件里多个同名定义，调用会连到每一个
 
@@ -149,3 +149,9 @@
   - 11 个语料三个版本边集相同；真实语料增量实测（hono、gsd-lite、claude-mem-lite、daagu 各 15 轮，每轮给 1–3 个 barrel 和 0–2 个导入方追加注释）60 轮 0 不一致。
   - 残余来自做法本身（行不分 import 和重导出、行无序、分轮绑定），换版本或再补丁只换一批合成形状出错；根治登记为 D#740，验收工具放在 `tasks/d714-resolver-precision/walk-harness/`。
 - 披露：CHANGELOG"未覆盖"加三条（D2/D3 漏绑、D1/O1/O2 增量不一致附 33/400 对 0/400 和真实语料 60 轮 0、O3 稠密 `export *` 60 文件全量 1,019–1,025 ms 对 77–96 ms 本会话复测），第 2 条范围按 D6 改；`Elsewhere` 文档按 D8 改。D5 的提交说明无法改写，记在这里。
+
+## 发版（2026-11-04）
+
+- v0.185.0：tag 4a56959a；main CI 41872600696 7/7（9 个新测试在 macOS、Windows 日志里都是 ok）；Release 41874612761 成功；npm 6 个包 `_npmUser` GitHub Actions；14 个资产；真实安装 `added 2 packages`；发布的二进制在 hono、gsd-lite、claude-mem-lite 上与源码构建边集逐行相同。
+- 推送 c2924c3c 后 CI 在 macOS、Windows 红：新测试里 `A.js` 和 `a.js` 在不分大小写的文件系统上是同一个文件；4a56959a 改名修复后绿。
+- 验收工具和案例：`tasks/d714-resolver-precision/walk-harness/`（含 `cases.tar.gz`），/var/tmp 下的临时目录发版后删除。

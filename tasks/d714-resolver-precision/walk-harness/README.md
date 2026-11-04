@@ -20,3 +20,8 @@ deferred item on making the walk exact.
   with `.git`), appends a comment to random barrels and importers and checks
   each incremental run ends with the full index's edges.
 - `genperf.py ROOT cyclic|dag` — dense `export *` fixtures for cost.
+- `cases.tar.gz` — the hand-written edit shapes as `kit38/<case>/{before,after}`
+  (pre-tag reviews 1–2) and `r4sets61/<case>/{before,after}` (review 3),
+  kept as an archive so this repo's own index does not take their JS files
+  in. 0.185.0: kit38 38/38 SAME, r4sets61 57/61 (the 4 are D#739's shape).
+  Run each case with `ivf.sh BIN <extracted>/<set>/<case>`.
