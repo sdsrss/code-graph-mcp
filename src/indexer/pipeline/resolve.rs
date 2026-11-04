@@ -367,10 +367,10 @@ enum JsReexport {
     Found(Vec<i64>),
     /// The file neither defines it nor re-exports it.
     Missing,
-    /// Not walked here: the file was walked nearer the importer in this
-    /// lookup, or lies past the depth bound, so what it holds is answered
-    /// there (ECMAScript's `ResolveExport` returns null for a module already
-    /// in its resolve set).
+    /// Not walked here: the file was already walked in this lookup at this
+    /// depth or nearer the importer, where what it holds is answered
+    /// (ECMAScript's `ResolveExport` returns null for a module already in its
+    /// resolve set), or it lies past the depth bound, where nothing answers.
     Elsewhere,
     /// Two `export *` sources lead to different definitions.
     Ambiguous,

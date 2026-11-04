@@ -1,0 +1,22 @@
+# Re-export walk harness (0.185.0 pre-tag review, round 4)
+
+Acceptance tools for the JS/TS re-export walk (`js_export_through_reexports`)
+and its incremental fan-out. Written by the round-4 reviewer; paths made
+relative. See `tasks/specs/d714-resolver-precision.md` (round 4) and the
+deferred item on making the walk exact.
+
+- `ivf.sh BIN CASEDIR` — `CASEDIR/before` indexed, `CASEDIR/after` applied
+  incrementally, `after` rebuilt from scratch; prints `SAME (n edges)` or the
+  `DIFF`. Writes `w/`, `f/`, `inc.txt`, `full.txt` into CASEDIR.
+- `fuzz.py ROOT N SEED` — N random barrel graphs (6 barrels, 4 defining
+  files) with a random edit, as `ROOT/z<SEED>_<i>/{before,after}`. Measured
+  on seeds 7 and 11, N=200 each: 0.184.0 0/400 DIFF, 0.185.0 33/400.
+- `shapes.py SPEC.py ARM[,ARM…]` + `sh/*.py` — hand-written valid and invalid
+  ES-module programs; prints what `node app.js` binds next to each arm's call
+  and import edges. Needs `CG_WALK_WORK` (binaries in
+  `$CG_WALK_WORK/repro/bin/cg-new`, `cg-old`) and `node`. 0.185.0 matches
+  Node on 44 of 62 valid programs.
+- `real_inc.py BIN CORPUS RUNS SEED` — on a corpus copy (`$CG_CORPORA/<name>`,
+  with `.git`), appends a comment to random barrels and importers and checks
+  each incremental run ends with the full index's edges.
+- `genperf.py ROOT cyclic|dag` — dense `export *` fixtures for cost.

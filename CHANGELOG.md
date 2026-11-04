@@ -318,8 +318,24 @@ server next starts. The file watcher still starts at the first tool call.
   the barrel's own `imports` edge to `x` until then.
 - The barrel walk reads a file's imports as its re-exports: `export * as ns
   from` is followed like `export *`, `export { read as load } from` is
-  followed under `read`, and a plain `import { f }` in an `export *` source is
-  taken as re-exporting `f`.
+  followed under `read`, and a plain `import { f }` in any file the walk reads,
+  the one the import names included, is taken as re-exporting `f`.
+- The walk can miss a binding JavaScript makes: a file that imports a name
+  from a barrel above it and has an `export *` source defining it
+  (`utils/index.js` with `import { f } from '../index.js'` and `export * from
+  './cfg.js'`) gives no edge for `f` imported through the barrel, and neither
+  does a name that one `export *` source of a barrel only imports and another
+  defines.
+- An incremental run can end with other import and call edges than a rebuild
+  where barrels lead to one name by several paths (named, renamed and `export
+  *` re-exports, imports between barrels). In 400 random graphs of 6 barrels
+  and 4 defining files built to mix these, 33 did, against none with 0.184.0.
+  On hono, gsd-lite, claude-mem-lite and the Vue frontend's project, 60
+  incremental runs that edited barrels and their importers ended as a rebuild
+  did. `code-graph-mcp reindex` rebuilds.
+- A project whose files re-export each other densely by `export *` indexes
+  slowly: 60 files each re-exporting all the others took 1,019–1,025 ms for a
+  full index against 77–96 ms with 0.184.0 (`--no-embed`, 3 runs).
 - In TypeScript the members of a `namespace` are seen from the whole file, so
   a call outside `namespace N { const f = … }` also binds that `f` beside a
   top-level `function f`, as 0.184.0 did.
