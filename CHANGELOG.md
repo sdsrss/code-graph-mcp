@@ -2,7 +2,7 @@
 
 ## 0.185.0
 
-**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 135
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 136
 because JavaScript and TypeScript call and import edges are added or moved,
 same-file call edges are dropped and some Python call edges are labelled
 `ambiguous` (below). The MCP server
@@ -111,12 +111,17 @@ to, or deletes such a file, now also re-extracts the files that import a
 changed name from it or from a file that re-exports it by `export *` (any
 name, when an `export *` set changed), round after round down a chain of named
 re-exports. A file that imports the whole module (`import * as ns`, `const m =
-require(…)`) is not re-extracted: `ns.f()` binds the module's own `f`. On a
+require(…)`) is not re-extracted: a call `ns.f()` is bound without the
+module's re-exports. On a
 copy of hono (6 runs each, `--no-embed`), adding and removing a new `export *`
-line in `src/helper/ssg/index.ts` took 57–70 ms per incremental run before
-this and 93–105 ms after; removing and restoring its `export * from './ssg'`,
-52–66 and 152–175 ms; adding and removing an import in `src/hono-base.ts`,
-99–110 and 95–114 ms.
+line in `src/helper/ssg/index.ts` took 52–62 ms per incremental run before
+this and 89–95 ms after; removing and restoring its `export * from './ssg'`,
+52–54 and 126–137 ms; adding and removing an import in `src/hono-base.ts`,
+78–88 and 78–85 ms. A changed `export *` set re-extracts every file that
+imports a name through the barrel, whether or not that name moved: on a copy
+of claude-mem-lite, adding and removing `export * from './lib/git-state.mjs'`
+in `utils.mjs` re-extracted 90 files and took 1,026–1,102 ms against 161–171
+ms before; the only edge that changed was the barrel's own.
 
 SCIP oracle, before and after, on the same copy of each project:
 
@@ -307,6 +312,17 @@ server next starts. The file watcher still starts at the first tool call.
 
 ### Not covered
 
+- An `export * from './x'` written before `x` exists is not followed once `x`
+  appears, until the barrel is edited or the index rebuilt: the files that
+  import through the barrel keep their by-name edges. 0.184.0 also left out
+  the barrel's own `imports` edge to `x` until then.
+- The barrel walk reads a file's imports as its re-exports: `export * as ns
+  from` is followed like `export *`, `export { read as load } from` is
+  followed under `read`, and a plain `import { f }` in an `export *` source is
+  taken as re-exporting `f`.
+- In TypeScript the members of a `namespace` are seen from the whole file, so
+  a call outside `namespace N { const f = … }` also binds that `f` beside a
+  top-level `function f`, as 0.184.0 did.
 - A JavaScript call through a local that destructures a method, `const { read }
   = store; read()` in a file that also defines `function read`, now binds only
   that function, which the local shadows; before, it bound the method
