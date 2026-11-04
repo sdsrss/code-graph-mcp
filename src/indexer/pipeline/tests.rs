@@ -16059,6 +16059,8 @@ fn a_named_reexport_answered_elsewhere_is_not_retried_through_export_star() {
             .collect()
     };
     let mut failures = Vec::new();
+    // No two file names here differ only by case: macOS and Windows fold it,
+    // and `A.js` beside `a.js` was one file there.
     for (label, tree) in [
         (
             "the named target walked first through another barrel",
@@ -16078,8 +16080,8 @@ fn a_named_reexport_answered_elsewhere_is_not_retried_through_export_star() {
                 def("a.js"),
                 def("c.js"),
                 m.clone(),
-                star("index.js", &["A", "m"]),
-                star("A.js", &["a"]),
+                star("index.js", &["pa", "m"]),
+                star("pa.js", &["a"]),
             ],
         ),
         (
@@ -16089,8 +16091,8 @@ fn a_named_reexport_answered_elsewhere_is_not_retried_through_export_star() {
                 def("a.js"),
                 def("c.js"),
                 m.clone(),
-                star("index.js", &["m", "A"]),
-                star("A.js", &["a"]),
+                star("index.js", &["m", "pa"]),
+                star("pa.js", &["a"]),
             ],
         ),
         (
@@ -16101,11 +16103,11 @@ fn a_named_reexport_answered_elsewhere_is_not_retried_through_export_star() {
                 def("c.js"),
                 (
                     "m.js".to_string(),
-                    "export { f } from './B.js';\nexport * from './c.js';\n".to_string(),
+                    "export { f } from './pb.js';\nexport * from './c.js';\n".to_string(),
                 ),
-                star("index.js", &["A", "m"]),
-                star("A.js", &["a"]),
-                star("B.js", &["a"]),
+                star("index.js", &["pa", "m"]),
+                star("pa.js", &["a"]),
+                star("pb.js", &["a"]),
             ],
         ),
     ] {
