@@ -47,9 +47,28 @@ pub(super) enum BackfillOutcome {
     Yielded,
 }
 
+/// How many times the startup repair is tried while another connection holds
+/// the write path, and how long it waits before the second try (doubling).
+pub(super) const STARTUP_REPAIR_ATTEMPTS: u32 = 5;
+const STARTUP_REPAIR_FIRST_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Clears the `embedding_in_progress` flag on drop, so an early return or a panic
 /// releases it.
-struct FlagGuard<'a>(&'a AtomicBool);
+pub(super) struct FlagGuard<'a>(&'a AtomicBool);
+
+/// Claim `in_progress` for the startup repair, waiting while another holder
+/// has it or an incremental has asked the backfill to yield. Such an
+/// incremental waits for the flag to drop and then writes without holding it:
+/// a repair that took the flag in that window wrote beside it (D#738).
+fn claim_for_repair<'a>(
+    in_progress: &'a AtomicBool,
+    yield_requested: &AtomicBool,
+) -> FlagGuard<'a> {
+    while yield_requested.load(Ordering::Acquire) || in_progress.swap(true, Ordering::AcqRel) {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    FlagGuard(in_progress)
+}
 impl Drop for FlagGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
@@ -235,13 +254,60 @@ impl McpServer {
         in_progress: &AtomicBool,
         yield_requested: &AtomicBool,
     ) {
-        while in_progress.swap(true, Ordering::AcqRel) {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        }
-        let _guard = FlagGuard(in_progress);
-        Self::run_startup_repair(db_path);
+        let _guard = Self::run_startup_repair_retrying(
+            db_path,
+            in_progress,
+            yield_requested,
+            &Self::run_startup_repair,
+            STARTUP_REPAIR_FIRST_BACKOFF,
+        );
         if cfg!(feature = "embed-model") {
             Self::run_backfill_reporting_errors(db_path, yield_requested);
+        }
+    }
+
+    /// Run `repair` under a claim of `in_progress` and return the claim, for the
+    /// backfill to run under (D#738).
+    ///
+    /// A busy write path — another connection, such as a CLI incremental,
+    /// committing while the repair writes — is tried again, up to
+    /// [`STARTUP_REPAIR_ATTEMPTS`] times, waiting `first_backoff` and twice as
+    /// long each time with the claim dropped: the repair has no other trigger
+    /// until the next server start (0.185.0's review saw it fail 5 of 5 times
+    /// that way). Any other error, and a panic, end it; the backfill still runs.
+    pub(super) fn run_startup_repair_retrying<'a>(
+        db_path: &Path,
+        in_progress: &'a AtomicBool,
+        yield_requested: &AtomicBool,
+        repair: &dyn Fn(&Path) -> Result<()>,
+        first_backoff: std::time::Duration,
+    ) -> FlagGuard<'a> {
+        let mut backoff = first_backoff;
+        let mut attempt = 1;
+        loop {
+            let guard = claim_for_repair(in_progress, yield_requested);
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| repair(db_path))) {
+                Ok(Ok(())) => return guard,
+                Ok(Err(e)) if super::is_db_busy_error(&e) && attempt < STARTUP_REPAIR_ATTEMPTS => {
+                    tracing::info!(
+                        "[startup-repair] the write path is busy ({}); trying again in {} ms",
+                        e,
+                        backoff.as_millis()
+                    );
+                    drop(guard);
+                    std::thread::sleep(backoff);
+                    backoff *= 2;
+                    attempt += 1;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("[startup-repair] Failed: {}", e);
+                    return guard;
+                }
+                Err(_) => {
+                    tracing::warn!("[startup-repair] Panicked; the backfill still runs");
+                    return guard;
+                }
+            }
         }
     }
 

@@ -309,6 +309,24 @@ fn take_forced_fk_error() -> bool {
     FORCE_FK_ERROR_ONCE.with(|f| f.replace(false))
 }
 
+/// What the startup index thread runs once its index is in (D#711, D#738).
+#[derive(Debug, PartialEq, Eq)]
+enum StartupFollowUp {
+    RepairThenBackfill,
+    Backfill,
+}
+
+/// The startup repair runs once per process, and only after a successful
+/// index: after a failed one `repair_done` stays clear, so the message path
+/// (`spawn_startup_repair`) can still run it.
+fn startup_follow_up(index_ok: bool, repair_done: &AtomicBool) -> StartupFollowUp {
+    if index_ok && !repair_done.swap(true, Ordering::AcqRel) {
+        StartupFollowUp::RepairThenBackfill
+    } else {
+        StartupFollowUp::Backfill
+    }
+}
+
 /// Whether an indexing error is "another connection holds the write path right
 /// now", as opposed to a real failure.
 ///
@@ -1141,14 +1159,17 @@ impl McpServer {
                 // slots it would have reclaimed). Before the backfill, so the context
                 // strings it rebuilds are embedded in the same run; not after a failed
                 // index, as before.
-                if index_ok && !repair_done.swap(true, Ordering::AcqRel) {
-                    Self::run_startup_repair_then_backfill(
+                match startup_follow_up(index_ok, &repair_done) {
+                    StartupFollowUp::RepairThenBackfill => Self::run_startup_repair_then_backfill(
                         &db_path,
                         &embedding_flag,
                         &embedding_yield,
-                    );
-                } else if cfg!(feature = "embed-model") {
-                    let _ = Self::run_guarded_backfill(&db_path, &embedding_flag, &embedding_yield);
+                    ),
+                    StartupFollowUp::Backfill if cfg!(feature = "embed-model") => {
+                        let _ =
+                            Self::run_guarded_backfill(&db_path, &embedding_flag, &embedding_yield);
+                    }
+                    StartupFollowUp::Backfill => {}
                 }
             });
 
@@ -1308,7 +1329,7 @@ impl McpServer {
     /// the embedding cache. Run through
     /// [`Self::run_startup_repair_then_backfill`], which serializes it with the
     /// backfill.
-    fn run_startup_repair(db_path: &Path) {
+    fn run_startup_repair(db_path: &Path) -> Result<()> {
         let outcome = (|| -> Result<(usize, usize, usize, usize, usize)> {
             let db = Database::open_with_vec(db_path)?;
             #[cfg(feature = "embed-model")]
@@ -1360,17 +1381,17 @@ impl McpServer {
             let pruned = crate::storage::queries::gc_embedding_cache(db.conn())?;
             Ok((repaired, reaped, compacted, seeded, pruned))
         })();
-        match outcome {
-            Ok((0, 0, 0, 0, 0)) => {}
-            Ok((repaired, reaped, compacted, seeded, pruned)) => {
+        match outcome? {
+            (0, 0, 0, 0, 0) => {}
+            (repaired, reaped, compacted, seeded, pruned) => {
                 tracing::info!(
                 "[startup-repair] Rebuilt {} NULL context_string rows; reaped {} orphan vectors; \
                  compacted {} vectors; seeded {} cache entries; pruned {} stale",
                 repaired, reaped, compacted, seeded, pruned
             )
             }
-            Err(e) => tracing::warn!("[startup-repair] Failed: {}", e),
         }
+        Ok(())
     }
 
     /// Spawn a background thread to embed nodes that don't yet have vectors.
@@ -9329,6 +9350,176 @@ end
         assert!(
             wait_for_orphan_reaped(&db_path),
             "the repair never ran after the backfill released the flag"
+        );
+    }
+
+    /// D#738: a CLI incremental committing while the startup repair writes made
+    /// it fail with "database is locked", and nothing ran it again until the
+    /// next server start (5/5 in the 0.185.0 review). Another connection holds
+    /// the write path here for longer than the busy timeout; the repair retries
+    /// once it is released.
+    #[test]
+    fn the_startup_repair_retries_while_another_connection_holds_the_write_path() {
+        let (project, db_path) = indexed_project_with_an_orphan_vector();
+        let server = McpServer::new_test_with_project(project.path());
+        let holder = Database::open_with_vec(&db_path).unwrap();
+        holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(6_500));
+            holder.conn().execute_batch("COMMIT").unwrap();
+        });
+        McpServer::run_startup_repair_then_backfill(
+            &db_path,
+            &server.indexing.embedding_in_progress,
+            &server.indexing.embedding_yield,
+        );
+        release.join().unwrap();
+        assert_eq!(
+            orphan_vectors(&db_path),
+            0,
+            "the repair gave up on a busy write path instead of retrying"
+        );
+        assert!(
+            !server
+                .indexing
+                .embedding_in_progress
+                .load(Ordering::Acquire),
+            "the repair's claim on the flag must be released when it returns"
+        );
+    }
+
+    /// D#738: the repair retries only a busy write path, with its claim on the
+    /// flag dropped between attempts; any other error, and a panic, end it, and
+    /// the claim it returns is released on drop (the backfill runs under it).
+    #[test]
+    fn the_startup_repair_retries_only_a_busy_write_path() {
+        let flag = AtomicBool::new(false);
+        let no_yield = AtomicBool::new(false);
+        let path = Path::new("unused.db");
+        let tick = std::time::Duration::from_millis(1);
+        let calls = std::cell::Cell::new(0u32);
+        let busy_twice = |_: &Path| -> Result<()> {
+            calls.set(calls.get() + 1);
+            if calls.get() <= 2 {
+                assert!(flag.load(Ordering::Acquire), "a try runs under the claim");
+                Err(anyhow!("database is locked"))
+            } else {
+                Ok(())
+            }
+        };
+        let guard =
+            McpServer::run_startup_repair_retrying(path, &flag, &no_yield, &busy_twice, tick);
+        assert_eq!(calls.get(), 3);
+        assert!(flag.load(Ordering::Acquire), "returned holding the claim");
+        drop(guard);
+        assert!(!flag.load(Ordering::Acquire), "released on drop");
+
+        calls.set(0);
+        let failing = |_: &Path| -> Result<()> {
+            calls.set(calls.get() + 1);
+            Err(anyhow!("no such table: nodes"))
+        };
+        drop(McpServer::run_startup_repair_retrying(
+            path, &flag, &no_yield, &failing, tick,
+        ));
+        assert_eq!(calls.get(), 1, "a real failure is not retried");
+
+        calls.set(0);
+        let always_busy = |_: &Path| -> Result<()> {
+            calls.set(calls.get() + 1);
+            Err(anyhow!("database is locked"))
+        };
+        drop(McpServer::run_startup_repair_retrying(
+            path,
+            &flag,
+            &no_yield,
+            &always_busy,
+            tick,
+        ));
+        assert_eq!(calls.get(), backfill::STARTUP_REPAIR_ATTEMPTS, "bounded");
+
+        let panics = |_: &Path| -> Result<()> { panic!("repair panicked") };
+        let guard = McpServer::run_startup_repair_retrying(path, &flag, &no_yield, &panics, tick);
+        assert!(
+            flag.load(Ordering::Acquire),
+            "a panic still returns the claim for the backfill"
+        );
+        drop(guard);
+        assert!(!flag.load(Ordering::Acquire));
+    }
+
+    /// D#738 (0.185.0 review, code-read): an incremental that asked a backfill to
+    /// yield waits for the flag to drop and then writes without holding it, so a
+    /// repair that took the flag in that window wrote beside it. The repair waits
+    /// until the request is withdrawn.
+    #[test]
+    fn the_startup_repair_does_not_claim_the_flag_an_incremental_waits_on() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let yield_flag = Arc::new(AtomicBool::new(true));
+        let ran = Arc::new(AtomicBool::new(false));
+        let (f, y, r) = (Arc::clone(&flag), Arc::clone(&yield_flag), Arc::clone(&ran));
+        let repair = std::thread::spawn(move || {
+            let mark = |_: &Path| -> Result<()> {
+                r.store(true, Ordering::Release);
+                Ok(())
+            };
+            drop(McpServer::run_startup_repair_retrying(
+                Path::new("unused.db"),
+                &f,
+                &y,
+                &mark,
+                std::time::Duration::from_millis(1),
+            ));
+        });
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert!(
+            !ran.load(Ordering::Acquire),
+            "the repair ran while an incremental waited"
+        );
+        assert!(!flag.load(Ordering::Acquire), "and took the flag");
+        yield_flag.store(false, Ordering::Release);
+        repair.join().unwrap();
+        assert!(
+            ran.load(Ordering::Acquire),
+            "the repair runs once the request is withdrawn"
+        );
+    }
+
+    /// D#738: which follow-up the startup index thread runs. The repair runs once
+    /// per process and only after a successful index; after a failed one the
+    /// flag stays clear, so the message path can still run it.
+    #[test]
+    fn the_startup_follow_up_runs_the_repair_once_and_only_after_a_good_index() {
+        let done = AtomicBool::new(false);
+        assert_eq!(startup_follow_up(false, &done), StartupFollowUp::Backfill);
+        assert!(
+            !done.load(Ordering::Acquire),
+            "a failed index leaves the repair to the message path"
+        );
+        assert_eq!(
+            startup_follow_up(true, &done),
+            StartupFollowUp::RepairThenBackfill
+        );
+        assert!(done.load(Ordering::Acquire));
+        assert_eq!(
+            startup_follow_up(true, &done),
+            StartupFollowUp::Backfill,
+            "once per process"
+        );
+    }
+
+    /// D#738: the message path marks the repair done, so neither it nor the
+    /// startup index thread starts it a second time.
+    #[test]
+    fn the_message_path_marks_the_startup_repair_done() {
+        let (project, db_path) = indexed_project_with_an_orphan_vector();
+        let server = McpServer::new_test_with_project(project.path());
+        server.spawn_startup_repair(project.path());
+        assert!(server.indexing.startup_repair_done.load(Ordering::Acquire));
+        assert!(wait_for_orphan_reaped(&db_path));
+        assert_eq!(
+            startup_follow_up(true, &server.indexing.startup_repair_done),
+            StartupFollowUp::Backfill
         );
     }
 
