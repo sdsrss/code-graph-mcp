@@ -517,8 +517,6 @@ pub(super) fn snapshot_js_reexports<'a>(
 /// How one file of the run moved, as the walk reads it.
 #[derive(Default)]
 struct Drift {
-    /// Added, deleted or new to the index: every name.
-    all: bool,
     /// Names its own binding or its indirect entry now resolves differently.
     names: HashSet<String>,
     /// Its `export *` sources (as resolved) changed.
@@ -578,9 +576,10 @@ fn shape_of(f: &FileExports, file: &str, paths: &HashSet<String>) -> Shape {
 /// before and after agrees up to the first file whose input differs, and both
 /// walks ask that file, so a walk that asks none answers as before. A moved
 /// `export *` set moves only the names the file does not answer itself.
-/// Also pulled: an importer whose specifier now names another file, and one
-/// whose import the walk serves although the file it names, re-extracted, now
-/// defines the name itself (a rebuild binds that directly). Drops the snapshot.
+/// Also pulled: an importer whose specifier now names another file. One whose
+/// named file, re-extracted, now defines the name itself (a rebuild binds that
+/// directly, without the walk) is the new-duplicate round's module-import arm
+/// (`bare_name_callers_of_new_duplicates`). Drops the snapshot.
 pub(super) fn importers_of_js_reexport_drift(conn: &rusqlite::Connection) -> Result<Vec<String>> {
     let has_snapshot: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name = 'cg_js_entries_before')",
@@ -661,9 +660,10 @@ pub(super) fn importers_of_js_reexport_drift(conn: &rusqlite::Connection) -> Res
     }
     let mut walker = JsExports::default();
     let mut drift: HashMap<String, Drift> = HashMap::new();
-    for (path, existed) in &in_run {
-        if !*existed || !now_paths.contains(path) {
-            drift.entry(path.clone()).or_default().all = true;
+    for path in in_run.keys() {
+        // A deleted file is asked by no walk over the current files; one new to
+        // the index compares with an empty snapshot.
+        if !now_paths.contains(path) {
             continue;
         }
         let was = before.remove(path).unwrap_or_default();
@@ -709,10 +709,6 @@ pub(super) fn importers_of_js_reexport_drift(conn: &rusqlite::Connection) -> Res
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut has_node = conn.prepare_cached(
-        "SELECT EXISTS(SELECT 1 FROM files f CROSS JOIN nodes n ON n.file_id = f.id
-                       WHERE f.path = ?1 AND n.name = ?2)",
-    )?;
     let mut visited: HashMap<(String, String), HashSet<(String, String)>> = HashMap::new();
     let mut out: BTreeSet<String> = BTreeSet::new();
     for (importer, spec, name, target_file) in rows {
@@ -731,10 +727,6 @@ pub(super) fn importers_of_js_reexport_drift(conn: &rusqlite::Connection) -> Res
             // Bound in the file its specifier names: no walk served it.
             continue;
         }
-        if in_run.contains_key(&file) && has_node.query_row([&file, &name], |r| r.get(0))? {
-            out.insert(importer);
-            continue;
-        }
         if drift.is_empty() {
             continue;
         }
@@ -745,8 +737,7 @@ pub(super) fn importers_of_js_reexport_drift(conn: &rusqlite::Connection) -> Res
         }
         let moved = visited[&key].iter().any(|(g, m)| {
             drift.get(g).is_some_and(|d| {
-                d.all
-                    || d.names.contains(m)
+                d.names.contains(m)
                     || (d.stars && m != "default" && !walker.answers_without_stars(g, m))
             })
         });

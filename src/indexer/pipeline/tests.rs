@@ -16291,9 +16291,64 @@ fn a_js_reexport_resolves_as_node_does() {
         v.iter().map(|(p, b)| (p.to_string(), b.clone())).collect()
     };
     // (label, files beside `app.js` unless one is given, calls of `main`,
-    // imports of app.js's `<module>` other than `<external>` ones)
+    // imports of app.js's `<module>` other than `<external>` ones; empty for
+    // the rows Node rejects, where the imports bind by name as before)
     type Row<'a> = (&'a str, Vec<(String, String)>, Vec<&'a str>, Vec<&'a str>);
     let rows: Vec<Row> = vec![
+        (
+            "s09 an export * cycle",
+            own(&[
+                ("index.js", star(&["p", "q"])),
+                ("p.js", star(&["q"])),
+                ("q.js", star(&["p", "a"])),
+                ("a.js", d("a")),
+            ]),
+            vec!["a.js.f"],
+            vec!["a.js.f"],
+        ),
+        (
+            "s10 a barrel that names itself",
+            own(&[("index.js", star(&["index", "a"])), ("a.js", d("a"))]),
+            vec!["a.js.f"],
+            vec!["a.js.f"],
+        ),
+        // Node rejects the next three; ECMAScript binds nothing.
+        (
+            "an ambiguous export * source is not masked by a later one",
+            own(&[
+                ("index.js", star(&["p", "z"])),
+                ("p.js", star(&["x", "y"])),
+                ("x.js", d("x")),
+                ("y.js", d("y")),
+                ("z.js", d("z")),
+            ]),
+            vec![],
+            vec![],
+        ),
+        (
+            "export * passes no default",
+            own(&[
+                (
+                    "app.js",
+                    "import { default as g } from './index.js';\nexport function main() { return g(); }\n"
+                        .to_string(),
+                ),
+                ("index.js", star(&["a"])),
+                ("a.js", "export default function f() { return 'a'; }\n".to_string()),
+            ]),
+            vec![],
+            vec![],
+        ),
+        (
+            "a re-export from a package is no answer of another source's",
+            own(&[
+                ("index.js", star(&["m", "b"])),
+                ("m.js", "export { f } from 'some-pkg';\n".to_string()),
+                ("b.js", d("b")),
+            ]),
+            vec![],
+            vec![],
+        ),
         (
             "s13 star to named to star",
             own(&[
@@ -16471,11 +16526,26 @@ fn a_js_reexport_resolves_as_node_does() {
         };
         let calls = pick("app.js.main --calls--> ");
         let imports = pick("app.js.<module> --imports--> ");
-        if calls != want_calls || imports != want_imports {
+        if calls != want_calls || (!want_imports.is_empty() && imports != want_imports) {
             failures.push(format!(
                 "{label}: calls {calls:?} (want {want_calls:?}), imports {imports:?} (want {want_imports:?})"
             ));
         }
+    }
+    // Calling a namespace binds nothing and waits for nothing.
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "app.js",
+            "import { f as g } from './index.js';\nexport function main() { return g(); }\n",
+        ),
+        ("index.js", "export * as f from './a.js';\n"),
+        ("a.js", "export function f() { return 'a'; }\n"),
+    ]);
+    let pending = crate::storage::queries::count_pending_unresolved_calls(db.conn()).unwrap();
+    if pending != 0 {
+        failures.push(format!(
+            "a namespace call was buffered: {pending} pending row(s)"
+        ));
     }
     // CommonJS: `module.exports = require('./mid.js')` forwards the module.
     let (_p, _d, db) = fresh_index_of(&[
@@ -16592,6 +16662,25 @@ fn an_export_star_written_before_its_file_follows_the_file_when_it_appears() {
         let edges = edge_set(&db);
         assert!(edges.contains(&want.to_string()), "{label}: {edges:#?}");
     }
+    // The barrel's own `imports` edge to the file: with one `init` elsewhere
+    // the importer's by-name binding is that one, so only re-extracting the
+    // barrel (Phase 0-pre) gives it.
+    let before: &[(&str, &str)] = &[
+        ("app.js", app),
+        ("index.js", "export * from './late.js';\n"),
+        ("crud.js", "export function init() { return 1; }\n"),
+    ];
+    let after: &[(&str, Option<&str>)] =
+        &[("late.js", Some("export function init() { return 3; }\n"))];
+    assert_incremental_matches_rebuild(before, after);
+    let (project, _d, db) = fresh_index_of(before);
+    fs::write(project.path().join("late.js"), after[0].1.unwrap()).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert!(
+        edge_set(&db).contains(&"index.js.<module> --imports--> late.js.<module>".to_string()),
+        "{:#?}",
+        edge_set(&db)
+    );
 }
 
 /// D#740: a random barrel graph of the round-4 fuzz (`fuzz.py`, seed 7, case
@@ -16672,11 +16761,43 @@ fn a_requeued_import_through_a_renamed_reexport_binds_as_a_rebuild_does() {
     ] {
         assert!(edges.contains(&want.to_string()), "{want}: {edges:#?}");
     }
+    assert!(
+        !edges.contains(&"app.js.main --calls--> c.js.f".to_string()),
+        "the call bound by name to another `f` must be pruned: {edges:#?}"
+    );
     assert_incremental_matches_rebuild(
         before,
         &[(
             "a.js",
             Some("export function r() { return 'a2'; }\n// edited\n"),
         )],
+    );
+    // Deleting `a.js` requeues the edge through the deferred pass, where it
+    // must be resolved as `f` (by name, to `c.js`), not as `r` (`b.js`).
+    assert_incremental_matches_rebuild(before, &[("a.js", None)]);
+}
+
+/// D#740: an import the walk served binds the named file's own node on a
+/// rebuild once that file defines the name, exported or not (the direct
+/// lookup takes any node of the name). Gaining one is no change to what the
+/// file exports; the round for a new same-named definition pulls the
+/// importer, which makes no call of the name here.
+#[test]
+fn a_barrel_gaining_a_namesake_of_its_own_rebinds_its_importers() {
+    let before: &[(&str, &str)] = &[
+        (
+            "app.js",
+            "import { f } from './index.js';\nexport const keep = [f];\n",
+        ),
+        ("index.js", "export * from './a.js';\n"),
+        ("a.js", "export function f() { return 'a'; }\n"),
+    ];
+    let gained = "export * from './a.js';\nfunction f() { return 'own'; }\n";
+    assert_incremental_matches_rebuild(before, &[("index.js", Some(gained))]);
+    let (_p, _d, db) = fresh_index_of(&[before[0], ("index.js", gained), before[2]]);
+    assert!(
+        edge_set(&db).contains(&"app.js.<module> --imports--> index.js.f".to_string()),
+        "{:#?}",
+        edge_set(&db)
     );
 }
