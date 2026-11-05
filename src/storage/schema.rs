@@ -228,6 +228,22 @@ CREATE TABLE IF NOT EXISTS cpp_fields (
     arrow_type TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_cpp_fields_class ON cpp_fields(class_id);
+
+-- The export entries of each JS/TS file, in source order (`ord`), recorded from
+-- the file's own text: what the re-export walk reads (D#740). `kind` is `local`
+-- (`name` is the file's binding `target`), `indirect` (`name` is what `spec`
+-- exports as `target`, its namespace when `target` is NULL) or `star` (`export *
+-- from spec`, `name` and `target` NULL). Keyed on the file's `<module>` node, so
+-- re-indexing or deleting the file clears its rows. Additive like `cpp_fields`.
+CREATE TABLE IF NOT EXISTS js_export_entries (
+    module_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    ord       INTEGER NOT NULL,
+    kind      TEXT NOT NULL,
+    name      TEXT,
+    target    TEXT,
+    spec      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_js_export_entries_module ON js_export_entries(module_id);
 "#
     )
 }

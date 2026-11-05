@@ -1095,6 +1095,41 @@ pub fn insert_cpp_fields(conn: &Connection, rows: &[CppFieldRow]) -> Result<()> 
     Ok(())
 }
 
+/// Record a JS/TS file's export entries against its `<module>` node, in order.
+pub fn insert_js_export_entries(
+    conn: &Connection,
+    module_id: i64,
+    entries: &[crate::parser::relations::JsExportEntry],
+) -> Result<()> {
+    use crate::parser::relations::JsExportEntry;
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO js_export_entries (module_id, ord, kind, name, target, spec)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for (ord, e) in entries.iter().enumerate() {
+        let (kind, name, target, spec) = match e {
+            JsExportEntry::Local { export, local } => {
+                ("local", Some(export.as_str()), Some(local.as_str()), None)
+            }
+            JsExportEntry::Indirect {
+                export,
+                spec,
+                import,
+            } => (
+                "indirect",
+                Some(export.as_str()),
+                import.as_deref(),
+                Some(spec.as_str()),
+            ),
+            JsExportEntry::Star { spec } => ("star", None, None, Some(spec.as_str())),
+        };
+        stmt.execute(rusqlite::params![
+            module_id, ord as i64, kind, name, target, spec
+        ])?;
+    }
+    Ok(())
+}
+
 /// Every recorded C++ field.
 pub fn cpp_fields(conn: &Connection) -> Result<Vec<CppFieldRow>> {
     let mut stmt = conn.prepare("SELECT class_id, field, dot_type, arrow_type FROM cpp_fields")?;

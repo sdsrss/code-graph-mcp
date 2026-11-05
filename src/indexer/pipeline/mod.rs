@@ -19,6 +19,7 @@ mod context;
 mod embed;
 mod in_flight;
 mod index_files;
+mod js_exports;
 mod js_modules;
 mod python_modules;
 mod resolve;
@@ -859,7 +860,7 @@ fn fan_out_to_new_duplicate_definitions(
     // Importers of a Python module whose re-exports the run moved (D#370(a)),
     // and of a JS/TS file whose re-exports it moved (0.185.0 review, H1).
     let reexported = resolve::importers_of_python_reexport_drift(db.conn())?;
-    let js_reexported = resolve::importers_of_js_reexport_drift(db.conn())?;
+    let js_reexported = js_exports::importers_of_js_reexport_drift(db.conn())?;
     let callers: Vec<String> = typed
         .iter()
         .chain(bare.iter())
@@ -897,7 +898,7 @@ fn fan_out_to_new_duplicate_definitions(
     let mut pulled = callers.len();
     for _ in 0..REEXPORT_FANOUT_ROUNDS {
         let mut more = resolve::importers_of_python_reexport_drift(db.conn())?;
-        more.extend(resolve::importers_of_js_reexport_drift(db.conn())?);
+        more.extend(js_exports::importers_of_js_reexport_drift(db.conn())?);
         more.sort_unstable();
         more.dedup();
         if more.is_empty() {

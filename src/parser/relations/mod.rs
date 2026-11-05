@@ -54,6 +54,8 @@ mod helpers;
 mod imports;
 mod inherits;
 mod java;
+mod js_export_entries;
+pub use js_export_entries::{js_export_entries, JsExportEntry};
 mod member;
 pub(crate) use member::js_member_root_is_api;
 mod python;

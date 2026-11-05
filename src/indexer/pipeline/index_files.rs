@@ -32,7 +32,8 @@ use crate::embedding::context::{build_context_string, NodeContext};
 use crate::embedding::model::EmbeddingModel;
 use crate::indexer::merkle::hash_file;
 use crate::parser::relations::{
-    cpp_class_fields, extract_relations_from_tree, CppField, ParsedRelation,
+    cpp_class_fields, extract_relations_from_tree, js_export_entries, CppField, JsExportEntry,
+    ParsedRelation,
 };
 use crate::parser::treesitter::{extract_nodes_from_tree, parse_tree, LexicalScope};
 use crate::storage::db::Database;
@@ -261,6 +262,8 @@ struct FilePreParsed {
     relations: Vec<ParsedRelation>,
     /// C++ only: each class body's typed fields (`record_cpp_fields`).
     cpp_fields: Vec<CppField>,
+    /// JS/TS only: the file's export entries (`record_js_export_entries`).
+    js_exports: Vec<JsExportEntry>,
     /// This file's tree carried ERROR node(s). Travels beside the `parse_errors`
     /// counter rather than replacing it: the counter is this run's total, this
     /// flag is which file, and only the second can be folded into the index's
@@ -279,6 +282,7 @@ struct FileParsed {
     language: String,
     relations: Vec<ParsedRelation>,
     cpp_fields: Vec<CppField>,
+    js_exports: Vec<JsExportEntry>,
     file_id: i64,
     node_ids: Vec<i64>,
     node_names: Vec<String>,
@@ -612,6 +616,11 @@ fn pre_parse_batch(
         } else {
             Vec::new()
         };
+        let js_exports = if matches!(language, "javascript" | "typescript" | "tsx") {
+            js_export_entries(&tree, &source)
+        } else {
+            Vec::new()
+        };
 
         PreParseOutcome::Parsed(Box::new(FilePreParsed {
             rel_path: rel_path.clone(),
@@ -624,6 +633,7 @@ fn pre_parse_batch(
             has_parse_errors,
             relations,
             cpp_fields,
+            js_exports,
         }))
     };
     let outcomes: Vec<PreParseOutcome> = match parse_pool() {
@@ -806,6 +816,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             language: pp.language,
             relations: pp.relations,
             cpp_fields: pp.cpp_fields,
+            js_exports: pp.js_exports,
             file_id,
             node_ids,
             node_names,
@@ -1305,6 +1316,15 @@ fn existence_change_dependents(
         }
     }
 
+    // A JS/TS file appearing or vanishing can change the file another one's
+    // export entry names (D#739); that file re-extracts its own edges here and
+    // the fan-out after the run follows its importers.
+    for dependent in super::js_exports::export_entry_dependents(db.conn(), files, delete_paths)? {
+        if !in_run.contains(dependent.as_str()) && !deleting.contains(dependent.as_str()) {
+            extra.insert(dependent);
+        }
+    }
+
     for importer in python_root_change_importers(db, files, delete_paths)? {
         if !in_run.contains(importer.as_str()) && !deleting.contains(importer.as_str()) {
             extra.insert(importer);
@@ -1663,6 +1683,25 @@ fn record_cpp_fields(db: &Database, pf: &FileParsed) -> Result<()> {
     crate::storage::queries::insert_cpp_fields(db.conn(), &rows)
 }
 
+/// Record a JS/TS file's export entries against its `<module>` node
+/// (`js_export_entries`), for the re-export walk (D#740). Written in the
+/// file's own batch, so every file's entries are in before the deferred pass
+/// walks them.
+fn record_js_export_entries(db: &Database, pf: &FileParsed) -> Result<()> {
+    if pf.js_exports.is_empty() {
+        return Ok(());
+    }
+    let Some(module_id) = pf
+        .node_names
+        .iter()
+        .position(|n| n == "<module>")
+        .map(|i| pf.node_ids[i])
+    else {
+        return Ok(());
+    };
+    crate::storage::queries::insert_js_export_entries(db.conn(), module_id, &pf.js_exports)
+}
+
 /// Phase 2 for ONE batch: resolve every relation Phase 1a extracted from the
 /// batch's files and insert the edges it can resolve, deferring the rest.
 ///
@@ -1747,6 +1786,7 @@ fn resolve_batch_relations(
         if pf.language == "cpp" {
             record_cpp_fields(db, pf)?;
         }
+        record_js_export_entries(db, pf)?;
         let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
         // Same-file qualified names, for C++ implicit-`this` member lookup below.
         let local_qualified: HashMap<i64, &str> = pf
@@ -2856,7 +2896,10 @@ Restart every code-graph server on this project so they run one version.",
             db.conn(),
             files.iter().chain(delete_paths.iter()),
         )?;
-        super::resolve::snapshot_js_reexports(db.conn(), files.iter().chain(delete_paths.iter()))?;
+        super::js_exports::snapshot_js_reexports(
+            db.conn(),
+            files.iter().chain(delete_paths.iter()),
+        )?;
     }
     // This run's token in the in-flight marker, held until its last graph phase
     // has run (`super::in_flight`; retired near the end of this function). An
@@ -4013,69 +4056,6 @@ fn settle_python_reexports<'a>(
     }
 }
 
-/// The JS named imports the deferred pass parked because the file their
-/// specifier resolves to defines no node of their name (D#714 A2), bound to
-/// what that file re-exports under it ([`js_import_edge_targets`]). Asked again
-/// until a round binds nothing, as [`settle_python_reexports`] is: a re-export
-/// of a re-export answers only once the inner one is bound. What no round
-/// answers stays in `waiting` for the pass to bind as it did before.
-fn settle_js_reexports(
-    db: &Database,
-    waiting: &mut Vec<(&DeferredRelation, Vec<i64>, String)>,
-    all_file_paths: &HashSet<String>,
-    name_to_ids: &HashMap<String, Vec<i64>>,
-    node_id_to_path: &HashMap<i64, String>,
-) -> Result<usize> {
-    let mut edges_created = 0usize;
-    let mut exports = super::resolve::JsExports::default();
-    let parked = waiting.len();
-    let mut rounds = 0usize;
-    loop {
-        rounds += 1;
-        let mut bound = false;
-        let mut left = Vec::with_capacity(waiting.len());
-        for (d, source_ids, file) in waiting.drain(..) {
-            let targets = super::resolve::js_import_edge_targets(
-                db.conn(),
-                &mut exports,
-                file.clone(),
-                &d.target_name,
-                all_file_paths,
-                name_to_ids,
-                node_id_to_path,
-            )?;
-            if targets.is_empty() {
-                left.push((d, source_ids, file));
-                continue;
-            }
-            edges_created += insert_relation_edges(
-                db,
-                &source_ids,
-                &targets,
-                &d.relation,
-                d.metadata.as_deref(),
-                false,
-            )?;
-            exports.forget(&d.rel_path);
-            bound = true;
-        }
-        *waiting = left;
-        if !bound || waiting.is_empty() {
-            if parked > 0 {
-                tracing::info!(
-                    "[index] Phase 2b-final: {} JS import(s) waited on a re-export, {} bound \
-                     ({} edge(s)) in {} round(s)",
-                    parked,
-                    parked - waiting.len(),
-                    edges_created,
-                    rounds
-                );
-            }
-            return Ok(edges_created);
-        }
-    }
-}
-
 /// Phase 2b-final: post-loop resolution for `DeferredRelation`s (audit
 /// 2026-08-02 P0-1).
 ///
@@ -4104,7 +4084,7 @@ fn resolve_deferred_relations(
     let mut classes = ProjectClassNames::default();
     let mut py_modules = super::resolve::ProjectPythonModules::new(python_module_map);
     let mut callable_ids: Option<HashSet<i64>> = None;
-    let mut js_exports = super::resolve::JsExports::default();
+    let mut js_exports = super::js_exports::JsExports::default();
 
     // Containment layer for dead ids (audit 2026-08-16 P0-1). Both id sources
     // this pass inserts from are SNAPSHOTS taken earlier in the run: the name map
@@ -4179,7 +4159,6 @@ fn resolve_deferred_relations(
         .filter(|d| d.relation != REL_CALLS)
         .collect();
     let mut reexport_wait: Vec<(&DeferredRelation, Vec<i64>, Vec<String>)> = Vec::new();
-    let mut js_reexport_wait: Vec<(&DeferredRelation, Vec<i64>, String)> = Vec::new();
     let mut waited: HashSet<*const DeferredRelation> = HashSet::new();
     let mut calls_queued = false;
     let mut next = 0usize;
@@ -4201,18 +4180,10 @@ fn resolve_deferred_relations(
                 &mut relative_bound,
                 python_module_map,
             )?;
-            edges_created += settle_js_reexports(
-                db,
-                &mut js_reexport_wait,
-                all_file_paths,
-                &name_to_ids,
-                &node_id_to_path,
-            )?;
             for d in reexport_wait
                 .drain(..)
                 .map(|(d, _, _)| d)
                 .chain(relative_bound)
-                .chain(js_reexport_wait.drain(..).map(|(d, _, _)| d))
             {
                 waited.insert(d);
                 queue.push(d);
@@ -4297,7 +4268,7 @@ fn resolve_deferred_relations(
             if let Some(CalleeMeta::Import { module, export }) =
                 parse_callee_metadata(d.metadata.as_deref())
             {
-                match super::resolve::js_import_targets(
+                match super::js_exports::js_import_targets(
                     db.conn(),
                     &mut js_exports,
                     &d.rel_path,
@@ -4482,10 +4453,11 @@ fn resolve_deferred_relations(
         // 3. JS/TS relative-specifier resolution.
         if let Some(meta) = import_meta.as_ref() {
             if let Some(js_module) = meta.get("js_module").and_then(|v| v.as_str()) {
+                let imported = super::js_exports::js_imported_name(meta, &d.target_name);
                 if let Some(targets) = resolve_js_module_targets(
                     js_module,
                     &d.rel_path,
-                    &d.target_name,
+                    imported,
                     all_file_paths,
                     &name_to_ids,
                     &node_id_to_path,
@@ -4501,20 +4473,41 @@ fn resolve_deferred_relations(
                     continue;
                 }
                 // A named import of a name the file does not define may be one
-                // it re-exports (D#714 A2): `import { init } from './index.js'`
-                // names `index.js`'s `export { init } from './crud.js'`. That
-                // re-export's own edge may be among this pass's, so the miss
-                // waits until every other relation is in, and binds as below
-                // only when no re-export answers it then.
-                if d.relation == REL_IMPORTS
-                    && meta.get("q").is_none()
-                    && !waited.contains(&(queued as *const DeferredRelation))
-                {
+                // it re-exports (D#714 A2, D#740): `import { init } from
+                // './index.js'` names `index.js`'s `export { init } from
+                // './crud.js'`. Every file's export entries are in by now, so
+                // one walk answers it; what it cannot answer binds as below.
+                if d.relation == REL_IMPORTS && meta.get("q").is_none() {
                     if let Some(file) =
                         resolve_js_specifier_path(js_module, &d.rel_path, all_file_paths)
                     {
-                        js_reexport_wait.push((queued, source_ids, file));
-                        continue;
+                        if let Some((targets, bound)) = super::js_exports::js_import_edge_targets(
+                            db.conn(),
+                            &mut js_exports,
+                            &file,
+                            imported,
+                            all_file_paths,
+                            &name_to_ids,
+                            &node_id_to_path,
+                        )? {
+                            let metadata = if bound == imported {
+                                d.metadata.clone()
+                            } else {
+                                super::js_exports::with_imported_name(
+                                    d.metadata.as_deref(),
+                                    imported,
+                                )
+                            };
+                            edges_created += insert_relation_edges(
+                                db,
+                                &source_ids,
+                                &targets,
+                                &d.relation,
+                                metadata.as_deref(),
+                                false,
+                            )?;
+                            continue;
+                        }
                     }
                 }
             }
