@@ -761,6 +761,14 @@ mod tests {
             ("javascript", "exports = {};\nexports.f = require('./b').f;\nmodule.exports = exports;", vec![indirect("f", "./b", Some("f"))]),
             ("javascript", "module.exports = { g: require('./a').g };\nexports.f = require('./b').f;\nmodule.exports = exports;", vec![indirect("f", "./b", Some("f"))]),
             ("javascript", "module.exports = { g: require('./b').g };\nexports = module.exports;\nexports.f = require('./a').f;", vec![indirect("g", "./b", Some("g")), indirect("f", "./a", Some("f"))]),
+            // Which object each name holds across reassignments (third
+            // pre-tag review of 0.186.0, LOW-4; each checked with `node`): a
+            // chain that sets both names leaves no detached object; `exports`
+            // keeps naming the first object however often `module.exports`
+            // moves on, and that object holds what was written to it before.
+            ("javascript", "module.exports = { g: 1 };\nexports = module.exports = { f: require('./a').f };\nexports.f = require('./b').f;", vec![indirect("f", "./b", Some("f"))]),
+            ("javascript", "exports.f = require('./a').f;\nmodule.exports = { g: 1 };\nmodule.exports = { h: 1 };\nmodule.exports = exports;", vec![indirect("f", "./a", Some("f"))]),
+            ("javascript", "exports.f = require('./a').f;\nmodule.exports = { g: 1 };\nmodule.exports = exports;", vec![indirect("f", "./a", Some("f"))]),
             ("javascript", "module.exports = { f: require('./a').f, f: require('./b').f };", vec![indirect("f", "./b", Some("f"))]),
             ("javascript", "module.exports = { f: require('./b').f, ...require('./a') };", vec![star("./a")]),
             ("javascript", "module.exports = { ...require('./a'), f: require('./b').f };", vec![star("./a"), indirect("f", "./b", Some("f"))]),

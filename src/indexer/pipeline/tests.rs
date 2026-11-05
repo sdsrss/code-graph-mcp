@@ -17285,4 +17285,34 @@ fn a_bare_call_through_a_renamed_binding_follows_its_import_when_the_binding_mov
             "{rows:#?}"
         );
     }
+    // Two such imports of one file whose bindings both move: the importer is
+    // recorded once (third pre-tag review of 0.186.0, LOW-3).
+    let rows = assert_incremental_graph_matches_rebuild(
+        &[
+            (
+                "b.js",
+                "import { f, k } from './d.js';\nexport function use() { return f() + k(); }\n",
+            ),
+            (
+                "c.js",
+                "export function f() { return 'decoy-f'; }\nexport function r() { return 'decoy-r'; }\nexport function s() { return 'decoy-s'; }\n",
+            ),
+            (
+                "d.js",
+                "function r() { return 1; }\nfunction s() { return 2; }\nexport { r as f, s as k };\n",
+            ),
+        ],
+        &[(
+            "d.js",
+            Some("export function f() { return 1; }\nexport function k() { return 2; }\n"),
+        )],
+    );
+    for callee in ["d.js.f", "d.js.k"] {
+        assert!(
+            rows.iter().any(
+                |r| r.starts_with("b.js.use --calls[") && r.ends_with(&format!("--> {callee}"))
+            ),
+            "{rows:#?}"
+        );
+    }
 }
