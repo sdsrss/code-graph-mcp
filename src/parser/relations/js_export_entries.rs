@@ -477,17 +477,21 @@ fn pattern_names(node: &tree_sitter::Node, source: &str, out: &mut Vec<String>, 
 
 /// The CommonJS writes of a file that forward another module, applied in
 /// order as its top level runs (pre-tag review of 0.186.0, MEDIUM-3: read as
-/// ESM entries, a name written twice kept its first write): the last write of
-/// a name wins; `module.exports = …` replaces everything before it and leaves
-/// `exports` naming the old object, unless the same chain rebinds it
-/// (`exports = module.exports = …`); rebinding `exports` alone exports
-/// nothing. A file's own values exported this way are `exports` edges already
-/// (the exports axis).
+/// ESM entries, a name written twice kept its first write). Two objects, as
+/// Node has them: the one `module.exports` holds, which the module exports,
+/// and the one the `exports` variable names, the same object until either is
+/// reassigned. The last write of a name wins; `module.exports = …` replaces
+/// the exported object, and a write to `exports` after that goes to the old
+/// one until `module.exports = exports` or `exports = module.exports` makes
+/// them one again (second review, LOW-2: writes made while `exports` named
+/// its own object were dropped). A file's own values exported this way are
+/// `exports` edges already (the exports axis).
 #[derive(Default)]
 struct CommonJs {
+    /// The object `module.exports` holds.
     entries: Vec<JsExportEntry>,
-    /// `exports` no longer names `module.exports`.
-    detached: bool,
+    /// The object `exports` names, when that is another one.
+    alias: Option<Vec<JsExportEntry>>,
 }
 
 impl CommonJs {
@@ -524,16 +528,33 @@ impl CommonJs {
                     break r;
                 }
             };
-            // `exports = module.exports`: both name one object again.
-            if matches!(node_text(&value, source), "module.exports" | "exports") {
-                self.detached = false;
-                return;
+            match node_text(&value, source) {
+                // The module exports the object `exports` names.
+                "exports" if module => {
+                    if let Some(a) = self.alias.take() {
+                        self.entries = a;
+                    }
+                    return;
+                }
+                // `exports` names the exported object again.
+                "module.exports" if alias => {
+                    self.alias = None;
+                    return;
+                }
+                "exports" | "module.exports" => return,
+                _ => {}
             }
-            if module {
-                self.entries.clear();
-                whole_exports_entries(&value, source, imported, &mut self.entries);
+            let mut assigned = Vec::new();
+            whole_exports_entries(&value, source, imported, &mut assigned);
+            if module && alias {
+                self.entries = assigned;
+                self.alias = None;
+            } else if module {
+                let old = std::mem::replace(&mut self.entries, assigned);
+                self.alias.get_or_insert(old);
+            } else {
+                self.alias = Some(assigned);
             }
-            self.detached = !(module && alias);
             return;
         }
         if left.kind() != "member_expression" {
@@ -545,13 +566,13 @@ impl CommonJs {
         ) else {
             return;
         };
-        match node_text(&object, source) {
-            "module.exports" => {}
-            "exports" if !self.detached => {}
+        let target = match (node_text(&object, source), &mut self.alias) {
+            ("module.exports", _) | ("exports", None) => &mut self.entries,
+            ("exports", Some(a)) => a,
             _ => return,
-        }
+        };
         let export = node_text(&property, source).to_string();
-        write_export(&mut self.entries, export, &right, source, imported);
+        write_export(target, export, &right, source, imported);
     }
 }
 
@@ -736,6 +757,9 @@ mod tests {
             ("javascript", "exports = module.exports = { f: require('./a').f };\nexports.g = require('./b').g;", vec![indirect("f", "./a", Some("f")), indirect("g", "./b", Some("g"))]),
             ("javascript", "module.exports = { f: require('./a').f };\nmodule.exports.g = require('./b').g;", vec![indirect("f", "./a", Some("f")), indirect("g", "./b", Some("g"))]),
             ("javascript", "exports = { f: require('./a').f };", vec![]),
+            ("javascript", "exports = { g: 1 };\nexports.f = require('./b').f;", vec![]),
+            ("javascript", "exports = {};\nexports.f = require('./b').f;\nmodule.exports = exports;", vec![indirect("f", "./b", Some("f"))]),
+            ("javascript", "module.exports = { g: require('./a').g };\nexports.f = require('./b').f;\nmodule.exports = exports;", vec![indirect("f", "./b", Some("f"))]),
             ("javascript", "module.exports = { g: require('./b').g };\nexports = module.exports;\nexports.f = require('./a').f;", vec![indirect("g", "./b", Some("g")), indirect("f", "./a", Some("f"))]),
             ("javascript", "module.exports = { f: require('./a').f, f: require('./b').f };", vec![indirect("f", "./b", Some("f"))]),
             ("javascript", "module.exports = { f: require('./b').f, ...require('./a') };", vec![star("./a")]),

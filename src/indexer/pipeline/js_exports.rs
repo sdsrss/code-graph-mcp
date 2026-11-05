@@ -640,6 +640,48 @@ fn shape_of(
 /// by the walk (`export { r as f }` there), so the walk judges it. Drops the
 /// snapshot.
 pub(super) fn importers_of_js_reexport_drift(conn: &rusqlite::Connection) -> Result<Vec<String>> {
+    let mut out: BTreeSet<String> = take_requeued_walk_importers(conn)?;
+    out.extend(importers_of_drift(conn)?);
+    Ok(out.into_iter().collect())
+}
+
+/// Record that Phase 0 requeued an `imports` edge of `importer`, a file
+/// outside the run, that the walk had bound under another name than the one
+/// it imports (second pre-tag review of 0.186.0, HIGH-1). The file's bare
+/// calls of that name went to the same node by this import, and Phase 0
+/// requeues them under the node's old name, which a rebuild never asks: `f()`
+/// bound through `export { r as f }` was lost, or bound another file's `r`,
+/// once `r` became `f`. Read by [`importers_of_js_reexport_drift`].
+pub(super) fn requeued_walk_import(conn: &rusqlite::Connection, importer: &str) -> Result<()> {
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS cg_js_requeued (path TEXT PRIMARY KEY);")?;
+    conn.execute(
+        "INSERT OR IGNORE INTO temp.cg_js_requeued (path) VALUES (?1)",
+        [importer],
+    )?;
+    Ok(())
+}
+
+/// The importers [`requeued_walk_import`] recorded; drops the record.
+fn take_requeued_walk_importers(conn: &rusqlite::Connection) -> Result<BTreeSet<String>> {
+    let recorded: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name = 'cg_js_requeued')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !recorded {
+        return Ok(BTreeSet::new());
+    }
+    let paths = conn
+        .prepare("SELECT path FROM temp.cg_js_requeued")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<BTreeSet<String>>>()?;
+    conn.execute_batch("DROP TABLE temp.cg_js_requeued;")?;
+    Ok(paths)
+}
+
+/// [`importers_of_js_reexport_drift`]'s comparison of the run's files with
+/// their snapshot.
+fn importers_of_drift(conn: &rusqlite::Connection) -> Result<Vec<String>> {
     let has_snapshot: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name = 'cg_js_entries_before')",
         [],

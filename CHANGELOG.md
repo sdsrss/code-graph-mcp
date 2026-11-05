@@ -33,10 +33,12 @@ name is resolved through them as ECMAScript's `ResolveExport` does:
   `export function* g`, `export var v`, `export declare function f` are read;
 - CommonJS `module.exports = require('./x')`, `module.exports = {
   ...require('./x') }`, and `exports.y = x` or `module.exports = { y: x }`
-  where `x` was required, forward to that file. The writes apply in the
-  order Node runs them: the last write of a name wins, `module.exports = …`
-  replaces everything written before it, and an `exports.y = …` after that
-  exports nothing (`exports` still names the old object);
+  where `x` was required, forward to that file. These forwarding writes
+  apply in the order Node runs them: the last one of a name wins,
+  `module.exports = …` replaces the ones before it, and an `exports.y = …`
+  after that exports nothing (`exports` still names the old object) until
+  `module.exports = exports` or `exports = module.exports` joins the two
+  again;
 - there is no bound of eight files (the walk gives up past 256 links); a
   cycle of `export *` ends where it began; `export *` passes no `default`;
   two `export *` sources that resolve a name differently make it ambiguous
@@ -73,7 +75,10 @@ instead of under `base.ts`'s `jsx`.
 - An import bound through a renamed re-export follows the file its walk ends
   in: writing `export { helper as h }` before `function helper`, or turning
   the bound `function r` into `let r`, re-binds its importers as a rebuild
-  does.
+  does. So do the bare calls bound through such an import when the binding
+  is renamed to the exported name (`function r() {}` with `export { r as f }`
+  becoming `export function f() {}`): those were lost, or bound another
+  file's `r`.
 - `export * from './x'` written before `x` exists is followed when `x`
   appears: the barrel's own `imports` edge to `x` and its importers' edges are
   a rebuild's (all 61 of the round-3 review's edit shapes, against 57). The
@@ -143,6 +148,12 @@ panic in it no longer skips the backfill.
   …)` output, `export default (function f() {})`, or an export inside a
   block or a function; a name exported only that way is bound by name as
   before.
+- A file's own values exported by CommonJS writes (`exports.f = f`,
+  `module.exports = { f }`) are read from every such write, in any order,
+  and win over a forwarding write of the same name: `exports.f = f;
+  exports.f = require('./b').f` and `module.exports = { f };
+  module.exports = require('./b')` bind the file's own `f`, where Node runs
+  `b.js`'s.
 - CommonJS order is followed only as far as the file's text decides it. Two
   spreads that both export a name (`module.exports = { ...require('./a'),
   ...require('./b') }`) give a call of it no edge, where Node calls the
@@ -151,10 +162,16 @@ panic in it no longer skips the backfill.
 - An import's edge binds every node of the imported name in the file its
   specifier names before the walk is asked, a private or nested one
   included: beside `export { f } from './a.js'`, a private `function f` of
-  the barrel takes the import edge, while the call binds `a.js`'s `f`. After
+  the barrel takes the import edge, and a bare `f()` follows it (`import { f
+  as g }` and `g()` bind `a.js`'s `f`). After
   `export { f as g, g as f }`, `import { f }` and `f()` bind that file's `f`
   for both edges, where Node runs `g`, as in 0.185.0 (`import { f as h }`
   and `h()` bind `g`).
+- An import bound by name across the project, because no file on its path
+  defines the name, is re-bound in an incremental run only when the name
+  gains a definition overall: when one file gains an unexported `r` and
+  another loses its `r` in the same run, the import keeps the other file's
+  `r`, where a rebuild picks the nearer new one. As in 0.185.0.
 - A string export name (`export { f as 'x-y' }`) binds `<external>`, and
   `export type * from` is read as a value `export *`.
 - When another process keeps writing to the index for longer than the 15 s

@@ -16603,6 +16603,11 @@ fn a_js_reexport_resolves_as_node_does() {
             Some("a.js"),
         ),
         (
+            "writes to a rebound exports, then module.exports = exports",
+            "exports = {};\nexports.f = require('./b.js').f;\nmodule.exports = exports;\n",
+            Some("b.js"),
+        ),
+        (
             "module.exports.f after module.exports is replaced",
             "module.exports = { f: require('./a.js').f };\nmodule.exports.f = require('./b.js').f;\n",
             Some("b.js"),
@@ -17218,6 +17223,66 @@ fn a_requeued_js_import_goes_back_as_it_was_extracted() {
         assert_eq!(
             super::js_exports::as_extracted(plain, "r"),
             ("r".to_string(), plain.map(str::to_string))
+        );
+    }
+}
+
+/// Second pre-tag review of 0.186.0, HIGH-1: a bare call `f()` bound through
+/// an import the walk served under another name (`export { r as f }`) points
+/// at `r`. When the binding moves, Phase 0 requeued that call under `r`, the
+/// node's old name, and the import, re-resolved, now bound the named file
+/// directly, which the fan-out reads as a direct lookup: the call was lost, or
+/// bound another file's `r`. Such an importer is re-extracted.
+#[test]
+fn a_bare_call_through_a_renamed_binding_follows_its_import_when_the_binding_moves() {
+    let user = "import { f } from './d.js';\nexport function use() { return f(); }\n";
+    let renamed = "function r() { return 1; }\nexport { r as f };\n";
+    for (decoy, after) in [
+        (
+            "export function f() { return 'decoy-f'; }\n",
+            "function f() { return 1; }\nexport { f };\n",
+        ),
+        (
+            "export function f() { return 'decoy-f'; }\nexport function r() { return 'decoy-r'; }\n",
+            "function f() { return 1; }\nexport { f };\n",
+        ),
+        (
+            "export function f() { return 'decoy-f'; }\n",
+            "export function f() { return 1; }\n",
+        ),
+    ] {
+        let rows = assert_incremental_graph_matches_rebuild(
+            &[("b.js", user), ("c.js", decoy), ("d.js", renamed)],
+            &[("d.js", Some(after))],
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.starts_with("b.js.use --calls[") && r.ends_with("--> d.js.f")),
+            "{rows:#?}"
+        );
+    }
+    // The binding moves into the barrel while its old file loses it.
+    let app = "import { h } from './b.js';\nexport function main() { return h(); }\n";
+    for decoy in [
+        "export function h() { return 'decoy-h'; }\nexport function r() { return 'decoy-r'; }\n",
+        "export function h() { return 'decoy-h'; }\n",
+    ] {
+        let rows = assert_incremental_graph_matches_rebuild(
+            &[
+                ("app.js", app),
+                ("b.js", "export { r as h } from './a.js';\n"),
+                ("a.js", "function r() { return 1; }\nexport { r };\n"),
+                ("c.js", decoy),
+            ],
+            &[
+                ("a.js", Some("export const unused = 1;\n")),
+                ("b.js", Some("export function h() { return 'b'; }\n")),
+            ],
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.starts_with("app.js.main --calls[") && r.ends_with("--> b.js.h")),
+            "{rows:#?}"
         );
     }
 }

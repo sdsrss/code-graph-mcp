@@ -3958,15 +3958,21 @@ fn restore_inbound_edges(
                     // re-export) goes back as it was extracted: under the name
                     // it imports, without the key, or the by-name fallback
                     // binds the old target's namesakes (pre-tag review of
-                    // 0.186.0, HIGH-1).
-                    let (target_name, metadata) =
+                    // 0.186.0, HIGH-1). Its file's bare calls of the name went
+                    // to the same node and come back here under the node's
+                    // name: the file is re-extracted (second review, HIGH-1).
+                    let (requeued_name, requeued_metadata) =
                         super::js_exports::as_extracted(metadata.as_deref(), target_name);
+                    if requeued_metadata != *metadata && !run_file_paths.contains(src_path.as_str())
+                    {
+                        super::js_exports::requeued_walk_import(db.conn(), &src_path)?;
+                    }
                     deferred.push(DeferredRelation {
                         source_ids: vec![*source_id],
                         source_name: String::new(),
-                        target_name,
+                        target_name: requeued_name,
                         relation: relation.clone(),
-                        metadata,
+                        metadata: requeued_metadata,
                         rel_path: src_path,
                         language: src_lang,
                         ns_file: None,

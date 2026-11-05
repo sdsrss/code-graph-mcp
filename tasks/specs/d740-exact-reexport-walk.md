@@ -67,7 +67,7 @@
 - 2026-11-05：用户授权新增表；D#735 下个会话；D#736 不跑。
 - 变异（9c481428 的副本、独立 target，24 个）：首轮 15 个被杀、3 个写错不能编译；为存活的补测试（星号环、自指 barrel、歧义来源不被后面的来源掩盖、`export *` 不传 `default`、包名重导出 = 未知、命名空间调用不进 pending、改名重导出的按名字调用要被剪掉、删除目标文件后的 requeue、星号目标出现时 barrel 自己的边——原测试行的三个同名定义掩盖了 Phase 0-pre）。重跑存活者：M2 M4 M5 M6 M8 M12 M15 M19 M20 被杀。
 - 删掉两段没有变异能杀掉的扇出分支：新文件"所有名字漂移"（新文件只能经由一个解析结果变了的已有文件被访问到，那个文件已漂移；改为与空快照比较）；"直接目标文件新增同名节点"检查（新同名定义那一轮的 module-import 分支已经拉这个导入方，实测日志 `1 bare-name caller(s)`）。余下等价变异：新文件跳过而不是与空快照比较；requeue 读目标名（导入方同一轮会被重抽）。
-- 2026-11-05 发版进度：发版提交 1dabea53（分支 d740-exact-reexport-walk，未推送）；插件清点（干净 clone、沙箱 HOME）0.186.0：Skills 2 · Agents 1 · Hooks 6 · MCP 1；JS 套件 1779 通过、0 失败、3 跳过；main CI 绿（41881101175、定时 41974016912）。下一步：等预发评审（新 subagent，盲简报，工作目录 /var/tmp/agent-tmp-review-0186），修复后合并到 main（快进）、推送、等 CI、打 tag。
+- 2026-11-05 发版进度：发版提交 1dabea53（分支 d740-exact-reexport-walk，未推送）；插件清点（干净 clone、沙箱 HOME）0.186.0：Skills 2 · Agents 1 · Hooks 6 · MCP 1；JS 套件 1779 通过、0 失败、3 跳过；main CI 绿（41881101175、定时 41974016912）。第 1 轮预发评审结果与修复见下一条；修复提交 879767b3（pre-commit：cargo test 2418 通过、0 失败、7 忽略；fmt；两条 clippy 腿）。第 2 轮评审结果与修复见下一条。下一步：第 3 轮评审（只看第 2 轮修复提交，新 subagent，工作目录 /var/tmp/agent-tmp-review-0186c）；通过后合并到 main（快进）、推送、等 CI、打 tag。复审深度上限 2：第 2 轮若仍有 HIGH/MEDIUM，修复后对该修复再复审一次；第 3 次仍未通过则停下，带全部上下文上报用户。
 - 2026-11-05 预发评审（第 1 轮，新 subagent，盲简报）：HIGH 1、MEDIUM 3、LOW 9，逐条对代码核实后修复：
   - HIGH-1（Phase 0 requeue 用旧目标名，by-name 兜底绑到旧名字的同名定义）：requeue 前把边还原成抽取时的样子（`js_exports::as_extracted`：用导入名、去掉 `imported`）。变异 M01（不还原）在终态上等价：被 requeue 意味着绑定文件里那个节点没了，这正是 MEDIUM-1 的"有无同名节点"漂移，扇出在同一次运行里会重抽这个导入方；保留还原是因为 requeue 交给延迟阶段的输入应当就是抽取结果，不靠后面一轮纠正。单测 `a_requeued_js_import_goes_back_as_it_was_extracted` 钉住函数本身（M11 被杀）。
   - MEDIUM-1（绑定文件增减了被绑定名字的节点，扇出看不到）：快照加运行文件的节点名（`cg_js_nodes_before`），本地导出的形状带"该本地名有没有节点"。还需要让落到 `<external>` 的相对具名导入保留 `js_module` 元数据（之前只保留 Rust 的 `ru`），否则扇出找不到这个导入方。变异显示"顶层函数"标志与"有节点"标志分开比较没有可观测差别（M12 存活：调用经 requeue 和 pending 重解析），所以只比较"有没有同名节点"。
@@ -76,6 +76,16 @@
   - MEDIUM-2（评审的 9 个存活变异）：H、I、W、AD、AG 用评审的用例写成 `the_reexport_rules_the_review_mutated_hold`，重跑全部被杀；AA（退避不翻倍）加耗时下限断言，被杀（4.3 ms < 15 ms）；E、L、AF 评审判为等价，未再处理。
   - 性能：修复后 160 文件稠密 DAG 加一个无关文件 102–106 ms（修复前 78–81，0.185.0 47–55）：200 个找不到名字的 `<external>` 导入现在带 `js_module`，每个名字走一遍整个 `export *` 图。加了按文件缓存解析过的 `export *` 来源（81–84 ms）。另外发现扇出每次都先读全部 JS 导入边（claude-mem-lite 7,189 条，查询 8.8 ms），而 0.185.0 在没有漂移时直接返回：加回早退（没有漂移、没有文件出现/消失、没有运行文件新增节点名时不查），只改注释的编辑回到 0.185.0 水平。试过两个没有可测收益的改动（Phase 0-pre 按 base 预过滤、扇出解析按 base 记忆、无转发文件不加载），已撤回。
   - LOW：1、3、4、8、9 改了 CHANGELOG/spec 措辞；5 的形状写进 Not covered；6（修复每次重试都加载模型；退避期间放开标志时进程内增量不会请求让出；CLI 写入方只靠重试等待共 15 s）：只在遇忙重试时发生，记入此处和 Not covered（最后一条），不改；7 见上。
+- 2026-11-05 第 2 轮评审（只看 879767b3，新 subagent）：HIGH 1、MEDIUM 1、LOW 6，逐条核实：
+  - HIGH-1（复现）：裸调用 `f()` 经一条被遍历以另一名字绑定的导入（`export { r as f }`）指向 `r`；绑定改名为导出名（`function r … export { r as f }` → `export function f`）或移进 barrel 时，Phase 0 按节点旧名 `r` 把调用 requeue 进 pending，导入边重解析后直接绑到说明符文件，扇出当成直接查找跳过，调用丢失或绑到别的文件的 `r`；0.185.0 无此问题。修复：Phase 0 requeue 一条带 `imported` 的导入边、且源文件不在本轮时，把源文件记入 `temp.cg_js_requeued`，扇出把它加入重抽（`requeued_walk_import` / `take_requeued_walk_importers`）。在 879767b3 上红，修复后绿（`a_bare_call_through_a_renamed_binding_follows_its_import_when_the_binding_moves`，5 个形状）。
+  - MEDIUM-1（复现）：CHANGELOG 的 CJS 顺序说法对文件自己的值不成立（自己的值来自 exports 轴，不分顺序，且 `local_of` 先认它）。改 exports 轴超出本次范围：把说法限定为转发写入，自己的值写进 Not covered。
+  - LOW-1（复现，0.185.0 同样）：按名字跨项目绑定的导入只在名字总数上升时重绑。记入 Not covered。
+  - LOW-2（复现，回归）：`exports = {}; exports.f = …; module.exports = exports` 丢了脱钩期间的写入。CJS 改成两个对象（`module.exports` 持有的、`exports` 指向的），赋值和成员写入分别作用于对应对象；`module.exports = exports` / `exports = module.exports` 合并。
+  - LOW-3：变异 (a)（requeue 不调用 `as_extracted`）不等价（直接导入边残留 `imported`）；修复 HIGH-1 后，pull 的条件就是 `as_extracted` 认出这个键，所以 (a) 现在也关掉 pull：在 handma 18 个里 13 个不一致，被 HIGH-1 测试杀。
+  - LOW-4：变异 M8 存活：补行 `exports = { g: 1 }; exports.f = …` → 无条目。
+  - LOW-5：Not covered 里"调用绑到 `a.js` 的 `f`"只对改名导入成立，改措辞。
+  - LOW-6：同一模块两个顶层 `function f`（非法 JS，ESM 下是语法错误）不一致；合法变体（嵌套同名函数）在本版、0.185.0、0.184.0 都一致。不处理。
+  - 本轮变异（独立树和 target）：N1、N3–N8 被杀；N2（本轮内的源文件也记录）只多重抽一次，等价。
 - D#738（afadb65e）：修复遇忙重试 5 次（间隔 1/2/4/8 s，期间放开标志）；增量请求 backfill 让出时不抢标志；panic 不跳过 backfill；`startup_follow_up` 可测。复现：另一连接持写事务 6.5 s，0.185.0 的修复后孤儿向量仍在（1），本版为 0。
 
 ## 验证记录
