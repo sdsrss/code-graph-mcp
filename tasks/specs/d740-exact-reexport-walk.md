@@ -103,6 +103,14 @@
   - 变异（独立 worktree + target，lib 1588 个测试）：MA7（去掉整路）被杀；MA3（不限元数据，成员调用 `x.f()` 的 `{"q":"member"}` 行被绑）、MA5（无自调用守卫，自导入生成 `r → r`）、MA6（不限调用方文件，未导入的 `o.js` 的 `f()` 被绑）存活，补断言后重跑都被杀；MA2（不删 pending 行）第一次写错不能编译，重写后被杀；MA4（同文件同名检查）等价，见上；MA1（不限改名导入）存活且不等价：JS 文件 `import { f } from './t.ts'` 后 `f()` 留在 pending（pending 扫描只在同语言内找），MA1 会把它绑上。这是本版之前就有的缺口，增量与重建一致；扩大到普通导入属另一个行为变更，要先在语料上量，记为待办，不写测试钉住现状。
   - 计时（6 次，`--no-embed`，v0.184.0 / 0.185.0 / r10 依次在同一台机器上，`timing-r10.sh`）：CHANGELOG 表整张换成这次的数。claude-mem-lite 加删文件 r10 119–131 / 74–82 ms（r8 那次 111–115 / 73–76）；交替 A/B 3 轮：r9 加 112–126、删 71–86，r10 加 114–130、删 72–91，范围重叠，新的一路没有可测开销。表后那句“增量边集等于全量”在 r10 上重验：claude-mem-lite 加 `export *` 31,097 条、hono 加 8,797 条、hono 删 8,793 条，逐行相同。
   - 下一步：提交测试和文档，派第 4 轮复审（新 subagent，盲简报，范围 e74e9c84..HEAD，工作目录 /var/tmp/agent-tmp-review-0186d）；通过就发版，在新代码里出 HIGH/MEDIUM 就撤回 ac69061f 及其测试，按选项 2 发版。
+- 2026-11-05 第 4 轮评审（范围 e74e9c84..7169dc76，新 subagent）：HIGH 0、MEDIUM 1、LOW 5。
+  - MEDIUM-1（复现，新代码引入）：没有任何 `f` 时新的一路绑定 `f()` 并删掉 pending 行；之后第一个 `f` 出现，重建按名字再绑一条 `use → c.js:f`，剪枝因调用方代码含 `.f(`（或超过 4 KB 被截断）保留它；增量里没有 pending 行可扫，少这条边。我的复现：`b.js` = `import { f } from './d.js'; export function use(o) { return f() + o.f(); }`，`d.js` = `export { r as f }`，加 `c.js` 的 `export function f`：r10 不一致，r9、0.185.0 一致。
+  - LOW：scope 推理不成立（Phase 0 把 run 外调用方的调用 requeue 进 pending 而不进 scope；按全图做正是让 pending 行与重建一致的原因，但没造出错的置信度或剪枝）；谓词沿用第一路的宽度（`import { f as g }` 后的裸 `f()`、`super.f()`、`this.f()`、`ns()` 也被绑）；pending 行集中在一个名字上时语句是二次的（1,000 × 5,000 时 134 ms）；上下文字符串不重渲（第一路同样）；测试只比较边、不比较 pending 行。
+  - 按约定撤回：`resolve.rs`、`tests.rs`、指纹文件恢复到 e74e9c84（撤回后 release 构建与 r9 逐字节相同）；CHANGELOG 恢复到 e74e9c84，加 Not covered 条目（最后一个其他 `f` 消失时增量留 Node 的边、重建不绑；600 条链 77 条，全是这一类；0.185.0 14 条，全是增量残留的按名字导入边），fix 段落加一句指向它；计时表用发布二进制（= r9）重测。
+  - 评审顺带发现、三个构建都有的 pending 行类不一致：成员调用行 `{"q":"member"}` 在目标文件消失时丢失；删掉两个同名目标之一后残留的 `PENDING o.js:o => r`（最小用例三个构建都不一致）。记为待办。
+  - 计时（发布二进制 = r9）：第一次跑时 15 分钟负载 8.36（评审刚结束），三列全偏高，作废；负载 1.0–1.7 时重跑，数写进 CHANGELOG 表（`timing-r9b.txt`）。表后那句在 r9 上重验：claude-mem-lite 31,097、hono 8,797 / 8,793 条，增量 = 全量。
+  - 下一步：提交撤回（pre-commit 全量），然后发版：查 main CI 颜色 → 快进合并 main → 推送 → 后台等 CI 7/7、在 macOS/Windows 日志里找新测试名 → 打 tag v0.186.0 → 等 Release → `gh release edit` 写说明 → 验证 npm / 资产 / 真实安装 / `_npmUser`。
+  - 这次修复的结论：调用的绑定要成为“只依赖它自己那条导入”的函数，需要 pending 扫描、剪枝、上下文字符串一起按这个依赖重做，也就是发版后待办里的“按依赖记录重解析”，不是在 2d-bind 加一路能做到的。
 - D#738（afadb65e）：修复遇忙重试 5 次（间隔 1/2/4/8 s，期间放开标志）；增量请求 backfill 让出时不抢标志；panic 不跳过 backfill；`startup_follow_up` 可测。复现：另一连接持写事务 6.5 s，0.185.0 的修复后孤儿向量仍在（1），本版为 0。
 
 ## 验证记录
