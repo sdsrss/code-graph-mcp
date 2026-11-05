@@ -1,5 +1,126 @@
 # Changelog
 
+## 0.186.0
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 136 → 137
+because JavaScript and TypeScript import and call edges through re-exports
+move (below), and each JS/TS file's exports are now recorded in a new table
+of the index (`js_export_entries`; no schema version change). The MCP server
+rebuilds the index when it starts; from the command line,
+`code-graph-mcp reindex` does. To pin the binary back:
+`npm i -g @sdsrs/code-graph@0.185.0`, then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The plugin's
+scripts are unchanged.
+
+### fix: an import through a barrel binds what Node binds
+
+0.185.0 followed a file's re-exports by reading that file's own `imports`
+edges, which are themselves the output of resolution. Each JS/TS file's
+export entries are now recorded from its own text, in source order, and a
+name is resolved through them as ECMAScript's `ResolveExport` does:
+
+- a plain `import { f } from './a.js'` in a barrel re-exports nothing; an
+  `export { f }` of it does, and so does `export default` of an imported
+  binding;
+- `export { r as f } from './a.js'` gives `f` the binding `r`; 0.185.0
+  looked for `r` under the name `f` asked for;
+- `export * as ns from './a.js'` exports `a.js`'s namespace: an import of
+  `ns` binds `a.js`'s `<module>`;
+- `export { g as h }` without `from`, and `export default function d`,
+  `export function* g`, `export var v`, `export declare function f` are read;
+- CommonJS `module.exports = require('./x')`, `module.exports = {
+  ...require('./x') }`, and `exports.y = x` or `module.exports = { y: x }`
+  where `x` was required, forward to that file;
+- there is no bound of eight files (the walk gives up past 256 links); a
+  cycle of `export *` ends where it began; `export *` passes no `default`;
+  two `export *` sources that resolve a name differently make it ambiguous
+  wherever it is asked, and an `export { f } from 'a-package'` makes the
+  walk give up rather than let another source answer.
+
+On the 62 valid programs of the round-4 review's probe set, the call edge
+matches what `node app.js` runs in 61, against 44 in 0.185.0 (the one left is
+listed under Not covered). A bare call through a plain import now follows a
+renamed re-export too: `import { f }` and `f()`, where the barrel holds
+`export { r as f } from './a.js'`, binds `a.js`'s `r`; such an import's edge
+records the name it imports (`"imported"` in the edge's metadata).
+
+Full index of 9 JS/TS projects, 0.185.0 and this build from source: the edge
+sets of 8 are identical; hono 4.6.14 loses 14 edges and gains 16, each
+checked against its source. `refs Hono --file src/hono-base.ts` lists 7
+importers instead of 2: `import { HonoBase } from './hono-base'`, where
+`hono-base.ts` holds `export { Hono as HonoBase }`, bound `<external>`. The
+`jsx(…)` calls in `src/jsx/dom/index.ts`, whose `jsx` is `jsx-runtime.ts`'s
+`export { jsxDEV as jsx } from './jsx-dev-runtime'`, are now listed by
+`callgraph jsxDEV --direction callers` (`createElement`, `cloneElement`)
+instead of under `base.ts`'s `jsx`.
+
+### fix: an incremental run binds through barrels as a rebuild does
+
+- In 400 random graphs of 6 barrels and 4 defining files (the review's
+  `fuzz.py`, seeds 7 and 11), 0 end with other edges than a rebuild, against
+  33 with 0.185.0.
+- `export * from './x'` written before `x` exists is followed when `x`
+  appears: the barrel's own `imports` edge to `x` and its importers' edges are
+  a rebuild's (all 61 of the round-3 review's edit shapes, against 57). The
+  same when a file appears beside the directory `index.js` a specifier named.
+- A file is re-extracted for a barrel's change only when the walk of one of
+  its imports asks a changed name of a changed file; a changed `export *` set
+  changes only the names the file does not export itself. 0.185.0
+  re-extracted every file that imported anything through such a barrel.
+
+Each incremental run below edits a file and undoes it, 3 times (6 runs,
+`--no-embed`, all three builds from source on the same machine):
+
+| Edit | 0.184.0 | 0.185.0 | 0.186.0 |
+|---|---|---|---|
+| claude-mem-lite: add `export * from './hash-utils.mjs'` to `utils.mjs` | 173–185 ms | 1,028–1,082 ms, 90 files re-extracted | 175–194 ms, none |
+| hono: add an `export *` line to `src/helper/ssg/index.ts` | 68–82 ms | 89–126 ms | 93–105 ms |
+| hono: remove `export * from './ssg'` there | 63–81 ms | 125–132 ms | 94–106 ms |
+| hono: add an import to `src/hono-base.ts` | 86–99 ms | 75–88 ms | 77–93 ms |
+
+After the first and the two hono `export *` edits the incremental edges equal
+a full index's. A full index of 60 files that each re-export all the others by
+`export *` takes 93–97 ms (0.184.0 75–96, 0.185.0 1,030–1,050), and of 160
+files in 8 layers that each re-export every lower layer 222–239 ms (153–174,
+1,072–1,116).
+
+### fix: the startup repair tries again when another process is writing
+
+0.185.0's startup repair (orphan vectors, vector-table compaction, the
+embedding cache) logged `database is locked` and was not tried again until
+the server next started whenever another process wrote to the index during it,
+such as a CLI `incremental-index`. It now tries again, up to five times,
+waiting 1, 2, 4 and 8 s between tries, and lets the embedding backfill run in
+between. With another connection holding a write transaction for 6.5 s, the
+orphan vector it should reap was still there after 0.185.0's repair and is
+gone after this one. It also no longer starts while an incremental run is
+waiting for the embedding backfill to stop (it wrote beside that run), and a
+panic in it no longer skips the backfill.
+
+### Not covered
+
+- `new g()` after `import { f as g } from './index.js'`, where the walk
+  finds a class `f`, has no `calls` edge, as before: a call through a renamed
+  import binds only functions.
+- A bare call through an import whose name no node of the project has gets
+  no `calls` edge even when the import binds: `import { ff } from './b.js'`,
+  where `b.js` holds `import { f as ff } from './a.js'` and `export { ff }`,
+  binds `a.js`'s `f`, and `ff()` binds nothing (as in 0.185.0, whose import
+  bound `<external>`).
+- `ns.f()` after `import * as ns from './index.js'` is bound by name, not
+  through the barrel's re-exports: with `a.js` and `b.js` each defining `f`
+  and `index.js` holding `export * from './b.js'`, it binds `a.js`'s `f`
+  (`ambiguous`), in 0.185.0 and here.
+- A function exported only by an `export { f }` clause still has no
+  `exports` edge, so the readers of those edges (`dead-code` among them) do not
+  see it exported; the walk reads the clause.
+- The export entries do not record TypeScript `export =` or `export import`,
+  `Object.assign(module.exports, …)`, or an export inside a block or a
+  function; a name exported only that way is bound by name as before.
+- A specifier is resolved as a bundler does (`./b` finds `b.js`), where Node's
+  ESM loader requires the extension.
+
 ## 0.185.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 126 → 136

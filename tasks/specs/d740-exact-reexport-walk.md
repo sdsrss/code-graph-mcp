@@ -59,12 +59,15 @@
 - [x] S3：遍历重写（`pipeline/js_exports.rs`）+ 延迟阶段/调用/pending 三个消费者；探测程序移植成管线测试
 - [x] S4：Phase 0-pre（D#739）+ 扇出重写；增量=重建测试
 - [x] S5：fuzz/探测/kit38/r4sets61/语料/计时
-- [ ] S6：D#738
-- [ ] S7：CHANGELOG、发版
+- [x] S6：D#738（afadb65e）
+- [ ] S7：CHANGELOG、发版（CHANGELOG 已写，0.186.0）
 
 ## 决策与进展
 
 - 2026-11-05：用户授权新增表；D#735 下个会话；D#736 不跑。
+- 变异（9c481428 的副本、独立 target，24 个）：首轮 15 个被杀、3 个写错不能编译；为存活的补测试（星号环、自指 barrel、歧义来源不被后面的来源掩盖、`export *` 不传 `default`、包名重导出 = 未知、命名空间调用不进 pending、改名重导出的按名字调用要被剪掉、删除目标文件后的 requeue、星号目标出现时 barrel 自己的边——原测试行的三个同名定义掩盖了 Phase 0-pre）。重跑存活者：M2 M4 M5 M6 M8 M12 M15 M19 M20 被杀。
+- 删掉两段没有变异能杀掉的扇出分支：新文件"所有名字漂移"（新文件只能经由一个解析结果变了的已有文件被访问到，那个文件已漂移；改为与空快照比较）；"直接目标文件新增同名节点"检查（新同名定义那一轮的 module-import 分支已经拉这个导入方，实测日志 `1 bare-name caller(s)`）。余下等价变异：新文件跳过而不是与空快照比较；requeue 读目标名（导入方同一轮会被重抽）。
+- D#738（afadb65e）：修复遇忙重试 5 次（间隔 1/2/4/8 s，期间放开标志）；增量请求 backfill 让出时不抢标志；panic 不跳过 backfill；`startup_follow_up` 可测。复现：另一连接持写事务 6.5 s，0.185.0 的修复后孤儿向量仍在（1），本版为 0。
 
 ## 验证记录
 
@@ -74,6 +77,8 @@
 - 语料全量边集（0.185.0 源码构建 vs 新）：cgm-plugin、claude-mem-lite、claudemd、daagu、express、gsd-lite、llm_wiki、sgc 逐行相同；hono −14 +16，逐条对源码核对全部正确（`export { module as serveStatic }`、`export { Hono as HonoBase }`×5、`export { jsx as createElement }` 的导入与调用、`reactAPICompatVersion as version`×2、`Fragment as StrictMode`、`export { jsxDEV as jsx } from`、`createElement/cloneElement as …ForDom` 的 3 条调用）。
 - 真实语料增量（`real_inc.py`，hono/gsd-lite/claude-mem-lite/daagu 各 15 轮，种子 7）：60 轮 0 不一致。
 - 计时（6 次，`--no-embed`）：稠密 `export *` 全量 环形 60 文件 0.185.0 1,058–1,077 → 新 113–123 ms；DAG 1,086–1,121 → 226–238 ms。claude-mem-lite `utils.mjs` 增删 `export * from './hash-utils.mjs'`：0.185.0 1,140–1,687 ms、每次重抽 90 个 → 新 200–226 ms、重抽 0 个；加行后增量与全量重建 31,050 条边逐行相同。
-- `cargo test --no-fail-fast`（加 `imported` 之前）：2406 通过、0 失败、7 忽略；clippy 两条 feature 腿无告警。
+- `cargo test --no-fail-fast`（加 `imported` 之前）：2406 通过、0 失败、7 忽略；clippy 两条 feature 腿无告警。之后每个提交的 pre-commit 都跑全量测试、fmt、两条 clippy 腿：通过。
+- 最终二进制（276268a8 的源码，md5 ecabdb58）：fuzz 400/400、kit38 38/38、r4sets61 61/61、9 个语料同上（8 个逐行相同，hono −14 +16）；探测合法 62 个中 61 个与 Node 一致（b08 在加 `only_default` 后一致，余 b18）。
+- 计时（6 次，三个版本都源码构建：v0.184.0 / 0.185.0 / 新）：环形 60 文件全量 75–96 / 1,030–1,050 / 93–97 ms；DAG 160 文件 153–174 / 1,072–1,116 / 222–239 ms；claude-mem-lite `utils.mjs` 加 `export *` 173–185 / 1,028–1,082（重抽 90）/ 175–194 ms（0）；hono `ssg/index.ts` 加 `export *` 68–82 / 89–126 / 93–105；删 `export * from './ssg'` 63–81 / 125–132 / 94–106；`hono-base.ts` 加 import 86–99 / 75–88 / 77–93。hono 两种 `export *` 编辑后增量与全量重建逐行相同（8,741、8,737 条）。
 
 - 基线（0.185.0，`~/.cache/code-graph/bin/code-graph-mcp` md5 915cfad4）：`shapes.py sh/*.py` 合法 62 个，44 个一致；不一致 18 个：s13 s15 s17 s22 s23 s24 b01 b02 b03 b08 b18 b20 c01 c05 c06 d04 d05 d06。
