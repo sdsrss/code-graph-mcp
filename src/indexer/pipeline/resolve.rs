@@ -2110,7 +2110,8 @@ pub(super) fn bind_calls_to_imported_targets(
                 -- the name imported, which a renamed JS re-export's edge
                 -- carries beside a target of another name (D#740)
                 COALESCE(json_extract(ie.metadata, '$.imported'), itn.name) AS import_name,
-                MIN(itn.id) AS import_target_id
+                MIN(itn.id) AS import_target_id,
+                MAX(json_extract(ie.metadata, '$.imported') IS NOT NULL) AS renamed
          FROM edges ie
          JOIN nodes mn  ON mn.id  = ie.source_id
          JOIN nodes itn ON itn.id = ie.target_id
@@ -2184,8 +2185,42 @@ pub(super) fn bind_calls_to_imported_targets(
         let mut stmt = conn.prepare(&sql)?;
         stmt.execute(rusqlite::params![REL_CALLS, REL_CALLS])?
     };
-    conn.execute_batch("DROP TABLE IF EXISTS temp.cg_unique_imports;")?;
-    Ok(inserted)
+    // A bare call whose name only a renamed JS import binds (`import { f }`,
+    // the walk serving `f` as another file's `r`) has no by-name edge for the
+    // statement above to repoint when no node of the project is named `f`: it
+    // waits in `pending_unresolved_calls`. Bind it to the import's target and
+    // drop the row, so the call follows its import whether or not some file
+    // holds an `f` (with one, the call was bound by name and repointed above,
+    // to the same node; third pre-tag review of 0.186.0, MEDIUM-1). Driven
+    // from the renamed imports, which are few, and over the whole graph in
+    // either scope: a rebuild binds every such row the same way.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.cg_pending_import_binds;
+         CREATE TEMP TABLE cg_pending_import_binds AS
+         SELECT p.id AS pending_id, p.source_id AS src_id, it.import_target_id AS tgt_id
+         FROM cg_unique_imports it
+         CROSS JOIN pending_unresolved_calls p ON p.target_name = it.import_name
+         CROSS JOIN nodes sn ON sn.id = p.source_id AND sn.file_id = it.import_file
+         WHERE it.renamed
+           AND (p.metadata IS NULL OR p.metadata = '')
+           AND p.source_id <> it.import_target_id
+           AND NOT EXISTS (
+               SELECT 1 FROM nodes ln
+               WHERE ln.file_id = sn.file_id AND ln.name = p.target_name
+           );",
+    )?;
+    let bound_pending = conn.execute(
+        "INSERT OR IGNORE INTO edges (source_id, target_id, relation, metadata)
+         SELECT DISTINCT src_id, tgt_id, ?1, NULL FROM temp.cg_pending_import_binds",
+        rusqlite::params![REL_CALLS],
+    )?;
+    conn.execute_batch(
+        "DELETE FROM pending_unresolved_calls
+         WHERE id IN (SELECT pending_id FROM temp.cg_pending_import_binds);
+         DROP TABLE temp.cg_pending_import_binds;
+         DROP TABLE IF EXISTS temp.cg_unique_imports;",
+    )?;
+    Ok(inserted + bound_pending)
 }
 
 /// Phase 2d-attr (D#518): a `P.X()` call on a module name binds what its

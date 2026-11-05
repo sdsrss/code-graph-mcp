@@ -17316,3 +17316,77 @@ fn a_bare_call_through_a_renamed_binding_follows_its_import_when_the_binding_mov
         );
     }
 }
+
+/// Third pre-tag review of 0.186.0, MEDIUM-1: a bare call bound through an
+/// import the walk served under another name follows that import whether or
+/// not any node of the project carries the imported name. Phase 2d-bind only
+/// repointed a call already bound by name, so with no `f` anywhere a rebuild
+/// left `f()` pending, while an incremental run that saw the last `f` go kept
+/// the edge Node runs.
+#[test]
+fn a_bare_call_through_a_renamed_import_binds_with_no_node_of_its_name() {
+    let direct: &[(&str, &str)] = &[
+        (
+            "app.js",
+            "import { f } from './e.js';\nexport function main() { return f(); }\n",
+        ),
+        ("e.js", "function r() { return 'e'; }\nexport { r as f };\n"),
+    ];
+    let barrel: &[(&str, &str)] = &[
+        (
+            "app.js",
+            "import { f } from './b.js';\nexport function main() { return f(); }\n",
+        ),
+        ("b.js", "export { r as f } from './e.js';\n"),
+        ("e.js", "export function r() { return 'e'; }\n"),
+    ];
+    let decoy = "export function f() { return 'd'; }\n";
+    let none = "export const z = 1;\n";
+    for tree in [direct, barrel] {
+        // The last other `f` goes, by an edit or a delete, or the first comes.
+        for (before, after) in [(decoy, Some(none)), (decoy, None), (none, Some(decoy))] {
+            let files: Vec<(&str, &str)> = tree.iter().copied().chain([("d.js", before)]).collect();
+            let rows = assert_incremental_graph_matches_rebuild(&files, &[("d.js", after)]);
+            assert!(
+                rows.iter()
+                    .any(|r| r.starts_with("app.js.main --calls[") && r.ends_with("--> e.js.r")),
+                "{rows:#?}"
+            );
+        }
+        // A fresh index with no `f` anywhere binds the call and buffers nothing.
+        let (_p, _d, db) = fresh_index_of(tree);
+        assert!(
+            graph_rows(&db)
+                .iter()
+                .any(|r| r.starts_with("app.js.main --calls[") && r.ends_with("--> e.js.r")),
+            "{:#?}",
+            graph_rows(&db)
+        );
+        assert!(
+            !pending_set(&db)
+                .iter()
+                .any(|p| p.starts_with("app.js.main")),
+            "{:#?}",
+            pending_set(&db)
+        );
+    }
+    // An import renamed on the way (`import { f as ff }` re-exported as `ff`).
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "app.js",
+            "import { ff } from './b.js';\nexport function main() { return ff(); }\n",
+        ),
+        (
+            "b.js",
+            "import { f as ff } from './a.js';\nexport { ff };\n",
+        ),
+        ("a.js", "export function f() { return 'a'; }\n"),
+    ]);
+    assert!(
+        graph_rows(&db)
+            .iter()
+            .any(|r| r.starts_with("app.js.main --calls[") && r.ends_with("--> a.js.f")),
+        "{:#?}",
+        graph_rows(&db)
+    );
+}
