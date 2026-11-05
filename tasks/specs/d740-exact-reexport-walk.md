@@ -1,6 +1,6 @@
 # D#740 + D#739：JS/TS 重导出遍历按 ECMAScript ResolveExport 精确实现（2026-11-05）
 
-状态：进行中（L3，FULL-lite；新增表已获用户授权 2026-11-05）
+状态：完成（v0.186.0 已发布 2026-11-05；L3，FULL-lite；新增表已获用户授权 2026-11-05）
 
 ## 背景与目标
 
@@ -34,13 +34,13 @@
 
 ## 验收标准
 
-- [ ] AC1：fuzz 400 个随机 barrel 图增量=重建 0/400 — 验证：`fuzz.py ROOT 200 7`、`fuzz.py ROOT 200 11` + `ivf.sh`
-- [ ] AC2：Node 合法探测程序：调用边与导入边和 `node app.js` 一致；不一致的逐条说明原因 — 验证：`shapes.py sh/*.py new,old`
-- [ ] AC3：kit38 38/38、r4sets61 61/61 一致（含 D#739 的 4 个形状） — 验证：`ivf.sh`
-- [ ] AC4：9 个语料全量边集与 0.185.0 的差异逐条归因（只应出现在旧遍历读错的形状上）
-- [ ] AC5：计时：稠密 `export *` 60 文件全量 ≤ 0.184.0 的 2 倍；claude-mem-lite `utils.mjs` 加一行 `export *` 的增量不再重抽 90 个文件
-- [ ] AC6：`cargo test` 全部通过、clippy 两条 feature 腿、fmt
-- [ ] AC7：预发评审（新 subagent，盲简报）
+- [x] AC1：fuzz 400 个随机 barrel 图增量=重建 0/400 — 验证：`fuzz.py ROOT 200 7`、`fuzz.py ROOT 200 11` + `ivf.sh`
+- [x] AC2：Node 合法探测程序：调用边与导入边和 `node app.js` 一致；不一致的逐条说明原因 — 验证：`shapes.py sh/*.py new,old`
+- [x] AC3：kit38 38/38、r4sets61 61/61 一致（含 D#739 的 4 个形状） — 验证：`ivf.sh`
+- [x] AC4：9 个语料全量边集与 0.185.0 的差异逐条归因（只应出现在旧遍历读错的形状上）
+- [x] AC5：计时：稠密 `export *` 60 文件全量 ≤ 0.184.0 的 2 倍；claude-mem-lite `utils.mjs` 加一行 `export *` 的增量不再重抽 90 个文件
+- [x] AC6：`cargo test` 全部通过、clippy 两条 feature 腿、fmt
+- [x] AC7：预发评审（新 subagent，盲简报）
 
 ## 方案
 
@@ -60,7 +60,7 @@
 - [x] S4：Phase 0-pre（D#739）+ 扇出重写；增量=重建测试
 - [x] S5：fuzz/探测/kit38/r4sets61/语料/计时
 - [x] S6：D#738（afadb65e）
-- [ ] S7：CHANGELOG、发版（CHANGELOG 已写，0.186.0）
+- [x] S7：CHANGELOG、发版（v0.186.0，f3cc144a）
 
 ## 决策与进展
 
@@ -111,6 +111,7 @@
   - 计时（发布二进制 = r9）：第一次跑时 15 分钟负载 8.36（评审刚结束），三列全偏高，作废；负载 1.0–1.7 时重跑，数写进 CHANGELOG 表（`timing-r9b.txt`）。表后那句在 r9 上重验：claude-mem-lite 31,097、hono 8,797 / 8,793 条，增量 = 全量。
   - 下一步：提交撤回（pre-commit 全量），然后发版：查 main CI 颜色 → 快进合并 main → 推送 → 后台等 CI 7/7、在 macOS/Windows 日志里找新测试名 → 打 tag v0.186.0 → 等 Release → `gh release edit` 写说明 → 验证 npm / 资产 / 真实安装 / `_npmUser`。
   - 这次修复的结论：调用的绑定要成为“只依赖它自己那条导入”的函数，需要 pending 扫描、剪枝、上下文字符串一起按这个依赖重做，也就是发版后待办里的“按依赖记录重解析”，不是在 2d-bind 加一路能做到的。
+- 2026-11-05 发版：main 快进到 f3cc144a 并推送；CI 42083824145 7/7 绿，macOS/Windows 日志里 7 个新测试名都是 ok；tag v0.186.0 → Release 42086408654 10/10（29 分 25 秒）；`gh release edit` 写入 CHANGELOG 一节（14 个资产，非草稿）；`npm view @sdsrs/code-graph version` = 0.186.0；6 个包 `_npmUser` = GitHub Actions、trustedPublisher github；真实安装 `added 2 packages`，平台包自带二进制 `--version` = 0.186.0；发布版在 9 个语料上的全量边集（带元数据）与源码构建 r9 逐字节相同，kit38 + r4sets61 99/99，D#741 形状 3/4 不一致（与 Not covered 一致）。待办：D#741（按依赖重解析，含这次 Not covered 的那一类）、D#742（JS→TS 普通导入的调用留 pending）、D#743（pending 行两类不一致，三个构建都有）、D#744（一次 refresh 600+ 文件）。编辑链生成器和比较脚本并入 `tasks/d714-resolver-precision/walk-harness/`。
 - D#738（afadb65e）：修复遇忙重试 5 次（间隔 1/2/4/8 s，期间放开标志）；增量请求 backfill 让出时不抢标志；panic 不跳过 backfill；`startup_follow_up` 可测。复现：另一连接持写事务 6.5 s，0.185.0 的修复后孤儿向量仍在（1），本版为 0。
 
 ## 验证记录

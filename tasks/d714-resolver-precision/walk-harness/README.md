@@ -25,3 +25,19 @@ deferred item on making the walk exact.
   kept as an archive so this repo's own index does not take their JS files
   in. 0.185.0: kit38 38/38 SAME, r4sets61 57/61 (the 4 are D#739's shape).
   Run each case with `ivf.sh BIN <extracted>/<set>/<case>`.
+
+Added for 0.186.0 (D#740 pre-tag reviews, 2026-11-05):
+
+- `ivfm.sh BIN CASEDIR` — `ivf.sh` comparing edges WITH metadata and node
+  types (`edgesm.sh`); `ivfr.sh` — the same, but the edit reaches the index
+  through the query-time refresh (`deps` per deleted file, then one
+  `affected` naming every changed file).
+- `fuzz2.py ROOT N SEED` — barrel graphs whose edits also turn `function r`
+  into `let r` and back and switch plain / renamed / default exports. 0.186.0:
+  seeds 5–11 (1,050 graphs) 0 DIFF; 0.185.0 23.
+- `chaingen.py ROOT N SEED STEPS` + `ivchain.sh BIN CHAINDIR` — N chains of
+  STEPS successive trees around one name (renamed / direct / star / decoy
+  files); each step is applied incrementally and compared, pending-call rows
+  included, with a fresh index. Seeds 21 and 22, 300 chains of 6: 0.186.0 77
+  DIFF (all D#741's shape: incremental keeps the call edge, the rebuild leaves
+  the call pending), 0.185.0 14, 0.184.0 10 (seed 21).
