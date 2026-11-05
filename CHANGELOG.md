@@ -10,7 +10,9 @@ rebuilds the index when it starts; from the command line,
 `code-graph-mcp reindex` does. To pin the binary back:
 `npm i -g @sdsrs/code-graph@0.185.0`, then delete
 `~/.cache/code-graph/bin/code-graph-mcp` and set
-`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The plugin's
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. 0.185.0 answers
+from an index this version wrote but will not write to it; delete
+`.code-graph/index.db*` once so it rebuilds (its error says so). The plugin's
 scripts are unchanged.
 
 ### fix: an import through a barrel binds what Node binds
@@ -31,7 +33,10 @@ name is resolved through them as ECMAScript's `ResolveExport` does:
   `export function* g`, `export var v`, `export declare function f` are read;
 - CommonJS `module.exports = require('./x')`, `module.exports = {
   ...require('./x') }`, and `exports.y = x` or `module.exports = { y: x }`
-  where `x` was required, forward to that file;
+  where `x` was required, forward to that file. The writes apply in the
+  order Node runs them: the last write of a name wins, `module.exports = …`
+  replaces everything written before it, and an `exports.y = …` after that
+  exports nothing (`exports` still names the old object);
 - there is no bound of eight files (the walk gives up past 256 links); a
   cycle of `export *` ends where it began; `export *` passes no `default`;
   two `export *` sources that resolve a name differently make it ambiguous
@@ -39,11 +44,13 @@ name is resolved through them as ECMAScript's `ResolveExport` does:
   walk give up rather than let another source answer.
 
 On the 62 valid programs of the round-4 review's probe set, the call edge
-matches what `node app.js` runs in 61, against 44 in 0.185.0 (the one left is
+matches what `node app.js` runs in 61, against 46 in 0.185.0 (the one left is
 listed under Not covered). A bare call through a plain import now follows a
 renamed re-export too: `import { f }` and `f()`, where the barrel holds
-`export { r as f } from './a.js'`, binds `a.js`'s `r`; such an import's edge
-records the name it imports (`"imported"` in the edge's metadata).
+`export { r as f } from './a.js'`, binds `a.js`'s `r` instead of another
+file's `f` (when no node of the project is named `f`, the call binds nothing;
+see Not covered). Such an import's edge records the name it imports
+(`"imported"` in the edge's metadata).
 
 Full index of 9 JS/TS projects, 0.185.0 and this build from source: the edge
 sets of 8 are identical; hono 4.6.14 loses 14 edges and gains 16, each
@@ -59,7 +66,14 @@ instead of under `base.ts`'s `jsx`.
 
 - In 400 random graphs of 6 barrels and 4 defining files (the review's
   `fuzz.py`, seeds 7 and 11), 0 end with other edges than a rebuild, against
-  33 with 0.185.0.
+  33 with 0.185.0. In 1,050 graphs of the pre-release review's generator,
+  whose edits also turn `function r` into `let r` and back and switch
+  between plain, renamed and default exports (seeds 5 to 11), 0 do, against
+  23 with 0.185.0.
+- An import bound through a renamed re-export follows the file its walk ends
+  in: writing `export { helper as h }` before `function helper`, or turning
+  the bound `function r` into `let r`, re-binds its importers as a rebuild
+  does.
 - `export * from './x'` written before `x` exists is followed when `x`
   appears: the barrel's own `imports` edge to `x` and its importers' edges are
   a rebuild's (all 61 of the round-3 review's edit shapes, against 57). The
@@ -70,29 +84,36 @@ instead of under `base.ts`'s `jsx`.
   re-extracted every file that imported anything through such a barrel.
 
 Each incremental run below edits a file and undoes it, 3 times (6 runs,
-`--no-embed`, all three builds from source on the same machine):
+`--no-embed`, all three builds from source on the same machine, one after the
+other):
 
 | Edit | 0.184.0 | 0.185.0 | 0.186.0 |
 |---|---|---|---|
-| claude-mem-lite: add `export * from './hash-utils.mjs'` to `utils.mjs` | 173–185 ms | 1,028–1,082 ms, 90 files re-extracted | 175–194 ms, none |
-| hono: add an `export *` line to `src/helper/ssg/index.ts` | 68–82 ms | 89–126 ms | 93–105 ms |
-| hono: remove `export * from './ssg'` there | 63–81 ms | 125–132 ms | 94–106 ms |
-| hono: add an import to `src/hono-base.ts` | 86–99 ms | 75–88 ms | 77–93 ms |
+| claude-mem-lite: add `export * from './hash-utils.mjs'` to `utils.mjs` | 161–189 ms | 995–1,090 ms, 90 files re-extracted | 174–207 ms, none |
+| claude-mem-lite: add a comment to `utils.mjs` | 159–179 ms | 159–191 ms | 160–179 ms |
+| claude-mem-lite: add a new file, then delete it | 99–103 / 62–72 ms | 97–102 / 59–63 ms | 111–115 / 73–76 ms |
+| hono: add `export * from '../html'` to `src/helper/ssg/index.ts` | 51–56 ms | 88–97 ms | 90–123 ms |
+| hono: remove `export * from './ssg'` there | 52–55 ms | 125–132 ms | 92–96 ms |
+| hono: add an import to `src/hono-base.ts` | 76–85 ms | 82–86 ms | 76–79 ms |
 
 After the first and the two hono `export *` edits the incremental edges equal
-a full index's. A full index of 60 files that each re-export all the others by
-`export *` takes 93–97 ms (0.184.0 75–96, 0.185.0 1,030–1,050), and of 160
-files in 8 layers that each re-export every lower layer 222–239 ms (153–174,
-1,072–1,116).
+a full index's (0.184.0 re-extracted no importer for the hono ones). Adding or
+deleting a JS/TS file reads every JS import edge and export entry of the
+index, for the files whose specifier now names another file (the third row;
+claude-mem-lite has 7,189 such import edges). A full index of 60 files that each
+re-export all the others by `export *` takes 83–97 ms (0.184.0 74–81, 0.185.0
+1,025–1,053), and of 160 files in 8 layers that each re-export every lower
+layer 177–215 ms (149–162, 1,044–1,056). Adding a file to that 160-file
+index, whose 10 importers name 20 names no file defines, takes 81–92 ms
+(49–50, 50–52): each such name is looked for through every `export *`.
 
 ### fix: the startup repair tries again when another process is writing
 
 0.185.0's startup repair (orphan vectors, vector-table compaction, the
 embedding cache) logged `database is locked` and was not tried again until
 the server next started whenever another process wrote to the index during it,
-such as a CLI `incremental-index`. It now tries again, up to five times,
-waiting 1, 2, 4 and 8 s between tries, and lets the embedding backfill run in
-between. With another connection holding a write transaction for 6.5 s, the
+such as a CLI `incremental-index`. It now makes up to five tries, waiting 1,
+2, 4 and 8 s between them, and lets the embedding backfill run in between. With another connection holding a write transaction for 6.5 s, the
 orphan vector it should reap was still there after 0.185.0's repair and is
 gone after this one. It also no longer starts while an incremental run is
 waiting for the embedding backfill to stop (it wrote beside that run), and a
@@ -116,8 +137,29 @@ panic in it no longer skips the backfill.
   `exports` edge, so the readers of those edges (`dead-code` among them) do not
   see it exported; the walk reads the clause.
 - The export entries do not record TypeScript `export =` or `export import`,
-  `Object.assign(module.exports, …)`, or an export inside a block or a
-  function; a name exported only that way is bound by name as before.
+  `Object.assign(module.exports, …)`, `exports.f = ns.f` where `ns` holds a
+  required module, `exports['f'] = …`, `var v = module.exports =
+  require(…)`, tsc's `__exportStar(…)` and `Object.defineProperty(exports,
+  …)` output, `export default (function f() {})`, or an export inside a
+  block or a function; a name exported only that way is bound by name as
+  before.
+- CommonJS order is followed only as far as the file's text decides it. Two
+  spreads that both export a name (`module.exports = { ...require('./a'),
+  ...require('./b') }`) give a call of it no edge, where Node calls the
+  later one's; a property written before a spread is left to the spread, so
+  when the spread's module lacks the name the import binds by name.
+- An import's edge binds every node of the imported name in the file its
+  specifier names before the walk is asked, a private or nested one
+  included: beside `export { f } from './a.js'`, a private `function f` of
+  the barrel takes the import edge, while the call binds `a.js`'s `f`. After
+  `export { f as g, g as f }`, `import { f }` and `f()` bind that file's `f`
+  for both edges, where Node runs `g`, as in 0.185.0 (`import { f as h }`
+  and `h()` bind `g`).
+- A string export name (`export { f as 'x-y' }`) binds `<external>`, and
+  `export type * from` is read as a value `export *`.
+- When another process keeps writing to the index for longer than the 15 s
+  the startup repair waits in all, the repair is left to the next server
+  start.
 - A specifier is resolved as a bundler does (`./b` finds `b.js`), where Node's
   ESM loader requires the extension.
 

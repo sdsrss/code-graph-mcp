@@ -9429,6 +9429,7 @@ end
             calls.set(calls.get() + 1);
             Err(anyhow!("database is locked"))
         };
+        let started = std::time::Instant::now();
         drop(McpServer::run_startup_repair_retrying(
             path,
             &flag,
@@ -9437,6 +9438,13 @@ end
             tick,
         ));
         assert_eq!(calls.get(), backfill::STARTUP_REPAIR_ATTEMPTS, "bounded");
+        // The waits double between tries: 1 + 2 + 4 + 8 ticks (pre-tag review
+        // of 0.186.0: a constant wait survived the suite).
+        assert!(
+            started.elapsed() >= tick * 15,
+            "waited {:?}",
+            started.elapsed()
+        );
 
         let panics = |_: &Path| -> Result<()> { panic!("repair panicked") };
         let guard = McpServer::run_startup_repair_retrying(path, &flag, &no_yield, &panics, tick);

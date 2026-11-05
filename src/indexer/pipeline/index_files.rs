@@ -3954,12 +3954,19 @@ fn restore_inbound_edges(
                         metadata.as_deref(),
                     )?;
                 } else {
+                    // A JS import bound under another name (a renamed
+                    // re-export) goes back as it was extracted: under the name
+                    // it imports, without the key, or the by-name fallback
+                    // binds the old target's namesakes (pre-tag review of
+                    // 0.186.0, HIGH-1).
+                    let (target_name, metadata) =
+                        super::js_exports::as_extracted(metadata.as_deref(), target_name);
                     deferred.push(DeferredRelation {
                         source_ids: vec![*source_id],
                         source_name: String::new(),
-                        target_name: target_name.clone(),
+                        target_name,
                         relation: relation.clone(),
-                        metadata: metadata.clone(),
+                        metadata,
                         rel_path: src_path,
                         language: src_lang,
                         ns_file: None,
@@ -5107,11 +5114,22 @@ fn resolve_deferred_relations(
         if target_ids.is_empty() && (d.relation == REL_IMPLEMENTS || d.relation == REL_IMPORTS) {
             // A Rust `use` path keeps its module path on the sentinel edge, so a
             // later definition in the module it names re-extracts the importer
-            // (`bare_name_callers_of_new_duplicates`).
-            let metadata = d
-                .metadata
-                .clone()
-                .filter(|m| d.relation == REL_IMPORTS && m.contains(r#""ru""#));
+            // (`bare_name_callers_of_new_duplicates`). So does a JS/TS named
+            // import by a relative specifier: the re-export fan-out pulls it
+            // when the walk through that file changes, e.g. once the file
+            // defines the binding `export { helper as h }` names (pre-tag
+            // review of 0.186.0, MEDIUM-1).
+            let metadata = d.metadata.clone().filter(|m| {
+                d.relation == REL_IMPORTS
+                    && (m.contains(r#""ru""#)
+                        || import_meta.as_ref().is_some_and(|meta| {
+                            meta.get("q").is_none()
+                                && meta
+                                    .get("js_module")
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|s| s.starts_with("./") || s.starts_with("../"))
+                        }))
+            });
             for &src_id in &source_ids {
                 unresolved_externals.push((
                     src_id,

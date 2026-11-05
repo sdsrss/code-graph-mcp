@@ -16565,6 +16565,67 @@ fn a_js_reexport_resolves_as_node_does() {
     if calls != ["app.js.main --calls--> a.js.f"] {
         failures.push(format!("s22 module.exports = require(): {calls:?}"));
     }
+    // CommonJS writes run in order (pre-tag review of 0.186.0, MEDIUM-3);
+    // Node's answer per row. Two spreads of one name bind nothing: Node takes
+    // the later, the walk reads them as two `export *` sources that disagree.
+    let cjs_app = "const { f: g } = require('./index.js');\nfunction main() { return g(); }\nmodule.exports = { main };\n";
+    let ca = "function f() { return 'a.js'; }\nmodule.exports = { f };\n";
+    let cb = "function f() { return 'b.js'; }\nmodule.exports = { f };\n";
+    for (label, index, want) in [
+        (
+            "y01 two spreads",
+            "module.exports = { ...require('./a.js'), ...require('./b.js') };\n",
+            None,
+        ),
+        (
+            "y02 a property, then a spread",
+            "module.exports = { f: require('./b.js').f, ...require('./a.js') };\n",
+            Some("a.js"),
+        ),
+        (
+            "a spread, then a property",
+            "module.exports = { ...require('./a.js'), f: require('./b.js').f };\n",
+            Some("b.js"),
+        ),
+        (
+            "y03 exports.f written twice",
+            "exports.f = require('./a.js').f;\nexports.f = require('./b.js').f;\n",
+            Some("b.js"),
+        ),
+        (
+            "y04 module.exports written twice",
+            "module.exports = require('./a.js');\nmodule.exports = require('./b.js');\n",
+            Some("b.js"),
+        ),
+        (
+            "exports.f after module.exports is replaced",
+            "module.exports = { f: require('./a.js').f };\nexports.f = require('./b.js').f;\n",
+            Some("a.js"),
+        ),
+        (
+            "module.exports.f after module.exports is replaced",
+            "module.exports = { f: require('./a.js').f };\nmodule.exports.f = require('./b.js').f;\n",
+            Some("b.js"),
+        ),
+    ] {
+        let (_p, _d, db) = fresh_index_of(&[
+            ("app.js", cjs_app),
+            ("index.js", index),
+            ("a.js", ca),
+            ("b.js", cb),
+        ]);
+        let calls: Vec<String> = edge_set(&db)
+            .into_iter()
+            .filter(|e| e.starts_with("app.js.main --calls-->"))
+            .collect();
+        let want: Vec<String> = want
+            .map(|f| format!("app.js.main --calls--> {f}.f"))
+            .into_iter()
+            .collect();
+        if calls != want {
+            failures.push(format!("{label}: {calls:?} (want {want:?})"));
+        }
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -16800,4 +16861,363 @@ fn a_barrel_gaining_a_namesake_of_its_own_rebinds_its_importers() {
         "{:#?}",
         edge_set(&db)
     );
+}
+
+/// Pre-tag review of 0.186.0, HIGH-1: re-extracting `a.js` cascades an import
+/// bound through `export { r as h }` to `a.js`'s `r`, and Phase 0 requeued it
+/// under `r`. Once `a.js` defines no node `r` (`let r = 1`), the walk finds no
+/// node and the by-name fallback bound `c.js`'s `r`, where a rebuild, resolving
+/// `h`, binds `c.js`'s `h`; the bare call followed the import. With no
+/// namesake the edge went to `<external>:r`, still carrying `"imported"`.
+#[test]
+fn a_requeued_import_binds_under_the_name_it_imports() {
+    let app = "import { h } from './b.js';\nexport function main() { return h(); }\n";
+    let barrel = "export { r as h } from './a.js';\n";
+    let before_a = "function r() { return 1; }\nexport { r };\n";
+    let after_a = "let r = 1;\nexport { r };\n";
+    let decoys =
+        "export function h() { return 'decoy-h'; }\nexport function r() { return 'decoy-r'; }\n";
+    let rows = assert_incremental_graph_matches_rebuild(
+        &[
+            ("app.js", app),
+            ("b.js", barrel),
+            ("a.js", before_a),
+            ("c.js", decoys),
+        ],
+        &[("a.js", Some(after_a))],
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("app.js.main --calls[") && r.ends_with("--> c.js.h")),
+        "{rows:#?}"
+    );
+    assert_incremental_graph_matches_rebuild(
+        &[("app.js", app), ("b.js", barrel), ("a.js", before_a)],
+        &[("a.js", Some(after_a))],
+    );
+}
+
+/// Pre-tag review of 0.186.0, MEDIUM-1: the walk answers a binding (a file and
+/// a local name), and an import binds that file's nodes of the name. A file of
+/// the run gaining or losing such a node moves the import while its export
+/// entries stay as they were, so the fan-out has to see it: writing `export {
+/// helper as h }` before `function helper` left `app.js` at `<external>:h`.
+/// Each edit runs both ways.
+#[test]
+fn a_binding_file_gaining_the_bound_node_rebinds_its_importers() {
+    let app = |import: &str, call: &str, spec: &str| {
+        format!("import {{ {import} }} from './{spec}.js';\nexport function main() {{ return {call}(); }}\n")
+    };
+    let renamed = "export { f as h } from './a.js';\n";
+    let default = "export { default as h } from './a.js';\n";
+    // (label, importer, barrel, a.js without the node, a.js with it)
+    let cases: Vec<(&str, String, Option<&str>, &str, &str)> = vec![
+        (
+            "no barrel",
+            app("h", "h", "a"),
+            None,
+            "export { helper as h };\n",
+            "export { helper as h };\nfunction helper() { return 1; }\n",
+        ),
+        (
+            "a renamed re-export",
+            app("h", "h", "b"),
+            Some(renamed),
+            "let f = 1;\nexport { f };\n",
+            "function f() { return 1; }\nexport { f };\n",
+        ),
+        (
+            "a renamed import of a renamed re-export",
+            app("h as g", "g", "b"),
+            Some(renamed),
+            "let f = 1;\nexport { f };\n",
+            "function f() { return 1; }\nexport { f };\n",
+        ),
+        (
+            "a re-exported default",
+            app("h", "h", "b"),
+            Some(default),
+            "let foo = 1;\nexport default foo;\n",
+            "function foo() { return 1; }\nexport default foo;\n",
+        ),
+        (
+            "a renamed import of a re-exported default",
+            app("h as g", "g", "b"),
+            Some(default),
+            "export default helper;\n",
+            "export default helper;\nfunction helper() { return 1; }\n",
+        ),
+        (
+            "a class taking the bound name",
+            app("h", "h", "b"),
+            Some(renamed),
+            "let f = 1;\nexport { f };\n",
+            "class f {}\nexport { f };\n",
+        ),
+    ];
+    // The bound name stays a node but becomes a function, or back. The
+    // fan-out compares only whether a node of the name exists (a mutation
+    // reading the function kind too left every test green); a call binds only
+    // top-level functions, and these pin that the calls still end as a
+    // rebuild's.
+    let class = "class f {}\nexport { f };\n";
+    let function = "function f() { return 1; }\nexport { f };\n";
+    for (from, to, import, call) in [
+        (class, function, "h", "h"),
+        (function, class, "h", "h"),
+        (class, function, "h as g", "g"),
+        (function, class, "h as g", "g"),
+    ] {
+        assert_incremental_graph_matches_rebuild(
+            &[
+                ("app.js", &app(import, call, "b")),
+                ("b.js", renamed),
+                ("a.js", from),
+            ],
+            &[("a.js", Some(to))],
+        );
+    }
+    for (label, importer, barrel, without, with) in &cases {
+        for (from, to) in [(without, with), (with, without)] {
+            let mut tree = vec![("app.js", importer.as_str()), ("a.js", *from)];
+            if let Some(b) = barrel {
+                tree.push(("b.js", b));
+            }
+            let rows = assert_incremental_graph_matches_rebuild(&tree, &[("a.js", Some(to))]);
+            if to == with {
+                assert!(
+                    rows.iter()
+                        .any(|r| r.starts_with("app.js.<module> --imports[")
+                            && r.contains("--> a.js.")),
+                    "{label}: {rows:#?}"
+                );
+            }
+        }
+    }
+}
+
+/// The pre-tag review's mutations of 0.186.0 that left the suite green yet
+/// bound differently (MEDIUM-2), each told apart here: the fan-out reading a
+/// file's published names (`module.exports = { f }` → `{ f: g }`), the
+/// vanishing arm of Phase 0-pre (`./a` naming `a.js` once `a.ts` is gone), the
+/// fan-out reading `"imported"` (a renamed re-export retargeted), a package
+/// `export *` adding nothing to the walk, and a `.tsx` barrel's entries.
+#[test]
+fn the_reexport_rules_the_review_mutated_hold() {
+    let app = "import { f } from './b.js';\nexport function main() { return f(); }\n";
+    assert_incremental_graph_matches_rebuild(
+        &[
+            ("app.js", app),
+            ("b.js", "export * from './a.cjs';\n"),
+            (
+                "a.cjs",
+                "function f() { return 'f'; }\nfunction g() { return 'g'; }\nmodule.exports = { f };\n",
+            ),
+        ],
+        &[(
+            "a.cjs",
+            Some("function f() { return 'f'; }\nfunction g() { return 'g'; }\nmodule.exports = { f: g };\n"),
+        )],
+    );
+    let rows = assert_incremental_graph_matches_rebuild(
+        &[
+            ("app.js", app),
+            ("b.js", "export { f } from './a';\n"),
+            ("a.js", "export { f } from './r.js';\n"),
+            ("a.ts", "export function other(): number { return 0; }\n"),
+            ("r.js", "export function f() { return 'r'; }\n"),
+            ("z/q.js", "export function f() { return 'q'; }\n"),
+        ],
+        &[("a.ts", None)],
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("app.js.main --calls[") && r.ends_with("--> r.js.f")),
+        "{rows:#?}"
+    );
+    let two = "export function r() { return 1; }\nexport function s() { return 2; }\n";
+    assert_incremental_graph_matches_rebuild(
+        &[
+            ("app.js", app),
+            ("b.js", "export { r as f } from './a.js';\n"),
+            ("a.js", two),
+            ("c.js", "export function f() { return 'decoy'; }\n"),
+        ],
+        &[("b.js", Some("export { s as f } from './a.js';\n"))],
+    );
+    assert_incremental_graph_matches_rebuild(
+        &[
+            (
+                "app.js",
+                "import { f } from './index.js';\nexport function main() { return f(); }\n",
+            ),
+            ("index.js", "export { g as f } from './m.js';\n"),
+            ("m.js", "export { h as g } from './a.js';\n"),
+            (
+                "a.js",
+                "export function h() { return 'h'; }\nexport function k() { return 'k'; }\n",
+            ),
+        ],
+        &[("m.js", Some("export { k as g } from './a.js';\n"))],
+    );
+    let renamed_local = "function r() { return 'a.r'; }\nexport { r as f };\n";
+    for (barrel, tree) in [
+        (
+            "b.js",
+            vec![
+                ("app.js", app),
+                (
+                    "b.js",
+                    "export * from 'left-pad';\nexport * from './a.js';\n",
+                ),
+                ("a.js", renamed_local),
+                ("c.js", "export function f() { return 'c'; }\n"),
+            ],
+        ),
+        (
+            "b.tsx",
+            vec![
+                (
+                    "app.ts",
+                    "import { f } from './b';\nexport function main() { return f(); }\n",
+                ),
+                ("b.tsx", "export { r as f } from './a';\n"),
+                ("a.ts", "export function r() { return 'a.r'; }\n"),
+                ("c.ts", "export function f() { return 'c'; }\n"),
+            ],
+        ),
+    ] {
+        let (_p, _d, db) = fresh_index_of(&tree);
+        let calls: Vec<String> = edge_set(&db)
+            .into_iter()
+            .filter(|e| e.contains(".main --calls--> "))
+            .collect();
+        assert_eq!(calls.len(), 1, "{barrel}: {calls:?}");
+        assert!(calls[0].ends_with(".r"), "{barrel}: {calls:?}");
+    }
+}
+
+/// Two fan-out gaps the review's fuzz generator (`fuzz2.py`, seeds 5–7) left
+/// after the HIGH-1 / MEDIUM-1 repairs, both on a barrel's own `imports` edge:
+/// an edge into the file its specifier names that the walk served (`export {
+/// r as f }` inside that file) is no direct lookup, so the walk through that
+/// file decides it; and a file of the run gaining a node of the imported name
+/// binds it directly on a rebuild even when another file of the run lost one
+/// (the name's count did not rise, so the new-duplicate round stays quiet).
+#[test]
+fn a_barrel_edge_follows_the_file_it_names_through_the_walk_and_by_name() {
+    let decoy =
+        "export function f() { return 'decoy-f'; }\nexport function r() { return 'decoy-r'; }\n";
+    let renamed = "function r() { return 1; }\nexport { r as f };\n";
+    let rows = assert_incremental_graph_matches_rebuild(
+        &[
+            ("b.js", "export { f } from './d.js';\n"),
+            ("d.js", renamed),
+            ("decoy.js", decoy),
+        ],
+        &[("d.js", Some("function r() { return 1; }\nexport { r };\n"))],
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("b.js.<module> --imports[") && r.ends_with("--> decoy.js.f")),
+        "{rows:#?}"
+    );
+    assert_incremental_graph_matches_rebuild(
+        &[
+            ("b.js", "export { default as f } from './d.js';\n"),
+            ("d.js", "function r() { return 1; }\nexport default r;\n"),
+            ("decoy.js", decoy),
+        ],
+        &[("d.js", Some("function r() { return 1; }\nexport { r };\n"))],
+    );
+    let rows = assert_incremental_graph_matches_rebuild(
+        &[
+            ("b.js", "export { r as f } from './d2.js';\n"),
+            ("d1.js", renamed),
+            ("d2.js", "let r = 1;\nexport { r as f };\n"),
+            ("decoy.js", decoy),
+        ],
+        &[
+            ("d1.js", Some("let r = 1;\nexport { r as f };\n")),
+            ("d2.js", Some(renamed)),
+        ],
+    );
+    let barrel: Vec<&String> = rows
+        .iter()
+        .filter(|r| r.starts_with("b.js.<module> --imports["))
+        .collect();
+    assert!(
+        barrel.len() == 1 && barrel[0].ends_with("--> d2.js.r"),
+        "{rows:#?}"
+    );
+    // The same with nothing exported moving: `d2.js` gains an unexported `r`
+    // and `d1.js` loses one, so no file drifted and no file appeared.
+    let rows = assert_incremental_graph_matches_rebuild(
+        &[
+            (
+                "b.js",
+                "export { r as f } from './d2.js';
+",
+            ),
+            (
+                "d1.js",
+                "function r() { return 1; }
+export const y = 1;
+",
+            ),
+            (
+                "d2.js",
+                "export const x = 2;
+",
+            ),
+            ("decoy.js", decoy),
+        ],
+        &[
+            (
+                "d1.js",
+                Some(
+                    "export const y = 1;
+",
+                ),
+            ),
+            (
+                "d2.js",
+                Some(
+                    "export const x = 2;
+function r() { return 2; }
+",
+                ),
+            ),
+        ],
+    );
+    let barrel: Vec<&String> = rows
+        .iter()
+        .filter(|r| r.starts_with("b.js.<module> --imports["))
+        .collect();
+    assert!(
+        barrel.len() == 1 && barrel[0].ends_with("--> d2.js.r"),
+        "{rows:#?}"
+    );
+}
+
+/// An `imports` edge the walk bound under another name goes back to the
+/// deferred pass as it was extracted (pre-tag review of 0.186.0, HIGH-1): the
+/// name it imports, the metadata without the key. (The fan-out re-extracts
+/// such an importer in the same run as well, so the end state alone cannot
+/// tell the two apart.)
+#[test]
+fn a_requeued_js_import_goes_back_as_it_was_extracted() {
+    assert_eq!(
+        super::js_exports::as_extracted(Some(r#"{"imported":"h","js_module":"./b.js"}"#), "r"),
+        (
+            "h".to_string(),
+            Some(r#"{"js_module":"./b.js"}"#.to_string())
+        )
+    );
+    for plain in [Some(r#"{"js_module":"./b.js"}"#), None, Some("not json")] {
+        assert_eq!(
+            super::js_exports::as_extracted(plain, "r"),
+            ("r".to_string(), plain.map(str::to_string))
+        );
+    }
 }
