@@ -50,10 +50,13 @@ On the 62 valid programs of the round-4 review's probe set, the call edge
 matches what `node app.js` runs in 61, against 46 in 0.185.0 (the one left is
 listed under Not covered). A bare call through a plain import now follows a
 renamed re-export too: `import { f }` and `f()`, where the barrel holds
-`export { r as f } from './a.js'`, binds `a.js`'s `r` instead of another
-file's `f` (when no node of the project is named `f`, the call binds nothing;
-see Not covered). Such an import's edge records the name it imports
-(`"imported"` in the edge's metadata).
+`export { r as f } from './a.js'`, binds `a.js`'s `r` whether or not another
+file defines an `f` (0.185.0 bound that file's `f`, or nothing when none
+did). So does a name renamed on the way: `ff()` after `import { ff }` from a
+file holding `import { f as ff } from './a.js'` and `export { ff }` binds
+`a.js`'s `f` (0.185.0: no edge, the import bound `<external>`). Such an
+import's edge records the name it imports (`"imported"` in the edge's
+metadata).
 
 Full index of 9 JS/TS projects, 0.185.0 and this build from source: the edge
 sets of 8 are identical; hono 4.6.14 loses 14 edges and gains 16, each
@@ -72,13 +75,17 @@ instead of under `base.ts`'s `jsx`.
   33 with 0.185.0. In 1,050 graphs of the pre-release review's generator,
   whose edits also turn `function r` into `let r` and back and switch
   between plain, renamed and default exports (seeds 5 to 11), 0 do, against
-  23 with 0.185.0.
+  23 with 0.185.0. In 600 chains of six edits each (the third pre-release
+  review's generator, seeds 21 and 22, pending calls compared too), 0 do
+  after any step, against 14 with 0.185.0.
 - The bindings this version adds through a renamed re-export are kept a
   rebuild's in an incremental run: writing `export { helper as h }` before
   `function helper`, turning the bound `function r` into `let r`, or renaming
   the binding to the exported name (`function r() {}` with `export { r as f }`
   becoming `export function f() {}`) re-binds the imports and the bare calls
-  through them. (0.185.0 bound these by name, the same way in both.)
+  through them, and those calls keep their binding when the last other node
+  of the imported name goes or the first one comes. (0.185.0 bound these by
+  name, the same way in both.)
 - `export * from './x'` written before `x` exists is followed when `x`
   appears: the barrel's own `imports` edge to `x` and its importers' edges are
   a rebuild's (all 61 of the round-3 review's edit shapes, against 57). The
@@ -94,23 +101,23 @@ other):
 
 | Edit | 0.184.0 | 0.185.0 | 0.186.0 |
 |---|---|---|---|
-| claude-mem-lite: add `export * from './hash-utils.mjs'` to `utils.mjs` | 161–189 ms | 995–1,090 ms, 90 files re-extracted | 174–207 ms, none |
-| claude-mem-lite: add a comment to `utils.mjs` | 159–179 ms | 159–191 ms | 160–179 ms |
-| claude-mem-lite: add a new file, then delete it | 99–103 / 62–72 ms | 97–102 / 59–63 ms | 111–115 / 73–76 ms |
-| hono: add `export * from '../html'` to `src/helper/ssg/index.ts` | 51–56 ms | 88–97 ms | 90–123 ms |
-| hono: remove `export * from './ssg'` there | 52–55 ms | 125–132 ms | 92–96 ms |
-| hono: add an import to `src/hono-base.ts` | 76–85 ms | 82–86 ms | 76–79 ms |
+| claude-mem-lite: add `export * from './hash-utils.mjs'` to `utils.mjs` | 170–187 ms | 1,022–1,093 ms, 90 files re-extracted | 178–189 ms, none |
+| claude-mem-lite: add a comment to `utils.mjs` | 163–178 ms | 164–176 ms | 168–192 ms |
+| claude-mem-lite: add a new file, then delete it | 97–100 / 59–66 ms | 99–103 / 59–62 ms | 119–131 / 74–82 ms |
+| hono: add `export * from '../html'` to `src/helper/ssg/index.ts` | 53–66 ms | 90–113 ms | 94–103 ms |
+| hono: remove `export * from './ssg'` there | 52–62 ms | 131–150 ms | 95–123 ms |
+| hono: add an import to `src/hono-base.ts` | 76–86 ms | 80–90 ms | 79–86 ms |
 
 After the first and the two hono `export *` edits the incremental edges equal
 a full index's (0.184.0 re-extracted no importer for the hono ones). Adding or
 deleting a JS/TS file reads every JS import edge and export entry of the
 index, for the files whose specifier now names another file (the third row;
 claude-mem-lite has 7,189 such import edges). A full index of 60 files that each
-re-export all the others by `export *` takes 83–97 ms (0.184.0 74–81, 0.185.0
-1,025–1,053), and of 160 files in 8 layers that each re-export every lower
-layer 177–215 ms (149–162, 1,044–1,056). Adding a file to that 160-file
-index, whose 10 importers name 20 names no file defines, takes 81–92 ms
-(49–50, 50–52): each such name is looked for through every `export *`.
+re-export all the others by `export *` takes 82–85 ms (0.184.0 72–83, 0.185.0
+1,031–1,069), and of 160 files in 8 layers that each re-export every lower
+layer 188–214 ms (147–158, 1,052–1,080). Adding a file to that 160-file
+index, whose 10 importers name 20 names no file defines, takes 85 ms
+(49–60, 47–59): each such name is looked for through every `export *`.
 
 ### fix: the startup repair tries again when another process is writing
 
@@ -129,11 +136,6 @@ panic in it no longer skips the backfill.
 - `new g()` after `import { f as g } from './index.js'`, where the walk
   finds a class `f`, has no `calls` edge, as before: a call through a renamed
   import binds only functions.
-- A bare call through an import whose name no node of the project has gets
-  no `calls` edge even when the import binds: `import { ff } from './b.js'`,
-  where `b.js` holds `import { f as ff } from './a.js'` and `export { ff }`,
-  binds `a.js`'s `f`, and `ff()` binds nothing (as in 0.185.0, whose import
-  bound `<external>`).
 - `ns.f()` after `import * as ns from './index.js'` is bound by name, not
   through the barrel's re-exports: with `a.js` and `b.js` each defining `f`
   and `index.js` holding `export * from './b.js'`, it binds `a.js`'s `f`

@@ -94,6 +94,15 @@
   - LOW-3（复现）：N7（`INSERT OR IGNORE` → `INSERT`）存活。HIGH-1 测试加“一个文件两条改名导入、绑定同时移动”的形状：N7 下 `UNIQUE constraint failed: cg_js_requeued.path`，还原后绿。
   - LOW-4（复现）：C3、C4、C9 存活。解析器表加 3 行（node 核对：b.js、a.js、a.js），三个变异各被一行杀掉，还原后绿。LOW-3/LOW-4 提交 8d779bb1（pre-commit：cargo test 2419 通过、0 失败、7 忽略；fmt；clippy；指纹按“只改测试、不升版本”重记）。
   - 停止线：这是第 3 次复审仍有 MEDIUM，按事先定的深度上限停下，MEDIUM-1 的处理交用户决定（选项见汇报）。
+- 2026-11-05 用户选择：修重建一侧，再对这一个提交做第 4 轮复审；第 4 轮若在新代码里再出 HIGH/MEDIUM，撤回这次修改，按“现在发版 + 写进 Not covered”发 0.186.0。
+  - 实现（`resolve.rs::bind_calls_to_imported_targets`）：`cg_unique_imports` 加 `renamed` 列（组里有带 `imported` 的边）；新的一路从改名的唯一导入出发，连 `pending_unresolved_calls`（同一调用方文件、`target_name` = 导入名、元数据为空、同文件没有同名节点），插入调用边并删掉 pending 行。两种 scope 都按全图做。
+  - scope 推理（交第 4 轮证伪）：一个不在 scope 里的调用方 C 要被这一路绑定，需要它的 pending 行和一条唯一的改名导入同时存在。C 的导入集合只经重抽（C 在本轮）或延迟阶段（C 是 deferred source，进 scope）改变；如果那条唯一改名导入在本轮之前就有，C 的裸调用上一轮已被 2d-bind 改绑、错边被剪，Phase 0 不会以这个名字把它 requeue。所以按全图做和按 scope 做结果相同，后面的剪枝、置信度只看 scope 也不会漏。曾写过把被绑调用方并入 scope 的代码，因为到不了而撤掉。
+  - “同文件没有同名节点”一条与已有那一路的判定逐字相同（调用结果不应随别处有无诱饵而变）。实测同文件有同名方法时调用在 Phase 2 就绑到方法、不进 pending，所以这一条是等价分支。
+  - 影响：9 个语料全量边集（带元数据）r10 与 r9 逐行相同。之前估计 hono 多 3 条，实际上那个文件对 `createElement` 还有一条来自 `'.'` 的导入，不唯一，不绑；估算查询只在改名导入之间判断唯一性，算错了。75 个 Node 探测程序 r10 = r9（合法 62 个里仍是 61 个与 Node 一致）。
+  - 提交 ac69061f（pre-commit：check、test、fmt、clippy 通过；指纹重记不升版本，137 未发布）。r10（md5 0f4867c7，与 ac69061f 源码构建逐字节相同）对照 r9，带元数据：MEDIUM-1 4 个形状 CLI 和 refresh 都 4/4（r9 1/4）；评审 353 个手写用例 CLI 350、refresh 344 一致，余下 r9 同样不一致：s_4x 3 个（LOW-1 按名字重绑，0.185.0 同样），refresh 路径的 mb 6 个（一次 `affected` 点名 601–603 个文件，0.185.0 同样 6/8，另记）；kit38 + r4sets61 99/99；fuzz 400/400；fuzz2 1,050/1,050；链测种子 21、22 各 300 条：r10 0/600，r9 77/600，0.185.0 14/600。
+  - 变异（独立 worktree + target，lib 1588 个测试）：MA7（去掉整路）被杀；MA3（不限元数据，成员调用 `x.f()` 的 `{"q":"member"}` 行被绑）、MA5（无自调用守卫，自导入生成 `r → r`）、MA6（不限调用方文件，未导入的 `o.js` 的 `f()` 被绑）存活，补断言后重跑都被杀；MA2（不删 pending 行）第一次写错不能编译，重写后被杀；MA4（同文件同名检查）等价，见上；MA1（不限改名导入）存活且不等价：JS 文件 `import { f } from './t.ts'` 后 `f()` 留在 pending（pending 扫描只在同语言内找），MA1 会把它绑上。这是本版之前就有的缺口，增量与重建一致；扩大到普通导入属另一个行为变更，要先在语料上量，记为待办，不写测试钉住现状。
+  - 计时（6 次，`--no-embed`，v0.184.0 / 0.185.0 / r10 依次在同一台机器上，`timing-r10.sh`）：CHANGELOG 表整张换成这次的数。claude-mem-lite 加删文件 r10 119–131 / 74–82 ms（r8 那次 111–115 / 73–76）；交替 A/B 3 轮：r9 加 112–126、删 71–86，r10 加 114–130、删 72–91，范围重叠，新的一路没有可测开销。表后那句“增量边集等于全量”在 r10 上重验：claude-mem-lite 加 `export *` 31,097 条、hono 加 8,797 条、hono 删 8,793 条，逐行相同。
+  - 下一步：提交测试和文档，派第 4 轮复审（新 subagent，盲简报，范围 e74e9c84..HEAD，工作目录 /var/tmp/agent-tmp-review-0186d）；通过就发版，在新代码里出 HIGH/MEDIUM 就撤回 ac69061f 及其测试，按选项 2 发版。
 - D#738（afadb65e）：修复遇忙重试 5 次（间隔 1/2/4/8 s，期间放开标志）；增量请求 backfill 让出时不抢标志；panic 不跳过 backfill；`startup_follow_up` 可测。复现：另一连接持写事务 6.5 s，0.185.0 的修复后孤儿向量仍在（1），本版为 0。
 
 ## 验证记录

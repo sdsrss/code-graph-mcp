@@ -17389,4 +17389,33 @@ fn a_bare_call_through_a_renamed_import_binds_with_no_node_of_its_name() {
         "{:#?}",
         graph_rows(&db)
     );
+    // Only a bare call of the importing file: not a member call of the name
+    // there, not a bare call in a file without the import, and not a call the
+    // import's own target makes (a file importing itself).
+    for (tree, caller) in [
+        (
+            &[
+                (
+                    "app.js",
+                    "import { f } from './e.js';\nexport function main() { return f(); }\nexport function m(x) { return x.f(); }\n",
+                ),
+                ("e.js", "function r() { return 'e'; }\nexport { r as f };\n"),
+                ("o.js", "export function o() { return f(); }\n"),
+            ][..],
+            ["app.js.m --calls[", "o.js.o --calls["].as_slice(),
+        ),
+        (
+            &[(
+                "app.js",
+                "import { f } from './app.js';\nfunction r() { return f(); }\nexport { r as f };\n",
+            )][..],
+            ["app.js.r --calls["].as_slice(),
+        ),
+    ] {
+        let (_p, _d, db) = fresh_index_of(tree);
+        let rows = graph_rows(&db);
+        for c in caller {
+            assert!(!rows.iter().any(|r| r.starts_with(c)), "{c} {rows:#?}");
+        }
+    }
 }
