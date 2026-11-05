@@ -34,7 +34,8 @@ name is resolved through them as ECMAScript's `ResolveExport` does:
 - CommonJS `module.exports = require('./x')`, `module.exports = {
   ...require('./x') }`, and `exports.y = x` or `module.exports = { y: x }`
   where `x` was required, forward to that file. These forwarding writes
-  apply in the order Node runs them: the last one of a name wins,
+  apply in the order Node runs them (chained writes aside, see Not
+  covered): the last one of a name wins,
   `module.exports = …` replaces the ones before it, and an `exports.y = …`
   after that exports nothing (`exports` still names the old object) until
   `module.exports = exports` or `exports = module.exports` joins the two
@@ -72,13 +73,12 @@ instead of under `base.ts`'s `jsx`.
   whose edits also turn `function r` into `let r` and back and switch
   between plain, renamed and default exports (seeds 5 to 11), 0 do, against
   23 with 0.185.0.
-- An import bound through a renamed re-export follows the file its walk ends
-  in: writing `export { helper as h }` before `function helper`, or turning
-  the bound `function r` into `let r`, re-binds its importers as a rebuild
-  does. So do the bare calls bound through such an import when the binding
-  is renamed to the exported name (`function r() {}` with `export { r as f }`
-  becoming `export function f() {}`): those were lost, or bound another
-  file's `r`.
+- The bindings this version adds through a renamed re-export are kept a
+  rebuild's in an incremental run: writing `export { helper as h }` before
+  `function helper`, turning the bound `function r` into `let r`, or renaming
+  the binding to the exported name (`function r() {}` with `export { r as f }`
+  becoming `export function f() {}`) re-binds the imports and the bare calls
+  through them. (0.185.0 bound these by name, the same way in both.)
 - `export * from './x'` written before `x` exists is followed when `x`
   appears: the barrel's own `imports` edge to `x` and its importers' edges are
   a rebuild's (all 61 of the round-3 review's edit shapes, against 57). The
@@ -154,6 +154,13 @@ panic in it no longer skips the backfill.
   exports.f = require('./b').f` and `module.exports = { f };
   module.exports = require('./b')` bind the file's own `f`, where Node runs
   `b.js`'s.
+- A member write inside an assignment chain is not recorded. After
+  `exports.f = require('./b.js').f`, the line `exports.g = exports.f =
+  require('./a.js').f` leaves `f` bound to `b.js`'s, and `exports.f =
+  exports.g = require('./a.js').f` leaves `f` with no entry, bound by name, as
+  does `module.exports.f = exports.f = require('./a.js').f`; Node runs
+  `a.js`'s `f` in all three. `module.exports = { ...module.exports }` drops
+  the entries written before it, where Node keeps them.
 - CommonJS order is followed only as far as the file's text decides it. Two
   spreads that both export a name (`module.exports = { ...require('./a'),
   ...require('./b') }`) give a call of it no edge, where Node calls the
@@ -161,12 +168,14 @@ panic in it no longer skips the backfill.
   when the spread's module lacks the name the import binds by name.
 - An import's edge binds every node of the imported name in the file its
   specifier names before the walk is asked, a private or nested one
-  included: beside `export { f } from './a.js'`, a private `function f` of
-  the barrel takes the import edge, and a bare `f()` follows it (`import { f
-  as g }` and `g()` bind `a.js`'s `f`). After
-  `export { f as g, g as f }`, `import { f }` and `f()` bind that file's `f`
-  for both edges, where Node runs `g`, as in 0.185.0 (`import { f as h }`
-  and `h()` bind `g`).
+  included, and a bare call of the name follows that edge: beside
+  `export { f } from './a.js'`, a private `function f` of the barrel takes
+  the edge of `import { f }` and the call `f()`, where Node runs `a.js`'s `f`;
+  after `export { f as g, g as f }`, `import { f }` and `f()` bind that file's
+  `f`, where Node runs `g`. Both as in 0.185.0. With a renamed import only the
+  call differs: `g()` after `import { f as g }` binds `a.js`'s `f` (as in
+  0.185.0), and `h()` after `import { f as h }` from the swapping file binds
+  `g` (0.185.0: no edge); the import edges are the ones above.
 - An import bound by name across the project, because no file on its path
   defines the name, is re-bound in an incremental run only when the name
   gains a definition overall: when one file gains an unexported `r` and

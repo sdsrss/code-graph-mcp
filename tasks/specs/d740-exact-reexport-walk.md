@@ -67,7 +67,7 @@
 - 2026-11-05：用户授权新增表；D#735 下个会话；D#736 不跑。
 - 变异（9c481428 的副本、独立 target，24 个）：首轮 15 个被杀、3 个写错不能编译；为存活的补测试（星号环、自指 barrel、歧义来源不被后面的来源掩盖、`export *` 不传 `default`、包名重导出 = 未知、命名空间调用不进 pending、改名重导出的按名字调用要被剪掉、删除目标文件后的 requeue、星号目标出现时 barrel 自己的边——原测试行的三个同名定义掩盖了 Phase 0-pre）。重跑存活者：M2 M4 M5 M6 M8 M12 M15 M19 M20 被杀。
 - 删掉两段没有变异能杀掉的扇出分支：新文件"所有名字漂移"（新文件只能经由一个解析结果变了的已有文件被访问到，那个文件已漂移；改为与空快照比较）；"直接目标文件新增同名节点"检查（新同名定义那一轮的 module-import 分支已经拉这个导入方，实测日志 `1 bare-name caller(s)`）。余下等价变异：新文件跳过而不是与空快照比较；requeue 读目标名（导入方同一轮会被重抽）。
-- 2026-11-05 发版进度：发版提交 1dabea53（分支 d740-exact-reexport-walk，未推送）；插件清点（干净 clone、沙箱 HOME）0.186.0：Skills 2 · Agents 1 · Hooks 6 · MCP 1；JS 套件 1779 通过、0 失败、3 跳过；main CI 绿（41881101175、定时 41974016912）。第 1 轮预发评审结果与修复见下一条；修复提交 879767b3（pre-commit：cargo test 2418 通过、0 失败、7 忽略；fmt；两条 clippy 腿）。第 2 轮评审结果与修复见下一条。下一步：第 3 轮评审（只看第 2 轮修复提交，新 subagent，工作目录 /var/tmp/agent-tmp-review-0186c）；通过后合并到 main（快进）、推送、等 CI、打 tag。复审深度上限 2：第 2 轮若仍有 HIGH/MEDIUM，修复后对该修复再复审一次；第 3 次仍未通过则停下，带全部上下文上报用户。
+- 2026-11-05 发版进度：发版提交 1dabea53（分支 d740-exact-reexport-walk，未推送）；插件清点（干净 clone、沙箱 HOME）0.186.0：Skills 2 · Agents 1 · Hooks 6 · MCP 1；JS 套件 1779 通过、0 失败、3 跳过；main CI 绿（41881101175、定时 41974016912）。第 1 轮预发评审结果与修复见下一条；修复提交 879767b3（pre-commit：cargo test 2418 通过、0 失败、7 忽略；fmt；两条 clippy 腿）。第 2 轮评审结果与修复见下一条，修复提交 40c0792c（pre-commit：cargo test 2419 通过、0 失败、7 忽略；fmt；两条 clippy 腿）。成熟方案对照：TypeScript BuilderProgram 按文件声明签名（.d.ts 哈希）变化沿引用 BFS 重查、签名不变即停；salsa/rustc red-green 记录每个查询读过的输入、输入变才重算并早停。本扇出是用手写规则近似后者；发版后登记待办：给 JS 导入边记录解析时读过的 (文件, 名字) 与节点名查找，按依赖重解析，取代规则式扇出。下一步：第 3 轮评审（只看第 2 轮修复提交，新 subagent，工作目录 /var/tmp/agent-tmp-review-0186c）；通过后合并到 main（快进）、推送、等 CI、打 tag。复审深度上限 2：第 2 轮若仍有 HIGH/MEDIUM，修复后对该修复再复审一次；第 3 次仍未通过则停下，带全部上下文上报用户。
 - 2026-11-05 预发评审（第 1 轮，新 subagent，盲简报）：HIGH 1、MEDIUM 3、LOW 9，逐条对代码核实后修复：
   - HIGH-1（Phase 0 requeue 用旧目标名，by-name 兜底绑到旧名字的同名定义）：requeue 前把边还原成抽取时的样子（`js_exports::as_extracted`：用导入名、去掉 `imported`）。变异 M01（不还原）在终态上等价：被 requeue 意味着绑定文件里那个节点没了，这正是 MEDIUM-1 的"有无同名节点"漂移，扇出在同一次运行里会重抽这个导入方；保留还原是因为 requeue 交给延迟阶段的输入应当就是抽取结果，不靠后面一轮纠正。单测 `a_requeued_js_import_goes_back_as_it_was_extracted` 钉住函数本身（M11 被杀）。
   - MEDIUM-1（绑定文件增减了被绑定名字的节点，扇出看不到）：快照加运行文件的节点名（`cg_js_nodes_before`），本地导出的形状带"该本地名有没有节点"。还需要让落到 `<external>` 的相对具名导入保留 `js_module` 元数据（之前只保留 Rust 的 `ru`），否则扇出找不到这个导入方。变异显示"顶层函数"标志与"有节点"标志分开比较没有可观测差别（M12 存活：调用经 requeue 和 pending 重解析），所以只比较"有没有同名节点"。
@@ -86,6 +86,14 @@
   - LOW-5：Not covered 里"调用绑到 `a.js` 的 `f`"只对改名导入成立，改措辞。
   - LOW-6：同一模块两个顶层 `function f`（非法 JS，ESM 下是语法错误）不一致；合法变体（嵌套同名函数）在本版、0.185.0、0.184.0 都一致。不处理。
   - 本轮变异（独立树和 target）：N1、N3–N8 被杀；N2（本轮内的源文件也记录）只多重抽一次，等价。
+- 2026-11-05 第 3 轮评审（只看 40c0792c，新 subagent）：HIGH 0、MEDIUM 2、LOW 4，逐条核实：
+  - MEDIUM-1（复现，本分支 md5 839d70bf 3/4 不一致；0.185.0、0.184.0 4/4 一致）：`import { f } from './e.js'` + `f()`，`e.js` 里 `export { r as f }`，另一文件的 `export function f` 被删或改名。增量保留 `main → e.js:r`（Node 运行的正是它），重建没有调用边（pending 里留着 `main => f`）。因果链：重建时 Phase 2d-bind（`resolve.rs::bind_calls_to_imported_targets`）只把一条已按名字绑到同名节点的裸调用边改绑到导入目标；全项目没有名为 `f` 的节点就没有这条边可改，调用留在 pending；增量里那条边是诱饵 `f` 还在时改绑的，诱饵消失时没有任何东西重问 `app.js`。与 Not covered 里 `ff()` 那条是同一个重建缺口。配对链测（评审的 `chaingen.py`，种子 21，300 条 6 步链，边带元数据 + pending 行）：本分支 35 不一致，35 条全是这一类（增量有 Node 的边，重建 pending）；0.185.0 8、0.184.0 10，全是增量残留按名字绑到诱饵 `c.js:f` 的错边。
+  - MEDIUM-2（复现）：CHANGELOG “those were lost, or bound another file's `r`” 说的是未发布代码的缺陷；整条第一句在 0.185.0 上也一致（4 个形状 + 评审 3 个，0.185.0/0.184.0 全 SAME）。改写为“本版新增的改名绑定在增量里保持重建的结果”。
+  - LOW-1（读码 + 复现）：成员写入链只读最外层（r1 只记 `f → ./b.js`，r2/r3/r4 无条目，node 都运行 `a.js`）。写进 Not covered，第 37 行加“chained writes aside”。
+  - LOW-2（复现）：`h()` 在 0.185.0 无调用边；`import { f as g }` 的导入边绑 barrel 私有 `f`，只有调用绑 `a.js`。改写该条。
+  - LOW-3（复现）：N7（`INSERT OR IGNORE` → `INSERT`）存活。HIGH-1 测试加“一个文件两条改名导入、绑定同时移动”的形状：N7 下 `UNIQUE constraint failed: cg_js_requeued.path`，还原后绿。
+  - LOW-4（复现）：C3、C4、C9 存活。解析器表加 3 行（node 核对：b.js、a.js、a.js），三个变异各被一行杀掉，还原后绿。LOW-3/LOW-4 提交 8d779bb1（pre-commit：cargo test 2419 通过、0 失败、7 忽略；fmt；clippy；指纹按“只改测试、不升版本”重记）。
+  - 停止线：这是第 3 次复审仍有 MEDIUM，按事先定的深度上限停下，MEDIUM-1 的处理交用户决定（选项见汇报）。
 - D#738（afadb65e）：修复遇忙重试 5 次（间隔 1/2/4/8 s，期间放开标志）；增量请求 backfill 让出时不抢标志；panic 不跳过 backfill；`startup_follow_up` 可测。复现：另一连接持写事务 6.5 s，0.185.0 的修复后孤儿向量仍在（1），本版为 0。
 
 ## 验证记录
