@@ -2175,6 +2175,44 @@ fn a_js_family_call_binds_what_its_file_imports() {
             "A",
             vec![],
         ),
+        (
+            "a member call of an imported name",
+            vec![
+                ("k.ts", "export class K {}\n"),
+                (
+                    "a.tsx",
+                    "import { K } from './k';\nexport function A(o: any) { return o.K(); }\n",
+                ),
+            ],
+            "A",
+            vec![],
+        ),
+        (
+            "another sibling defines it, and the caller makes a member call of it",
+            vec![
+                f_ts,
+                ("c.js", "export function f() { return 3; }\n"),
+                (
+                    "a.tsx",
+                    "import { f } from './t';\nexport function A(o: any) { o.f(); return f(); }\n",
+                ),
+            ],
+            "A",
+            vec!["A -> t.ts.f"],
+        ),
+        (
+            "a renamed re-export, a sibling of the name elsewhere",
+            vec![
+                ("u.ts", "function s() { return 1; }\nexport { s as f };\n"),
+                ("c.js", "export function f() { return 3; }\n"),
+                (
+                    "a.tsx",
+                    "import { f } from './u';\nexport function A() { return f(); }\n",
+                ),
+            ],
+            "A",
+            vec![],
+        ),
     ];
     let mut failures = Vec::new();
     for (label, files, caller, want) in table {
@@ -2198,41 +2236,74 @@ fn a_js_family_call_binds_what_its_file_imports() {
 }
 
 /// D#742: the widened pool depends on the caller's import, so every edit that
-/// moves either side gives the edges and pending rows a rebuild gives.
+/// moves either side gives the edges and pending rows a rebuild gives, and the
+/// rebuild binds what the final tree imports (`want`, so a chain cannot pass
+/// by both sides binding nothing).
 #[test]
 fn a_js_family_import_call_matches_a_rebuild_through_edits() {
     let caller = "import { f } from './t';\nexport function A() { return f(); }\n";
     let callee = "export function f() { return 1; }\n";
+    let guarded = "import { f } from './t';\nexport function A(o: any) { o.f(); return f(); }\n";
+    let renamed = "function r() { return 1; }\nexport { r as f };\n";
+    let two_imports = "import { f } from './t';\nimport { f as g } from './v';\n\
+                       export function A() { return f() + g(); }\n";
+    let long_caller = format!(
+        "import {{ f }} from './t';\nexport function A() {{\n  /* {} */\n  return f();\n}}\n",
+        "x".repeat(4200)
+    );
     type Tree<'a> = &'a [(&'a str, &'a str)];
     type Edit<'a> = &'a [(&'a str, Option<&'a str>)];
-    let chains: &[(&str, Tree, Edit)] = &[
-        ("the callee arrives", &[("a.tsx", caller)], &[("t.ts", Some(callee))]),
-        ("the caller arrives", &[("t.ts", callee)], &[("a.tsx", Some(caller))]),
-        ("the callee goes", &[("a.tsx", caller), ("t.ts", callee)], &[("t.ts", None)]),
+    let chains: &[(&str, Tree, Edit, &[&str])] = &[
+        (
+            "the callee arrives",
+            &[("a.tsx", caller)],
+            &[("t.ts", Some(callee))],
+            &["a.tsx.A -> t.ts.f"],
+        ),
+        (
+            "the caller arrives",
+            &[("t.ts", callee)],
+            &[("a.tsx", Some(caller))],
+            &["a.tsx.A -> t.ts.f"],
+        ),
+        (
+            "the callee goes",
+            &[("a.tsx", caller), ("t.ts", callee)],
+            &[("t.ts", None)],
+            &[],
+        ),
         (
             "an own-language twin appears",
             &[("a.tsx", caller), ("t.ts", callee)],
             &[("b.tsx", Some("export function f() { return 2; }\n"))],
+            &["a.tsx.A -> t.ts.f"],
         ),
         (
             "the caller drops the import",
             &[("a.tsx", caller), ("t.ts", callee)],
             &[("a.tsx", Some("export function A() { return f(); }\n"))],
+            &[],
         ),
         (
             "the callee renames it",
             &[("a.tsx", caller), ("t.ts", callee)],
             &[("t.ts", Some("export function g() { return 1; }\n"))],
+            &[],
         ),
         (
             "the callee moves to js",
             &[("a.tsx", caller), ("t.ts", callee)],
             &[("t.ts", None), ("t.js", Some(callee))],
+            &["a.tsx.A -> t.js.f"],
         ),
         (
             "the callee file is touched",
             &[("a.tsx", caller), ("t.ts", callee)],
-            &[("t.ts", Some("// touched\nexport function f() { return 1; }\n"))],
+            &[(
+                "t.ts",
+                Some("// touched\nexport function f() { return 1; }\n"),
+            )],
+            &["a.tsx.A -> t.ts.f"],
         ),
         (
             "the callee re-exports it from another file",
@@ -2241,27 +2312,60 @@ fn a_js_family_import_call_matches_a_rebuild_through_edits() {
                 ("t.ts", Some("export { f } from './u';\n")),
                 ("u.ts", Some(callee)),
             ],
+            &["a.tsx.A -> u.ts.f"],
         ),
         (
             "a first `f` appears beside a renamed re-export",
-            &[
-                ("a.tsx", caller),
-                ("t.ts", "function r() { return 1; }\nexport { r as f };\n"),
-            ],
+            &[("a.tsx", caller), ("t.ts", renamed)],
             &[("c.ts", Some(callee))],
+            &[],
         ),
         (
-            "a second import of the name goes",
+            "a sibling decoy of a renamed re-export goes",
+            &[("a.tsx", caller), ("t.ts", renamed), ("c.js", callee)],
+            &[("c.js", Some("export function g() { return 1; }\n"))],
+            &[],
+        ),
+        (
+            "another sibling appears beside the caller's member call of the name",
+            &[("a.tsx", guarded), ("t.ts", callee)],
+            &[("c.js", Some(callee))],
+            &["a.tsx.A -> t.ts.f"],
+        ),
+        (
+            "the caller's own language gains the name beside its member call",
             &[
-                ("a.tsx", "import { f } from './t';\nimport { f as g } from './v';\nexport function A() { return f() + g(); }\n"),
+                ("a.tsx", guarded),
                 ("t.ts", callee),
-                ("v.ts", callee),
+                ("c.tsx", "export const w = 1;\n"),
             ],
+            &[("c.tsx", Some("export function f() { return 2; }\n"))],
+            &["a.tsx.A -> c.tsx.f", "a.tsx.A -> t.ts.f"],
+        ),
+        (
+            // The prune keeps `b.tsx:f` beside the import (the caller's text is
+            // past the 4 KB it reads); its deletion buffers the call, and only
+            // the pending sweep sees it. (A member call `o.f()` would keep it
+            // too, but loses its own pending row on the deletion, D#743.)
+            "the caller's own-language definition goes",
+            &[
+                ("a.tsx", &long_caller),
+                ("t.ts", callee),
+                ("b.tsx", "export function f() { return 2; }\n"),
+            ],
+            &[("b.tsx", None)],
+            &["a.tsx.A -> t.ts.f"],
+        ),
+        (
+            // The import of `./v` then binds by name: no longer walked.
+            "a second import of the name goes",
+            &[("a.tsx", two_imports), ("t.ts", callee), ("v.ts", callee)],
             &[("v.ts", None)],
+            &[],
         ),
     ];
     let mut failures = Vec::new();
-    for (label, before, after) in chains {
+    for (label, before, after, want_edges) in chains {
         let (project, _d, db) = fresh_index_of(before);
         let mut tree: Vec<(String, String)> = before
             .iter()
@@ -2282,6 +2386,17 @@ fn a_js_family_import_call_matches_a_rebuild_through_edits() {
         let (_p2, _d2, control) = fresh_index_of(&files);
         let got = (call_edges_with_confidence(&db), pending_set(&db));
         let want = (call_edges_with_confidence(&control), pending_set(&control));
+        let bound: Vec<String> = want
+            .0
+            .iter()
+            .filter(|e| e.starts_with("a.tsx.A "))
+            .map(|e| e.split(' ').take(3).collect::<Vec<_>>().join(" "))
+            .collect();
+        if bound != *want_edges {
+            failures.push(format!(
+                "{label}: the rebuild binds {bound:?}, want {want_edges:?}"
+            ));
+        }
         if got != want {
             failures.push(format!("{label}:\n    got  {got:?}\n    want {want:?}"));
         }
@@ -6255,6 +6370,45 @@ fn test_empty_incremental_tick_does_not_age_pending_rows() {
             .iter()
             .any(|e| e.relation == REL_CALLS && e.target_id == foo_id),
         "the forward reference must still bridge after idle ticks"
+    );
+}
+
+/// D#743 runs the sweep in a run that only deletes files, to re-resolve what
+/// the deletion buffered; that sweep ages no row. Deleting a barrel re-extracts
+/// its importer in a second, parsing round of the same invocation, and that
+/// round ages each row once, as 0.187.0 did: the deletion round aged them too
+/// at first (attempts 1 -> 3 for the reviewer's unrelated `zzz()`).
+#[test]
+fn a_deletion_ages_a_pending_row_at_most_once() {
+    let attempts = |db: &Database| -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT attempts FROM pending_unresolved_calls WHERE target_name = 'zzz'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let (project, _d, db) = fresh_index_of(&[
+        ("t.ts", "export function f() { return 1; }\n"),
+        ("b.ts", "export { f } from './t';\n"),
+        (
+            "a.ts",
+            "import { f } from './b';\nexport function A() { return f(); }\n",
+        ),
+        ("z.ts", "export function Z() { return zzz(); }\n"),
+        ("y.ts", "export function Y() { return 1; }\n"),
+    ]);
+    let indexed = attempts(&db);
+    fs::remove_file(project.path().join("y.ts")).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert_eq!(attempts(&db), indexed, "a plain deletion parses nothing");
+    fs::remove_file(project.path().join("b.ts")).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert_eq!(
+        attempts(&db),
+        indexed + 1,
+        "the barrel's deletion re-extracts a.ts: one parsing round"
     );
 }
 

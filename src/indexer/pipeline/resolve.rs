@@ -243,75 +243,85 @@ pub(super) fn python_attr_of(metadata: Option<&str>) -> Option<String> {
 
 const JS_FAMILY: [&str; 3] = ["javascript", "typescript", "tsx"];
 
-/// Whether a definition in `callee` joins the by-name pool of a call in
-/// `caller` that [`may_widen_to_family`] and whose file imports the name from
-/// one project node ([`uniquely_imported_names`]): the JS family's languages
-/// import one another's files. hono's `.tsx` tests left 182 calls of what they
-/// import from `.ts` modules without an edge, the pool holding `tsx` only
-/// (D#742). Widening every pool instead bound 331 calls hono does not import
-/// by that name, and daagu's `tseslint.config()` a `.ts` constant.
+/// Whether a definition in `callee` is a sibling of a call in `caller`: the
+/// JS family's languages import one another's files. hono's `.tsx` tests left
+/// 182 calls of what they import from `.ts` modules without an edge, the
+/// call's pool holding `tsx` only (D#742).
 pub(super) fn family_fallback(caller: &str, callee: &str) -> bool {
     caller != callee && JS_FAMILY.contains(&caller) && JS_FAMILY.contains(&callee)
 }
 
-/// A bare call in a JS-family file, no qualifier at all: the only call Phase
-/// 2d-bind re-points at what its file imports, which settles the by-name pick
-/// the widened pool makes. A call through a package name (`{"q":"pkg"}`) is
-/// not one: hono's `dirname()` from `@std/path` bound a project `dirname`.
+/// A bare call in a JS-family file, no qualifier at all. A call through a
+/// package name (`{"q":"pkg"}`) is not one, nor a member call.
 pub(super) fn may_widen_to_family(caller: &str, metadata: Option<&str>) -> bool {
     JS_FAMILY.contains(&caller) && metadata.is_none()
 }
 
-/// `(importing file, name)` of every name a file imports from exactly one
-/// project node, by the rule of 2d-bind's `cg_unique_imports`, each import of
-/// it through a relative specifier that names an indexed file: the walk bound
-/// those, where an import of `../../dist/x` (not indexed) bound by name.
-pub(super) fn uniquely_imported_names(
-    conn: &rusqlite::Connection,
-    files: &HashSet<String>,
-) -> Result<HashSet<(String, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT f.path, COALESCE(json_extract(ie.metadata, '$.imported'), itn.name),
-                itn.id, json_extract(ie.metadata, '$.js_module')
-         FROM edges ie
-         JOIN nodes mn ON mn.id = ie.source_id
-         JOIN files f ON f.id = mn.file_id
-         JOIN nodes itn ON itn.id = ie.target_id
-         JOIN files itf ON itf.id = itn.file_id
-         WHERE ie.relation = 'imports'
-           AND itf.path <> '<external>'
-           AND json_extract(ie.metadata, '$.attr') IS NULL",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, Option<String>>(3)?,
-        ))
-    })?;
-    // (target, every import through a specifier naming an indexed file), or
-    // None once two targets are seen.
-    let mut by_name: HashMap<(String, String), Option<(i64, bool)>> = HashMap::new();
-    for row in rows {
-        let (path, name, target, spec) = row?;
-        let walked = spec.is_some_and(|spec| {
-            super::js_modules::resolve_js_specifier_path(&spec, &path, files).is_some()
-        });
-        by_name
-            .entry((path, name))
-            .and_modify(|seen| {
-                *seen = seen
-                    .filter(|(t, _)| *t == target)
-                    .map(|(t, w)| (t, w && walked));
-            })
-            .or_insert(Some((target, walked)));
+/// The definition a file imports under a name, read once per file: the
+/// file's only import target for that name, every import of it through a
+/// relative path that names an indexed file. The walk bound those; an import
+/// of an unindexed `../dist/x` was bound by name. The name is the one the
+/// module exports (`import { f as g }` imports `f`), as 2d-bind reads it.
+#[derive(Default)]
+pub(super) struct FileImports {
+    by_file: HashMap<String, HashMap<String, Option<i64>>>,
+}
+
+impl FileImports {
+    pub(super) fn target(
+        &mut self,
+        conn: &rusqlite::Connection,
+        files: &HashSet<String>,
+        file: &str,
+        name: &str,
+    ) -> Result<Option<i64>> {
+        if !self.by_file.contains_key(file) {
+            // `CROSS JOIN` in file-first order: without statistics (a fresh
+            // index has none yet) SQLite drove this from `idx_edges_relation`,
+            // every import edge of the index once per file: 28 s of a 30 s full
+            // index of 4,400 files with 100,000 imports.
+            let mut stmt = conn.prepare_cached(
+                "SELECT COALESCE(json_extract(ie.metadata, '$.imported'), itn.name),
+                        itn.id, json_extract(ie.metadata, '$.js_module')
+                 FROM files f
+                 CROSS JOIN nodes mn ON mn.file_id = f.id
+                 CROSS JOIN edges ie ON ie.source_id = mn.id AND ie.relation = 'imports'
+                 CROSS JOIN nodes itn ON itn.id = ie.target_id
+                 CROSS JOIN files itf ON itf.id = itn.file_id
+                 WHERE f.path = ?1
+                   AND itf.path <> '<external>'
+                   AND json_extract(ie.metadata, '$.attr') IS NULL",
+            )?;
+            let rows = stmt.query_map([file], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            // (target, every import walked), or None once two targets are seen.
+            let mut seen: HashMap<String, Option<(i64, bool)>> = HashMap::new();
+            for row in rows {
+                let (imported, target, spec) = row?;
+                let walked = spec.is_some_and(|spec| {
+                    super::js_modules::resolve_js_specifier_path(&spec, file, files).is_some()
+                });
+                seen.entry(imported)
+                    .and_modify(|s| {
+                        *s = s
+                            .filter(|(t, _)| *t == target)
+                            .map(|(t, w)| (t, w && walked));
+                    })
+                    .or_insert(Some((target, walked)));
+            }
+            let named = seen
+                .into_iter()
+                .map(|(k, s)| (k, s.filter(|(_, walked)| *walked).map(|(t, _)| t)))
+                .collect();
+            self.by_file.insert(file.to_string(), named);
+        }
+        Ok(self.by_file[file].get(name).copied().flatten())
     }
-    Ok(by_name
-        .into_iter()
-        .filter(|(_, seen)| matches!(seen, Some((_, true))))
-        .map(|(key, _)| key)
-        .collect())
 }
 
 /// The `pending_unresolved_calls.target_name` of a buffered call through a
@@ -345,6 +355,7 @@ pub(super) fn resolve_pending_calls(db: &Database, crate_roots: &RustCrates) -> 
         crate_roots,
         &mut std::collections::BTreeSet::new(),
         &mut HashSet::new(),
+        true,
     )
 }
 
@@ -358,6 +369,7 @@ pub(super) fn resolve_pending_calls_touching(
     crate_roots: &RustCrates,
     touched: &mut std::collections::BTreeSet<String>,
     ends: &mut HashSet<i64>,
+    age: bool,
 ) -> Result<usize> {
     let pending = list_pending_unresolved_calls(db.conn())?;
     if pending.is_empty() {
@@ -416,7 +428,7 @@ pub(super) fn resolve_pending_calls_touching(
     // Every file path, read at the first call a `use` anchors in a crate.
     let mut all_file_paths: Option<HashSet<String>> = None;
     let mut js_exports = super::js_exports::JsExports::default();
-    let mut imported: Option<HashSet<(String, String)>> = None;
+    let mut imports = FileImports::default();
 
     for row in &pending {
         // A call through a renamed import (D#120) binds what the file its
@@ -480,12 +492,15 @@ pub(super) fn resolve_pending_calls_touching(
                 .collect()
         };
         let mut candidates = pool(&|l| l == row.source_language);
-        // The deferred pass's JS-family widening, decided before the self-call
-        // guard as that pass decides it: its pool still holds the caller.
+        // D#742: a bare JS-family call with no candidate of its own language
+        // binds the sibling-language definition its file imports under that
+        // name, and nothing else; the deferred pass applies the same rule to
+        // the call before it is buffered.
         if candidates.is_empty()
             && may_widen_to_family(&row.source_language, row.metadata.as_deref())
         {
-            if imported.is_none() {
+            let siblings = pool(&|l| family_fallback(&row.source_language, l));
+            if !siblings.is_empty() {
                 if all_file_paths.is_none() {
                     all_file_paths = Some(
                         db.conn()
@@ -495,18 +510,15 @@ pub(super) fn resolve_pending_calls_touching(
                     );
                 }
                 let files = all_file_paths.as_ref().expect("loaded above");
-                imported = Some(uniquely_imported_names(db.conn(), files)?);
-            }
-            let caller = source_id_to_path
-                .get(&row.source_id)
-                .cloned()
-                .unwrap_or_default();
-            if imported
-                .as_ref()
-                .expect("read above")
-                .contains(&(caller, row.target_name.clone()))
-            {
-                candidates = pool(&|l| family_fallback(&row.source_language, l));
+                let caller = source_id_to_path
+                    .get(&row.source_id)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                if let Some(target) = imports.target(db.conn(), files, caller, &row.target_name)? {
+                    if siblings.contains(&target) {
+                        candidates = vec![target];
+                    }
+                }
             }
         }
         candidates.retain(|id| *id != row.source_id); // self-call guard
@@ -841,9 +853,15 @@ pub(super) fn resolve_pending_calls_touching(
     // Bounded retention (SCHEMA v10): rows that survived this sweep age by one
     // failed attempt; rows reaching PENDING_CALL_MAX_ATTEMPTS are evicted.
     // Resolution wins ties — resolved rows were drained above before aging.
-    let evicted = age_and_evict_pending_unresolved_calls(db.conn())?;
-    if evicted > 0 {
-        tracing::debug!("[pipeline] pending-call sweep evicted {evicted} rows at max attempts");
+    // A sweep of a run that parsed nothing (it only deleted files, D#743) does
+    // not age them: no node appeared, and a deletion that re-extracts its
+    // dependents runs a second, parsing round in the same invocation, which
+    // ages them once.
+    if age {
+        let evicted = age_and_evict_pending_unresolved_calls(db.conn())?;
+        if evicted > 0 {
+            tracing::debug!("[pipeline] pending-call sweep evicted {evicted} rows at max attempts");
+        }
     }
 
     Ok(edges_added)
@@ -1791,6 +1809,23 @@ pub(super) fn bare_name_callers_of_new_duplicates(
            -- the path, not the bare name: the re-export arm below judges them.
            AND (e.metadata IS NULL OR e.metadata NOT LIKE '%\"rx\"%')"
     );
+    // A JS-family call bound to a sibling language's definition because its
+    // own language had none (D#742): when the name gains a definition in the
+    // caller's language, a rebuild picks from that pool by name instead, and
+    // the call holds no pending row and no `ambiguous` edge to bring it back.
+    let family_sql = format!(
+        "SELECT DISTINCT f.path
+         FROM cg_fanout_up u
+         CROSS JOIN nodes tgt ON tgt.name = u.nm
+         CROSS JOIN files tf ON tf.id = tgt.file_id
+                           AND tf.language IN ('javascript', 'typescript', 'tsx')
+                           AND tf.language IS NOT u.lang
+         CROSS JOIN edges e ON e.target_id = tgt.id AND e.relation = '{REL_CALLS}'
+         CROSS JOIN nodes src ON src.id = e.source_id
+         CROSS JOIN files f ON f.id = src.file_id AND f.language IS u.lang
+         WHERE u.lang IN ('javascript', 'typescript', 'tsx')
+           AND f.path NOT IN (SELECT path FROM cg_fanout_paths)"
+    );
     // A Rust `use crate::a::widget` bound by name to another file's `widget`,
     // because `a` had none (D#124 F9): the import edge is no `calls` edge and
     // is not `ambiguous`, so the half above misses it, and its call follows the
@@ -1899,6 +1934,13 @@ pub(super) fn bare_name_callers_of_new_duplicates(
         let mut paths: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        paths.extend(
+            conn.prepare(&family_sql)?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
+        paths.sort_unstable();
+        paths.dedup();
         let reexported: Vec<ReexportRow> = conn
             .prepare(&reexport_sql)?
             .query_map([], |row| {

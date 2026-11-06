@@ -879,9 +879,9 @@ struct WrittenFanouts {
 type Fanout = (Vec<i64>, Vec<i64>, String, Option<String>, bool);
 
 impl WrittenFanouts {
-    /// Start on `rel_path`'s relations. What another file wrote is forgotten:
-    /// a repeat has the same sources, which are one file's nodes, so this
-    /// costs at most a repeated insert and bounds the memory to one file.
+    /// Start on `rel_path`'s relations. What another file wrote is forgotten,
+    /// which bounds the memory to one file's outcomes and costs at most a
+    /// repeated insert: forgetting never skips a write.
     fn enter(&mut self, rel_path: &str) {
         if self.file != rel_path {
             self.seen.clear();
@@ -3382,6 +3382,7 @@ Restart every code-graph server on this project so they run one version.",
             &crate_roots,
             &mut pending_sources,
             &mut swept_ends,
+            !all_indexed.is_empty(),
         )?
     };
     total_edges_created += pending_resolved;
@@ -3414,8 +3415,8 @@ Restart every code-graph server on this project so they run one version.",
     // `pending_resolved > 0` is part of the condition because Phase 2c INSERTS
     // edges, and every edge it inserts is a cross-file by-name bind — precisely
     // the shape Phase 2e downgrades off the `extracted` column default. Phase 2c
-    // is now itself gated on `!all_indexed.is_empty()`, so the term cannot fire
-    // alone — it is kept because it states the actual invariant (Phase 2c wrote
+    // runs only when this run parsed or deleted something (D#743), so the term
+    // cannot fire alone — it is kept because it states the actual invariant (Phase 2c wrote
     // edges ⇒ reclassify) rather than a chain of reasoning about which batches
     // can produce them. Give the sweep a per-tick cap for large backlogs and the
     // spilled remainder would drain on a batch whose own files are unchanged;
@@ -4255,9 +4256,6 @@ fn resolve_deferred_relations(
             .copied()
             .collect()
     };
-    // Read at the first bare call that finds no candidate of its own language:
-    // calls come after every other relation, so this run's imports are bound.
-    let mut imported: Option<HashSet<(String, String)>> = None;
 
     let mut edges_created = 0usize;
     let mut unresolved_externals: Vec<ExternalRef> = Vec::new();
@@ -4281,6 +4279,9 @@ fn resolve_deferred_relations(
     let mut field_types: Option<super::resolve::CppFieldTypes> = None;
     let mut typed_call: DeferredRelation;
     let mut written = WrittenFanouts::default();
+    // Read at the first call that needs it: calls come after every other
+    // relation, so this run's imports are bound by then.
+    let mut imports = super::resolve::FileImports::default();
     loop {
         if next == queue.len() {
             if calls_queued {
@@ -5154,27 +5155,32 @@ fn resolve_deferred_relations(
                 })
                 .collect();
             let mut same_language_targets = same_lang_of(&cross_file, &d.language, &[]);
+            // D#742: the sibling-language definition the caller's file imports
+            // under the name, by the rule the pending sweep applies to a row.
+            // Decided here too because a call the sweep binds has both ends'
+            // context strings rendered a second time: 0.8 s of a 2.9 s full index
+            // of 4,400 files with 6,000 such calls.
             if same_language_targets.is_empty()
                 && super::resolve::may_widen_to_family(&d.language, call_meta)
             {
-                if imported.is_none() {
-                    imported = Some(super::resolve::uniquely_imported_names(
-                        db.conn(),
-                        all_file_paths,
-                    )?);
-                }
-                let imported = imported.as_ref().expect("read above");
-                if imported.contains(&(d.rel_path.clone(), d.target_name.clone())) {
-                    same_language_targets = cross_file
-                        .iter()
-                        .copied()
-                        .filter(|id| {
-                            node_id_to_language
-                                .get(id)
-                                .and_then(|l| l.as_deref())
-                                .is_some_and(|l| super::resolve::family_fallback(&d.language, l))
-                        })
-                        .collect();
+                let siblings: Vec<i64> = cross_file
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        node_id_to_language
+                            .get(id)
+                            .and_then(|l| l.as_deref())
+                            .is_some_and(|l| super::resolve::family_fallback(&d.language, l))
+                    })
+                    .collect();
+                if !siblings.is_empty() {
+                    if let Some(target) =
+                        imports.target(db.conn(), all_file_paths, &d.rel_path, &d.target_name)?
+                    {
+                        if siblings.contains(&target) {
+                            same_language_targets = vec![target];
+                        }
+                    }
                 }
             }
             if !same_language_targets.is_empty() {
