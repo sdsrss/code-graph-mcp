@@ -1,6 +1,6 @@
 # D#735：Python 函数体里的裸调用不绑定同文件的类成员
 
-状态：进行中（2026-11-05）。级别 L2（解析器 + 索引两个模块，改边，INDEX_VERSION 137 → 138，minor 版本）。来源：待办 D#735（D#714 A3 的 Python 一半）。
+状态：**已随 0.187.0 发布（2026-11-06，tag v0.187.0 = 4f512810，INDEX_VERSION 138）**。级别 L2（解析器 + 索引两个模块，改边，INDEX_VERSION 137 → 138，minor 版本）。来源：待办 D#735（D#714 A3 的 Python 一半）。
 
 ## 问题
 
@@ -81,4 +81,5 @@
   - LOW-5（既有）：保留全部候选的调用按 调用数 × 候选数 插边，登记 D#745。
   - NIT-1：`global h` 那句只在模块也定义 `h` 时成立，改措辞。NIT-2：函数里的类，类体调用记在外层函数名下，改措辞。NIT-3：见上。
   - LOW-4 实测（本机，release，`--no-embed`）：评审的 588 KB 输入，JS 0.186.0 164,387 ms → 57efd309 构建 2,233–2,246 ms（3 次），TS 161,148 → 2,216–2,291 ms（2 次），调用边都是 1 条。
+- 2026-11-06 发版：main 推到 4f512810；CI 42172659908 7/7 绿，macOS/Windows 日志里 4 个新增或改过的测试都是 ok；tag v0.187.0 → Release 42174350525 10/10（29 分 09 秒）；`gh release edit` 写入 CHANGELOG 一节（5,068 字符，14 个资产，非草稿）；`npm view @sdsrs/code-graph version` = 0.187.0；6 个包 `_npmUser` = GitHub Actions、带 attestations；真实安装 `added 2 packages`，平台包自带二进制 `--version` = 0.187.0；发布版在 stdlib（114,773）、nltk（30,404）、本仓库（26,581）上的边集与源码构建逐行相同。`~/.cache/code-graph` 本任务期间新增文件 0 个。
 
