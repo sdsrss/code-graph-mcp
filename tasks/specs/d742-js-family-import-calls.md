@@ -94,3 +94,11 @@
 - 走查工具集（最终 vs 0.187.0）：链测种子 21 35/300、种子 22 42/300，两边不一致的链与内容逐字相同（全是 D#741 形状）；kit38 38/38、r4sets61 61/61。
 - 0.187.0 读 v139 索引：查询可用，`incremental-index` 拒写并提示删 `.code-graph/index.db*`。
 - JS 套件 1,779 通过、0 失败、3 跳过；pre-commit（cargo test 全量、fmt、两条 clippy 腿）三次提交都通过。
+
+## 发版记录
+
+- 2026-11-06 发布 0.188.0（D#745 + D#743；D#742 撤回，重做记为 D#746；D#743 第二类记为 D#747）。tag v0.188.0 指向 2c277896，main CI 42251273000 7/7 通过；macOS、Windows 日志里三个新测试都是 ok。
+- Release 42253771793：10/10 通过（16:35:14Z → 17:08:18Z，33 分钟）。发版说明取自 CHANGELOG 0.188.0（与 CHANGELOG 段落逐字相同），非草稿，14 个资产。
+- npm：`npm view @sdsrs/code-graph version` = 0.188.0；6 个包的 packument 都有 0.188.0，`_npmUser` = GitHub Actions，`trustedPublisher.id` = github。
+- 真实安装：`npm install --prefix <scratch> --cache <scratch>/cache @sdsrs/code-graph@0.188.0` 装上 code-graph 与 code-graph-linux-x64 两个包；平台包自带二进制 `--version` = `code-graph-mcp 0.188.0`（md5 0efabd18）。
+- 信号 3：发布的二进制对撤回后的源码构建 w1（md5 fc923307，即上面"撤回后"那个二进制），`tasks/d742-kit/diff2.sh` 13 个语料全量索引，边集（带元数据）和 pending 行 13/13 逐字节相同。
