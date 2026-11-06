@@ -15502,6 +15502,103 @@ fn a_python_call_among_many_same_named_methods_stays_linear() {
     assert!(from_g[0].ends_with("-> h@1"), "{from_g:?}");
 }
 
+thread_local! {
+    static EDGE_INSERT_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn count_edge_insert_runs(event: rusqlite::trace::TraceEvent<'_>) {
+    if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
+        if sql.trim_start().starts_with("INSERT OR IGNORE INTO edges") {
+            EDGE_INSERT_RUNS.with(|c| c.set(c.get() + 1));
+        }
+    }
+}
+
+/// D#745: a call repeated N times whose every run keeps the same M candidates
+/// tried N x M edge inserts, which the unique index cut down to M rows (6,000
+/// `h()` among 6,000 methods named `h`, 310 KB: 20 s in a release build). Each
+/// resolution path that writes such a fan-out, same-file and cross-file, bare
+/// and member, writes it once. The count is SQLite's own: one trace event per
+/// run of the edge INSERT.
+#[test]
+fn a_repeated_call_writes_its_fanout_once() {
+    let n = 200;
+    let py_classes: String = (0..n)
+        .map(|i| format!("class C{i}:\n    def h(self):\n        pass\n\n"))
+        .collect();
+    let js_classes: String = (0..n)
+        .map(|i| format!("class C{i} {{\n  h() {{ return 1; }}\n}}\n"))
+        .collect();
+    let py_calls = format!("def g():\n{}", "    h()\n".repeat(n));
+    let js_calls = format!("function g(o) {{\n{}}}\n", "  h();\n".repeat(n));
+    let js_member_calls = format!("function g(o) {{\n{}}}\n", "  o.h();\n".repeat(n));
+    let table: Vec<(&str, Vec<(&str, String)>)> = vec![
+        (
+            "py: same file, def body",
+            vec![("m.py", format!("{py_classes}{py_calls}"))],
+        ),
+        (
+            "py: same file, class body",
+            vec![(
+                "m.py",
+                format!("{py_classes}class K:\n{}", "    h()\n".repeat(n)),
+            )],
+        ),
+        (
+            "py: another file",
+            vec![("b.py", py_classes.clone()), ("a.py", py_calls.clone())],
+        ),
+        (
+            "js: same file, bare",
+            vec![("m.js", format!("{js_classes}{js_calls}"))],
+        ),
+        (
+            "js: another file, bare",
+            vec![("b.js", js_classes.clone()), ("a.js", js_calls.clone())],
+        ),
+        (
+            "js: same file, member",
+            vec![("m.js", format!("{js_classes}{js_member_calls}"))],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, files) in table {
+        let project = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+        for (name, body) in &files {
+            fs::write(project.path().join(name), body).unwrap();
+        }
+        db.conn().trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(count_edge_insert_runs),
+        );
+        EDGE_INSERT_RUNS.with(|c| c.set(0));
+        run_full_index(&db, project.path(), None, None).unwrap();
+        db.conn()
+            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        let runs = EDGE_INSERT_RUNS.with(|c| c.get());
+        let count = |sql: &str| -> usize {
+            let c: i64 = db.conn().query_row(sql, [], |r| r.get(0)).unwrap();
+            c as usize
+        };
+        let fanout = count(
+            "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id \
+             WHERE e.relation = 'calls' AND s.name IN ('g', '<module>')",
+        );
+        let rows = count("SELECT COUNT(*) FROM edges");
+        // The shape must fan out, or the bound below holds vacuously.
+        if fanout < 2 {
+            failures.push(format!("{label}: the calls bound {fanout} methods"));
+        } else if runs > rows + n {
+            failures.push(format!(
+                "{label}: {runs} edge inserts for {rows} edges ({fanout} from the caller)"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// D#714 A3: editing a file whose twins the rule told apart, and editing a
 /// file that calls into it, give the calls a rebuild gives.
 #[test]

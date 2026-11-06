@@ -862,6 +862,55 @@ fn module_node_of(
         .unwrap_or_default()
 }
 
+/// Fan-outs already written (D#745). A call repeated N times whose every run
+/// keeps the same M candidates (6,000 `h()` among 6,000 methods named `h`)
+/// tried N x M inserts that `idx_edges_unique` cut down to M rows: 20 s for
+/// 310 KB. Skipping the repeat is exact while no edge is deleted between the
+/// two writes, which holds within Phase 2's file loop and within the deferred
+/// pass, the only holders. A one-pair outcome is not remembered: its repeat
+/// costs one insert, and remembering it would hold every edge of the file.
+#[derive(Default)]
+struct WrittenFanouts {
+    file: String,
+    seen: HashSet<Fanout>,
+}
+
+/// `(sources, targets, relation, metadata, allow_self)` of one write.
+type Fanout = (Vec<i64>, Vec<i64>, String, Option<String>, bool);
+
+impl WrittenFanouts {
+    /// Start on `rel_path`'s relations. What another file wrote is forgotten:
+    /// a repeat has the same sources, which are one file's nodes, so this
+    /// costs at most a repeated insert and bounds the memory to one file.
+    fn enter(&mut self, rel_path: &str) {
+        if self.file != rel_path {
+            self.seen.clear();
+            rel_path.clone_into(&mut self.file);
+        }
+    }
+
+    /// Whether this outcome is still to be written; it is remembered as written.
+    fn first(
+        &mut self,
+        sources: &[i64],
+        targets: &[i64],
+        relation: &str,
+        metadata: Option<&str>,
+        allow_self: bool,
+    ) -> bool {
+        if sources.len() * targets.len() < 2 {
+            return true;
+        }
+        self.seen.insert((
+            sources.to_vec(),
+            targets.to_vec(),
+            relation.to_string(),
+            metadata.map(str::to_string),
+            allow_self,
+        ))
+    }
+}
+
 /// Insert the `sources` × `targets` cross-product for one relation.
 ///
 /// Every Phase-2 resolution branch ends this way, and each used to carry its
@@ -883,6 +932,7 @@ fn module_node_of(
 /// finds it (`typed_callers_of_class_drift`).
 fn bind_unless_ruled_out(
     db: &Database,
+    written: &mut WrittenFanouts,
     sources: &[i64],
     targets: &[i64],
     never: &super::resolve::RecvNever,
@@ -906,17 +956,21 @@ fn bind_unless_ruled_out(
         }
         return Ok(0);
     }
-    insert_relation_edges(db, sources, &kept, &d.relation, metadata, false)
+    insert_relation_edges(db, written, sources, &kept, &d.relation, metadata, false)
 }
 
 fn insert_relation_edges(
     db: &Database,
+    written: &mut WrittenFanouts,
     sources: &[i64],
     targets: &[i64],
     relation: &str,
     metadata: Option<&str>,
     allow_self: bool,
 ) -> Result<usize> {
+    if !written.first(sources, targets, relation, metadata, allow_self) {
+        return Ok(0);
+    }
     // A `P.X()` call's synthetic import (D#518) is no edge of the graph a user
     // is told about.
     let counted = usize::from(!crate::domain::is_synthetic_import(relation, metadata));
@@ -1785,13 +1839,29 @@ fn resolve_batch_relations(
 
     // Loaded on the first supertype relation: this batch's nodes are inserted.
     let mut callable_ids: Option<HashSet<i64>> = None;
+    let mut written = WrittenFanouts::default();
+    let mut member_pools: HashMap<String, Vec<i64>> = HashMap::new();
     for pf in batch_parsed {
+        written.enter(&pf.rel_path);
         let relations = &pf.relations;
         if pf.language == "cpp" {
             record_cpp_fields(db, pf)?;
         }
         record_js_export_entries(db, pf)?;
         let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
+        // Node indexes by name and by qualified name, ascending, each node at
+        // most once per key: a relation's scope is looked up here instead of
+        // by a scan of the file per relation (50,000 calls in a file of
+        // 20,000 nodes, D#745).
+        let mut nodes_named: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, name) in pf.node_names.iter().enumerate() {
+            nodes_named.entry(name.as_str()).or_default().push(i);
+            if let Some(q) = pf.node_qualified_names[i].as_deref() {
+                if q != name {
+                    nodes_named.entry(q).or_default().push(i);
+                }
+            }
+        }
         // Same-file qualified names, for C++ implicit-`this` member lookup below.
         let local_qualified: HashMap<i64, &str> = pf
             .node_ids
@@ -1883,13 +1953,15 @@ fn resolve_batch_relations(
                 }
                 _ => rel.source_name.as_str(),
             };
-            let mut source_ids = (0..pf.node_ids.len())
+            let mut source_ids = nodes_named
+                .get(source_name)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .copied()
                 .filter(|&i| {
-                    (pf.node_names[i] == source_name
-                        || pf.node_qualified_names[i].as_deref() == Some(source_name))
-                        && (!type_source_only
-                            || !matches!(pf.node_types[i].as_str(), "function" | "method"))
-                        && !(rust_impl && pf.node_types[i] == "interface")
+                    let kind = pf.node_types[i].as_str();
+                    !(type_source_only && matches!(kind, "function" | "method")
+                        || rust_impl && kind == "interface")
                 })
                 .collect::<Vec<_>>();
             // Same-named definitions in one file (cfg twins, `@overload` stubs,
@@ -1994,6 +2066,7 @@ fn resolve_batch_relations(
                                 resolved = true;
                                 edges_created += insert_relation_edges(
                                     db,
+                                    &mut written,
                                     &source_ids,
                                     &module_targets,
                                     &rel.relation,
@@ -2047,6 +2120,7 @@ fn resolve_batch_relations(
                         if let Some(module_targets) = found {
                             edges_created += insert_relation_edges(
                                 db,
+                                &mut written,
                                 &source_ids,
                                 &module_targets,
                                 &rel.relation,
@@ -2098,6 +2172,7 @@ fn resolve_batch_relations(
                     ) {
                         edges_created += insert_relation_edges(
                             db,
+                            &mut written,
                             &source_ids,
                             &targets,
                             &rel.relation,
@@ -2143,6 +2218,7 @@ fn resolve_batch_relations(
                         if !module_targets.is_empty() {
                             edges_created += insert_relation_edges(
                                 db,
+                                &mut written,
                                 &source_ids,
                                 &module_targets,
                                 &rel.relation,
@@ -2179,6 +2255,7 @@ fn resolve_batch_relations(
                         if !module_targets.is_empty() {
                             edges_created += insert_relation_edges(
                                 db,
+                                &mut written,
                                 &source_ids,
                                 &module_targets,
                                 &rel.relation,
@@ -2301,6 +2378,7 @@ fn resolve_batch_relations(
                             if !targets.is_empty() {
                                 edges_created += insert_relation_edges(
                                     db,
+                                    &mut written,
                                     &source_ids,
                                     &targets,
                                     &rel.relation,
@@ -2368,6 +2446,7 @@ fn resolve_batch_relations(
                             // is COMPLETE at batch time — safe to decide here.
                             edges_created += insert_relation_edges(
                                 db,
+                                &mut written,
                                 &source_ids,
                                 &[same_file_methods[0]],
                                 &rel.relation,
@@ -2483,8 +2562,10 @@ fn resolve_batch_relations(
             if rel.relation == REL_CALLS {
                 all_target_ids = super::resolve::member_call_candidates(
                     rel.metadata.as_deref(),
+                    &rel.target_name,
                     all_target_ids,
                     db,
+                    &mut member_pools,
                 )?;
                 pf.retain_rust_call_shape(rel, &mut all_target_ids);
             }
@@ -2601,6 +2682,7 @@ fn resolve_batch_relations(
             {
                 edges_created += insert_relation_edges(
                     db,
+                    &mut written,
                     &source_ids,
                     &target_ids,
                     &rel.relation,
@@ -4013,6 +4095,7 @@ fn restore_inbound_edges(
 /// `cycles` and `deps` (review of D#370(a), L4).
 fn settle_python_reexports<'a>(
     db: &Database,
+    written: &mut WrittenFanouts,
     waiting: &mut Vec<(&'a DeferredRelation, Vec<i64>, Vec<String>)>,
     relative_bound: &mut Vec<&'a DeferredRelation>,
     python_module_map: &HashMap<String, Vec<String>>,
@@ -4038,8 +4121,10 @@ fn settle_python_reexports<'a>(
                 left.push((d, source_ids, files));
                 continue;
             }
+            written.enter(&d.rel_path);
             edges_created += insert_relation_edges(
                 db,
+                written,
                 &source_ids,
                 &targets,
                 &d.relation,
@@ -4188,6 +4273,7 @@ fn resolve_deferred_relations(
     // load before them typed differently from an incremental run.
     let mut field_types: Option<super::resolve::CppFieldTypes> = None;
     let mut typed_call: DeferredRelation;
+    let mut written = WrittenFanouts::default();
     loop {
         if next == queue.len() {
             if calls_queued {
@@ -4196,6 +4282,7 @@ fn resolve_deferred_relations(
             let mut relative_bound = Vec::new();
             edges_created += settle_python_reexports(
                 db,
+                &mut written,
                 &mut reexport_wait,
                 &mut relative_bound,
                 python_module_map,
@@ -4213,6 +4300,7 @@ fn resolve_deferred_relations(
             continue;
         }
         let d = queue[next];
+        written.enter(&d.rel_path);
         next += 1;
         let queued = d;
         let d = if d.relation == REL_CALLS
@@ -4312,6 +4400,7 @@ fn resolve_deferred_relations(
                     Some(ids) => {
                         edges_created += insert_relation_edges(
                             db,
+                            &mut written,
                             &source_ids,
                             &ids,
                             &d.relation,
@@ -4348,6 +4437,7 @@ fn resolve_deferred_relations(
                         let module_targets = module_node_of(&name_to_ids, &node_id_to_path, &file);
                         edges_created += insert_relation_edges(
                             db,
+                            &mut written,
                             &source_ids,
                             &module_targets,
                             &d.relation,
@@ -4391,6 +4481,7 @@ fn resolve_deferred_relations(
                     if let Some(module_targets) = found {
                         edges_created += insert_relation_edges(
                             db,
+                            &mut written,
                             &source_ids,
                             &module_targets,
                             &d.relation,
@@ -4425,6 +4516,7 @@ fn resolve_deferred_relations(
                         ) {
                             edges_created += insert_relation_edges(
                                 db,
+                                &mut written,
                                 &source_ids,
                                 &module_nodes,
                                 &d.relation,
@@ -4457,6 +4549,7 @@ fn resolve_deferred_relations(
                         ) {
                             edges_created += insert_relation_edges(
                                 db,
+                                &mut written,
                                 &source_ids,
                                 &module_nodes,
                                 &d.relation,
@@ -4484,6 +4577,7 @@ fn resolve_deferred_relations(
                 ) {
                     edges_created += insert_relation_edges(
                         db,
+                        &mut written,
                         &source_ids,
                         &targets,
                         &d.relation,
@@ -4520,6 +4614,7 @@ fn resolve_deferred_relations(
                             };
                             edges_created += insert_relation_edges(
                                 db,
+                                &mut written,
                                 &source_ids,
                                 &targets,
                                 &d.relation,
@@ -4549,6 +4644,7 @@ fn resolve_deferred_relations(
                 if !module_targets.is_empty() {
                     edges_created += insert_relation_edges(
                         db,
+                        &mut written,
                         &source_ids,
                         &module_targets,
                         &d.relation,
@@ -4582,6 +4678,7 @@ fn resolve_deferred_relations(
             if !targets.is_empty() {
                 edges_created += insert_relation_edges(
                     db,
+                    &mut written,
                     &source_ids,
                     &targets,
                     &d.relation,
@@ -4611,6 +4708,7 @@ fn resolve_deferred_relations(
                             if !filtered.is_empty() {
                                 edges_created += insert_relation_edges(
                                     db,
+                                    &mut written,
                                     &source_ids,
                                     &filtered,
                                     &d.relation,
@@ -4677,6 +4775,7 @@ fn resolve_deferred_relations(
                 if !targets.is_empty() {
                     edges_created += insert_relation_edges(
                         db,
+                        &mut written,
                         &source_ids,
                         &targets,
                         &d.relation,
@@ -4762,6 +4861,7 @@ fn resolve_deferred_relations(
                         if let Some(tgt_id) = target {
                             edges_created += bind_unless_ruled_out(
                                 db,
+                                &mut written,
                                 &source_ids,
                                 &[tgt_id],
                                 &never,
@@ -4785,6 +4885,7 @@ fn resolve_deferred_relations(
                     if !filtered.is_empty() {
                         edges_created += insert_relation_edges(
                             db,
+                            &mut written,
                             &source_ids,
                             &filtered,
                             &d.relation,
@@ -4831,6 +4932,7 @@ fn resolve_deferred_relations(
                             RecvTypeTargets::Bind(own) => {
                                 edges_created += insert_relation_edges(
                                     db,
+                                    &mut written,
                                     &source_ids,
                                     &own,
                                     &d.relation,
@@ -4841,6 +4943,7 @@ fn resolve_deferred_relations(
                             RecvTypeTargets::Ambiguous(own) => {
                                 edges_created += insert_relation_edges(
                                     db,
+                                    &mut written,
                                     &source_ids,
                                     &own,
                                     &d.relation,
@@ -4905,6 +5008,7 @@ fn resolve_deferred_relations(
                                 Anchored::Named(ids) => {
                                     edges_created += insert_relation_edges(
                                         db,
+                                        &mut written,
                                         &source_ids,
                                         &ids,
                                         &d.relation,
@@ -4927,6 +5031,7 @@ fn resolve_deferred_relations(
                                     });
                                     edges_created += insert_relation_edges(
                                         db,
+                                        &mut written,
                                         &source_ids,
                                         &ids,
                                         &d.relation,
@@ -4969,6 +5074,7 @@ fn resolve_deferred_relations(
                         };
                         edges_created += insert_relation_edges(
                             db,
+                            &mut written,
                             &source_ids,
                             &final_targets,
                             &d.relation,
@@ -4998,6 +5104,7 @@ fn resolve_deferred_relations(
             if !same_file_targets.is_empty() {
                 edges_created += bind_unless_ruled_out(
                     db,
+                    &mut written,
                     &source_ids,
                     &same_file_targets,
                     &never,
@@ -5043,8 +5150,15 @@ fn resolve_deferred_relations(
             if !same_language_targets.is_empty() {
                 let final_targets =
                     refine_ambiguous_targets(&same_language_targets, &d.rel_path, &node_id_to_path);
-                edges_created +=
-                    bind_unless_ruled_out(db, &source_ids, &final_targets, &never, d, call_meta)?;
+                edges_created += bind_unless_ruled_out(
+                    db,
+                    &mut written,
+                    &source_ids,
+                    &final_targets,
+                    &never,
+                    d,
+                    call_meta,
+                )?;
                 continue;
             }
             // Still unresolved after seeing the WHOLE tree — this is what the
@@ -5154,6 +5268,7 @@ fn resolve_deferred_relations(
         } else {
             edges_created += insert_relation_edges(
                 db,
+                &mut written,
                 &source_ids,
                 &target_ids,
                 &d.relation,

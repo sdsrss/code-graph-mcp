@@ -4110,19 +4110,30 @@ pub(super) fn module_call_skips_own_file(metadata: Option<&str>) -> bool {
 /// (`CalleeMeta::Member`, or `RecvType` — a receiver of known class) cannot reach
 /// a free function; every other call keeps them all. One helper so the batch,
 /// deferred and pending paths cannot disagree.
+///
+/// `candidates` is the batch's pool of `name`, so while the batch's nodes
+/// stand the answer depends on the name alone and `pools` keeps it: 6,000
+/// `o.h()` among 6,000 methods named `h` ran 6,000 queries of 6,000 ids each
+/// (11 s, D#745).
 pub(super) fn member_call_candidates(
     metadata: Option<&str>,
+    name: &str,
     candidates: Vec<i64>,
     db: &crate::storage::db::Database,
+    pools: &mut HashMap<String, Vec<i64>>,
 ) -> anyhow::Result<Vec<i64>> {
-    if matches!(
+    if !matches!(
         parse_callee_metadata(metadata),
         Some(CalleeMeta::Member | CalleeMeta::RecvType(_) | CalleeMeta::SuperType(_))
     ) {
-        crate::storage::queries::filter_out_function_ids(db.conn(), &candidates)
-    } else {
-        Ok(candidates)
+        return Ok(candidates);
     }
+    if let Some(pool) = pools.get(name) {
+        return Ok(pool.clone());
+    }
+    let pool = crate::storage::queries::filter_out_function_ids(db.conn(), &candidates)?;
+    pools.insert(name.to_string(), pool.clone());
+    Ok(pool)
 }
 
 /// Whether a dotted Python module is a project module or package: a key of the
