@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.187.0
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 137 → 138
+because Python call edges move (below). The MCP server rebuilds the index
+when it starts; from the command line, `code-graph-mcp reindex` does. To pin
+the binary back: `npm i -g @sdsrs/code-graph@0.186.0`, then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. 0.186.0 answers
+from an index this version wrote but will not write to it; delete
+`.code-graph/index.db*` once so it rebuilds (its error says so). The plugin's
+scripts are unchanged.
+
+### fix: a Python call in a function body binds no method of the file
+
+A Python name used in a `def` or `lambda` body is looked up in that
+function, the functions around it, the module and the builtins, never in a
+class body; code at the module's top level sees no class body either. So in
+
+```python
+def h(): ...
+
+class C:
+    def h(self): ...
+    def g(self):
+        h()
+```
+
+`g` calls the module's `h`, never `C.h`, but 0.186.0 bound both. A bare call
+in a function body or at the top level that sees a definition of its name
+(a module-level `def`, or a `def` in the calling function or one around it)
+now binds no same-named method of the same file. Code that runs in a class
+body keeps that body's methods as candidates: the body's own statements, and
+a method's default arguments, annotations and decorators, which Python
+evaluates there.
+JavaScript and TypeScript had this rule since 0.185.0.
+
+Measured with the SCIP oracle on the same copies, 0.186.0 and this build from
+source:
+
+| Corpus | Default-floor precision | Wrong edges | Recall (inferred floor) | Edges removed / added |
+|---|---|---|---|---|
+| Python 3.14 standard library | 81.87% → 82.14% | 2,429 → 2,385 | 10,759/12,375, unchanged | 70 / 0 |
+| nltk 3.9.2 | 89.30% → 89.44% | 693 → 683 | 4,984/5,838, unchanged | 10 / 0 |
+
+Every removed edge is a `calls` edge to a method. The oracle judged 54 of the
+80, all wrong; the other 26 are in the standard library, among them `open()`
+in `webbrowser.open_new`, `open_new_tab` and `main`, which bound the `open`
+methods of 8 browser classes beside the module's `open`. No other edge of
+the two corpora changed, its confidence included, and a full index of this
+repository's own Rust, JavaScript and Python files has the same edges. A
+full index of the standard library took 3,085–3,121 ms against 3,099–3,127
+ms (3 runs each, alternating).
+
+### Not covered
+
+- A comprehension in a class body keeps the body's methods as candidates of
+  the calls inside it, although only its first iterable runs in the class
+  body: `xs = [h() for _ in range(2)]` binds both `h`s.
+- A class body's calls are recorded under the file's `<module>`, as before,
+  so a top-level `h()` and a class-body `h()` in one file give `<module>` one
+  edge to each `h`, the method included.
+- A parameter or local variable of the name does not hide the module's
+  definition: `def g(self, h): h()` and `h = self.h; h()` bind the module's
+  `h` (no longer `C.h` as well). In the standard library,
+  `mimetypes._read_windows_registry(cls, add_type)` calls its parameter and
+  binds the module's `add_type`.
+- A call that sees no definition of its name keeps every candidate, a method
+  included: `h()` in a method of a file whose only `h` is a method binds it.
+
 ## 0.186.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 136 → 137
