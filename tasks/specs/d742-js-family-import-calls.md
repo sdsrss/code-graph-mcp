@@ -68,4 +68,9 @@
 
 ## 验证记录
 
-（实现完成后填写）
+- D#742 提交 71ed014a。RED：把 `may_widen_to_family` 改成恒假，`a_js_family_call_binds_what_its_file_imports` 的 4 个正例失败（got []），4 个反例不变；只关掉扫描一侧，`a_js_family_import_call_matches_a_rebuild_through_edits` 的"改名再导出旁出现第一个 `f`"一条失败（增量 pending、重建绑 `t.ts:r`），恢复后 11 条链全绿。
+- 最终二进制（71ed014a 源码，md5 79ec99d9）对 0.187.0 源码构建（b91a9ab2，md5 50feddb9），13 个语料：hono −298 pending +301 calls、sgc −2 +2，其余 11 个逐字节相同；hono、sgc 的差异与原型 fam3 逐字节相同。hono 3 条按名候选被剪枝保留的原因已查：路由处理函数代码含 `.html(`；两个 `runner` 的代码 4,099 字符（截断）。
+- 真实语料增量：`real_inc.py` hono 15 轮 0 不一致；`famchain.py`（删/恢复 12 个跨族导入目标文件，24 步）1 步不一致：删 `src/jsx/streaming.ts` 后重建多 16 条成员调用 pending 行（`then`），0.187.0 与 D#745 构建同样 16 条，记入 Not covered（D#743 第二类，根因未定位）。
+- 走查工具集（最终 vs 0.187.0）：链测种子 21 35/300、种子 22 42/300，两边不一致的链与内容逐字相同（全是 D#741 形状）；kit38 38/38、r4sets61 61/61。
+- 0.187.0 读 v139 索引：查询可用，`incremental-index` 拒写并提示删 `.code-graph/index.db*`。
+- JS 套件 1,779 通过、0 失败、3 跳过；pre-commit（cargo test 全量、fmt、两条 clippy 腿）三次提交都通过。

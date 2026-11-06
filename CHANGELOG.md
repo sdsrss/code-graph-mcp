@@ -1,5 +1,115 @@
 # Changelog
 
+## 0.188.0
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 138 → 139
+because JavaScript/TypeScript call edges are added (below). The MCP server
+rebuilds the index when it starts; from the command line, `code-graph-mcp
+reindex` does. To pin the binary back: `npm i -g @sdsrs/code-graph@0.187.0`,
+then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. 0.187.0 answers
+from an index this version wrote but will not write to it; delete
+`.code-graph/index.db*` once so it rebuilds (its error says so). The plugin's
+scripts are unchanged.
+
+### fix: a JS/TS call binds what its file imports from a sibling language
+
+A bare call's candidates by name were the definitions of its own language,
+and `.js`/`.jsx`/`.mjs`/`.cjs`, `.ts` and `.tsx` are three languages here.
+So in
+
+```tsx
+// a.tsx
+import { f } from './t';
+export function A() { return f(); }
+```
+
+with `export function f` in `t.ts`, the import edge bound `t.ts:f` and the
+call bound nothing: it stayed among the unresolved calls. A bare call in a
+JavaScript, TypeScript or TSX file that finds no definition of its name in
+its own language now also takes those of the other two, when its file
+imports that name from exactly one project definition and every import of
+it goes through a relative path naming an indexed file. From there the call
+goes the way of a same-language one: the import re-points it at the
+imported definition, and a guess the import contradicts is dropped. A call
+through a package (`import { f } from 'pkg'`), a member call, a call the
+file does not import by that name, and an import of an unindexed path
+(`'../dist/t'`) keep the old pool.
+
+Measured on full indexes, 0.187.0 and this build from source: hono (v4.6.14)
+gains 301 call edges and has 298 fewer unresolved calls. 298 of the 301 go to
+exactly the definition the caller's file imports (`.tsx` tests calling
+`.ts` modules, `.ts` benchmarks calling `.tsx` pages); the other 3 are
+by-name picks beside them that the existing prune keeps, as it keeps them
+for a same-language call, because the caller also makes a member call of
+that name (`c.html(...)`) or its text is longer than the 4 KB the prune
+reads. sgc gains 2 (`.ts` tests calling `.mjs` scripts). The
+other 11 corpora (express, claude-mem-lite, claudemd, gsd-lite, llm_wiki,
+daagu, flask, nltk, the Python standard library, tokio and this repository)
+have byte-identical edges and unresolved calls.
+
+### fix: deleting a file re-resolves the calls into it
+
+A run that only deleted files never re-resolved the calls that had pointed
+into them. With `r` defined in `c.js` and in `tests/x.js`, a call `r()` in
+`o.js` bound only `c.js:r` (a non-test definition is preferred); after
+deleting `c.js` a rebuild binds `tests/x.js:r`, but the incremental index
+bound nothing and kept the call unresolved until some later run parsed a
+file. A call that still bound another file's definition (a function of the
+same name, or another class's method for a member call, JavaScript and
+Python) kept an unresolved-call row that a rebuild does not have, which
+decides what it binds when a new definition appears. Deleting files now
+re-resolves them in the same run, as an edit already did.
+
+### perf: a call repeated many times among many same-named candidates
+
+A call made N times whose every run keeps the same M candidates attempted
+N × M edge inserts for M edges. Each such fan-out is now written once per
+file, the member-call candidate filter is read once per name in each batch
+instead of once per call, and a relation's enclosing definition is found through a
+per-file name index instead of a scan of the file. Edges are unchanged:
+the 13 corpora above have byte-identical edges and unresolved calls apart
+from the hono and sgc additions above.
+
+Full index, 3 runs each alternating, 0.187.0 and this build from source
+(`--no-embed`). The first six inputs are 6,000 classes each with a method
+`h` and 6,000 calls of `h` (310 KB); every one gives 6,000 call edges with
+either build.
+
+| Input | 0.187.0 | 0.188.0 |
+|---|---|---|
+| Python, calls in one function, same file | 19,679–19,863 ms | 945–957 ms |
+| Python, calls in a class body, same file | 19,329–19,549 ms | 739–754 ms |
+| Python, calls from another file | 21,395–21,737 ms | 2,862–3,009 ms |
+| JavaScript, bare calls, same file | 19,397–19,604 ms | 904–914 ms |
+| JavaScript, bare calls from another file | 21,229–21,586 ms | 2,811–2,914 ms |
+| JavaScript, member calls `o.h()`, same file | 30,599–30,762 ms | 749–753 ms |
+| Python, 50,000 calls in a file of 20,000 functions (899 KB) | 1,571–1,636 ms | 917–977 ms |
+| hono | 480–485 ms | 485–512 ms |
+| Python 3.14 standard library | 3,079–3,165 ms | 2,948–3,015 ms |
+
+### Not covered
+
+- Deleting a file can still leave fewer unresolved member calls than a
+  rebuild: in hono, deleting `src/jsx/streaming.ts` (which defines a local
+  `const then`) leaves 16 `x.then()` calls without the unresolved row a
+  rebuild gives them. Edges are equal; 0.187.0 does the same.
+- The JS-family widening reads the import as the existing re-pointing does,
+  by the name the module exports: `import type { a as b }` counts as
+  importing `a`. hono's `common.case.test.tsx` calls a local variable named
+  `rawCssString`, and those calls now bind `css/common.ts`'s
+  `rawCssString`.
+- C and C++ are not widened to each other (a `.cc` call of a function only
+  a `.c` file defines), and a JS/TS value reference (`onClick={handler}`) to
+  a sibling language is not either.
+- The incremental/rebuild divergence of 0.186.0's Not covered (a call through
+  `export { r as f }` when the last other `f` goes) remains: 77 of 600 edit
+  chains (seeds 21 and 22, 35 + 42), the same chains with the same
+  differences on 0.187.0 and this build.
+- Resolving the repeated call still visits its M candidates on each of its N
+  runs, without writing: 6,000 `h()` from another file among 6,000 methods
+  named `h` index in 2.8–3.0 s (the table's "from another file" rows).
+
 ## 0.187.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 137 → 138
