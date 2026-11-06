@@ -33,13 +33,12 @@ replacing an unresolved call; the other 11 have the same edges as 0.188.0.
 
 When an edit gives the imported file a second definition of the name (a class
 method, object method, namespace function or nested function beside the
-imported function), an incremental run now decides such a call again, as a
-rebuild does, which binds neither; it used to restore the call onto both.
-0.188.0 did this already to a call whose own language
-also defines the name (an import moves such a call onto the imported
-definition): `a.tsx` importing `f` from `t.ts`, with another `f` in `b.tsx`,
-kept `t.ts:f` and the new `t.ts:K.f` after `class K { f() {} }` was added to
-`t.ts`.
+imported function), an incremental run now re-reads the calling file, as a
+rebuild reads it, and binds neither; restoring the call by name bound both.
+0.188.0 did this already to a call whose own language also defines the name
+(an import moves such a call onto the imported definition): `a.tsx`
+importing `f` from `t.ts`, with another `f` in `b.tsx`, kept `t.ts:f` and the
+new `t.ts:K.f` after `class K { f() {} }` was added to `t.ts`.
 
 ### fix: a member call that reaches only functions keeps its unresolved row
 
@@ -59,13 +58,13 @@ express; llm_wiki and tokio are unchanged.
 
 ### Cost
 
-3 runs each, alternating 0.188.0 and this build from source (`--no-embed`).
-"Edit" appends a comment to one file and runs `incremental-index`. Synthetic
-trees, 4,000 `.ts`/`.tsx`/`.js` files each:
+3 runs each (hono: 6, from two sets), alternating 0.188.0 and this build from
+source (`--no-embed`). "Edit" appends a comment to one file and runs
+`incremental-index`. Synthetic trees:
 
-- *imports*: each file imports 25 functions from one of 400 `.ts` modules
-  (100,000 imports, 6,000 calls this release binds) and calls a `gfn()` that
-  only a `.js` file defines and none imports;
+- *imports*: 4,000 `.ts`/`.tsx` files each import 25 functions from one of
+  400 `.ts` modules (100,000 imports, 6,000 calls this release binds) and call
+  a `gfn()` that only a `.js` file defines and none imports;
 - *fan-in*: 4,000 `.tsx` files each import and call 10 of 50 functions of one
   `.ts` file (40,000 calls this release binds into that file);
 - *member calls*: 4,000 `.js` files each make 10 member calls `o.h0()` …
@@ -74,33 +73,35 @@ trees, 4,000 `.ts`/`.tsx`/`.js` files each:
 
 | Input | 0.188.0 | 0.189.0 |
 |---|---|---|
-| hono, full index | 439–442 ms | 442–448 ms |
-| hono, edit `src/jsx/hooks/index.ts` (191 calls from `.tsx` files point into it) | 72–85 ms | 77–79 ms |
-| hono, edit `src/context.ts` | 101–112 ms | 104–110 ms |
-| claude-mem-lite, full index | 2,091–2,129 ms | 1,981–2,065 ms |
-| claude-mem-lite, edit `adopt-cli.mjs` | 142–151 ms | 141–155 ms |
-| daagu, full index | 3,783–3,815 ms | 3,703–3,794 ms |
-| daagu, edit one test file | 187–210 ms | 200–210 ms |
-| imports, full index | 1,894–1,904 ms | 2,038–2,050 ms |
-| imports, edit `lib/m0.ts` | 356–380 ms | 492–498 ms |
-| imports, edit `app/f1.tsx` | 357–368 ms | 493–496 ms |
-| fan-in, full index | 922–951 ms | 1,128–1,149 ms |
-| fan-in, edit the `.ts` file | 530–554 ms | 1,002–1,045 ms |
-| member calls, full index | 2,433–2,497 ms | 616–624 ms |
-| member calls, edit `app/f1.js` | 62–63 ms | 98–106 ms |
+| hono, full index | 418–502 ms | 433–478 ms |
+| hono, edit `src/jsx/hooks/index.ts` (191 calls from `.tsx` files point into it) | 67–82 ms | 72–103 ms |
+| hono, edit `src/context.ts` | 101–121 ms | 99–119 ms |
+| claude-mem-lite, full index | 2,042–2,082 ms | 1,991–2,031 ms |
+| claude-mem-lite, edit `adopt-cli.mjs` | 138–153 ms | 142–162 ms |
+| daagu, full index | 3,746–3,791 ms | 3,805–3,843 ms |
+| daagu, edit one test file | 177–178 ms | 173–183 ms |
+| imports, full index | 1,883–1,952 ms | 2,031–2,110 ms |
+| imports, edit `lib/m0.ts` | 352–359 ms | 494–503 ms |
+| imports, edit `app/f1.tsx` | 361–367 ms | 493–504 ms |
+| fan-in, full index | 916–939 ms | 1,131–1,135 ms |
+| fan-in, edit the `.ts` file | 531–556 ms | 1,009–1,025 ms |
+| fan-in, the `.ts` file gains a method of each of its 50 names | 975–983 ms | 3,552–3,571 ms |
+| member calls, full index | 2,432–2,898 ms | 627–651 ms |
+| member calls, edit `app/f1.js` | 61–68 ms | 98–104 ms |
 
 ### Not covered
 
 - Each run re-reads, for every unresolved bare call whose name only another
-  of the three languages defines, its file's imports: 112–137 ms more per edit
+  of the three languages defines, its file's imports: 129–147 ms more per edit
   on the *imports* tree above (4,000 such calls; without the `gfn()` calls the
-  same edits take 352–410 ms with either build). hono has 46 such calls in 27
+  same edits take 352–379 ms with either build). hono has 46 such calls in 27
   files.
 - An edit of a file that many calls this release binds point into restores
   each of them: on the *fan-in* tree (40,000 such calls) the edit takes
-  466–494 ms more. Each run also visits the unresolved rows this release
-  keeps: on the *member calls* tree (40,000 such rows) an edit takes 35–44 ms
-  more.
+  469–482 ms more. When the edit gives the file a second definition of the
+  names, every calling file is re-read: 2.57–2.59 s more there (4,000 files).
+  Each run also visits the unresolved rows this release keeps: on the *member
+  calls* tree (40,000 such rows) an edit takes 34–37 ms more.
 - A call whose imported file defines the name twice (a function and a method,
   nested function or namespace function of the same name) binds neither and
   stays unresolved, as an import's edge names both.

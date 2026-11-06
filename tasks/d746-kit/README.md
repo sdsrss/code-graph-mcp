@@ -19,3 +19,11 @@ e9b078c9, `h2` 55fb20a6, `h3` 21e167c5); point them at a new work directory.
   the targeted tests (`cargo test --lib`); restores the file afterwards.
 - `results.tar.gz` — corpus differentials (`diff-*.txt`), chain results per
   arm, timings, hono famchain/real_inc.
+- `famgen2.py ROOT N SEED STEPS` (second pre-tag reviewer of 0.189.0) — chains
+  aimed at the restore path: two nodes of a name, a node imported under two
+  names, renamed exports, barrels, deletions, own-language twins. Seeds 101
+  (200 chains), 102 and 103 (300 each), 6 steps; `whole3.sh ARM` runs 102/103
+  as whole chains.
+- `timing3.sh A B` — hono and the reviewer's adversarial trees (fan-in,
+  sibling-only, member calls); `timing4.sh A B` — the fan-in tree's `.ts` file
+  gaining a method of each of its 50 names (every caller re-extracted).
