@@ -245,8 +245,9 @@ const JS_FAMILY: [&str; 3] = ["javascript", "typescript", "tsx"];
 
 /// Whether a definition in `callee` is a sibling of a call in `caller`: the
 /// JS family's languages import one another's files. hono's `.tsx` tests left
-/// 182 calls of what they import from `.ts` modules without an edge, the
-/// call's pool holding `tsx` only (D#742).
+/// 290 calls of what they import from `.ts` modules without an edge (and 8
+/// calls went the other way), the call's pool holding its own language only
+/// (D#742).
 pub(super) fn family_fallback(caller: &str, callee: &str) -> bool {
     caller != callee && JS_FAMILY.contains(&caller) && JS_FAMILY.contains(&callee)
 }
@@ -259,9 +260,12 @@ pub(super) fn may_widen_to_family(caller: &str, metadata: Option<&str>) -> bool 
 
 /// The definition a file imports under a name, read once per file: the
 /// file's only import target for that name, every import of it through a
-/// relative path that names an indexed file. The walk bound those; an import
-/// of an unindexed `../dist/x` was bound by name. The name is the one the
-/// module exports (`import { f as g }` imports `f`), as 2d-bind reads it.
+/// relative path that names an indexed file (an import of an unindexed
+/// `../dist/x` was bound by name). That the specifier names an indexed file
+/// does not prove the walk bound the target: `export * from 'pkg'` dead-ends
+/// and the import falls back to a project node of the name. The name is the
+/// one the module exports (`import { f as g }` imports `f`; a parameter `f`
+/// beside it reads as the import), as 2d-bind reads it.
 #[derive(Default)]
 pub(super) struct FileImports {
     by_file: HashMap<String, HashMap<String, Option<i64>>>,
@@ -342,9 +346,11 @@ pub(super) fn js_import_pending_name(metadata: Option<&str>, target_name: &str) 
 /// edge and the pending row is dropped; rows that still don't resolve stay
 /// buffered for the next index pass.
 ///
-/// Resolution priority mirrors Phase 2: same-language candidates only (no
-/// cross-language promotion — memory `feedback_edge_resolution_same_language.md`
-/// flags that as the canonical false-positive class), with
+/// Resolution priority mirrors Phase 2: same-language candidates (no
+/// cross-language promotion by name — memory
+/// `feedback_edge_resolution_same_language.md` flags that as the canonical
+/// false-positive class; a JS-family bare call with none takes the sibling
+/// language's definition its file imports, D#742), with
 /// `refine_ambiguous_targets` applied when multiple candidates share the name.
 ///
 /// Returns the number of edges inserted by this sweep.

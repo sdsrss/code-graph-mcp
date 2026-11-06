@@ -2855,10 +2855,6 @@ Restart every code-graph server on this project so they run one version.",
     // real edges at exactly the scale where a full rebuild is least likely to be
     // re-run — the failure this pipeline has already been bitten by twice.
     let mut deferred: Vec<DeferredRelation> = Vec::new();
-    // Files whose cross-language JS-family calls Phase 2c sent back to the
-    // pending buffer (D#746): in the post-pass scope whatever the sweep binds.
-    let mut requeued_family_sources: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
 
     // Same sort+dedup rationale as `files` above: `delete_paths` arrives from
     // `compute_diff`'s HashMap walk, and the pending-buffer rows Phase 0 writes
@@ -3219,7 +3215,6 @@ Restart every code-graph server on this project so they run one version.",
             &run_file_paths,
             &done_paths,
             &mut deferred,
-            &mut requeued_family_sources,
         )?;
         done_paths.extend(batch_file_paths.iter().map(|p| p.to_string()));
 
@@ -3498,7 +3493,6 @@ Restart every code-graph server on this project so they run one version.",
                 .iter()
                 .map(|d| d.rel_path.as_str())
                 .chain(pending_sources.iter().map(String::as_str))
-                .chain(requeued_family_sources.iter().map(String::as_str))
                 .collect();
             if !deferred_sources.is_empty() {
                 let conn = db.conn();
@@ -3790,7 +3784,6 @@ fn mint_external_sentinels(
 ///
 /// Returns the number of edges actually inserted.
 #[allow(clippy::type_complexity)]
-#[allow(clippy::too_many_arguments)]
 fn restore_inbound_edges(
     db: &Database,
     batch_parsed: &[FileParsed],
@@ -3807,7 +3800,6 @@ fn restore_inbound_edges(
     run_file_paths: &HashSet<&str>,
     done_paths: &HashSet<String>,
     deferred: &mut Vec<DeferredRelation>,
-    requeued_family_sources: &mut std::collections::BTreeSet<String>,
 ) -> Result<usize> {
     let mut edges_created = 0usize;
     // Phase 2c: Restore cross-file inbound edges lost to cascade delete.
@@ -3851,6 +3843,20 @@ fn restore_inbound_edges(
             .iter()
             .map(|pf| (pf.file_id, pf.language.as_str()))
             .collect();
+        // (importing file, imported file, node name) -> the names its imports
+        // of that node import it under, from the saved `imports` edges.
+        let mut imported_as: HashMap<(i64, i64, &str), std::collections::BTreeSet<String>> =
+            HashMap::new();
+        for (_, source_file_id, target_file_id, target_name, relation, metadata, _) in
+            saved_inbound_edges
+        {
+            if relation.as_str() == REL_IMPORTS {
+                imported_as
+                    .entry((*source_file_id, *target_file_id, target_name.as_str()))
+                    .or_default()
+                    .insert(super::js_exports::as_extracted(metadata.as_deref(), target_name).0);
+            }
+        }
 
         let mut restored = 0usize;
         let mut skipped_intra_batch = 0usize;
@@ -3935,16 +3941,28 @@ fn restore_inbound_edges(
             // A bare JS-family call bound to a sibling language's definition
             // went to its file's only import target of the name: through its
             // own language's pool and 2d-bind, or, that pool empty, through
-            // the widened one (D#742). The edited file may now hold a second
-            // node of the name, which the import's edge names too, and a
-            // rebuild then binds neither: the call is decided again by the
-            // pending sweep and the post-passes, never restored by name onto
-            // every node of the name (D#746).
-            let family_call = relation.as_str() == REL_CALLS
+            // the widened one (D#742). When the edited file now holds two
+            // nodes of the name, the import's edge names both and a rebuild
+            // binds neither: the call goes back to the pending buffer, under
+            // the name its file imports (a renamed export's node is named
+            // otherwise), for the sweep and the post-passes to decide, never
+            // restored by name onto both (D#746). With one node it is restored
+            // as any call is: requeued under the node's name, a call through
+            // `export { r as f }` stayed pending where a rebuild binds `r`, and
+            // 40,000 calls into one file went through the sweep one by one.
+            let family_requeue: Option<&String> = (relation.as_str() == REL_CALLS
                 && super::resolve::may_widen_to_family(&src_lang, metadata.as_deref())
                 && batch_file_language
                     .get(target_file_id)
-                    .is_some_and(|l| super::resolve::family_fallback(&src_lang, l));
+                    .is_some_and(|l| super::resolve::family_fallback(&src_lang, l))
+                && batch_name_to_ids
+                    .get(&(*target_file_id, target_name.as_str()))
+                    .is_some_and(|found| found.len() > 1))
+            .then(|| imported_as.get(&(*source_file_id, *target_file_id, target_name.as_str())))
+            .flatten()
+            .filter(|names| names.len() == 1)
+            .and_then(|names| names.iter().next());
+            let family_call = family_requeue.is_some();
             let new_target_ids: Option<Vec<i64>> = (!renamed_import
                 && !receiver_typed
                 && !family_call
@@ -4067,20 +4085,19 @@ fn restore_inbound_edges(
                     continue;
                 }
                 if relation.as_str() == REL_CALLS {
+                    let pending_name = match family_requeue {
+                        Some(name) => name.clone(),
+                        None => {
+                            super::resolve::js_import_pending_name(metadata.as_deref(), target_name)
+                        }
+                    };
                     crate::storage::queries::insert_pending_unresolved_call(
                         db.conn(),
                         *source_id,
-                        &super::resolve::js_import_pending_name(metadata.as_deref(), target_name),
+                        &pending_name,
                         &src_lang,
                         metadata.as_deref(),
                     )?;
-                    // The sweep may bind it by name to an own-language edge
-                    // the caller still holds, writing nothing new; 2d-bind
-                    // brings back the import's target only if it looks at
-                    // the caller (D#746).
-                    if family_call {
-                        requeued_family_sources.insert(src_path.clone());
-                    }
                 } else {
                     // A JS import bound under another name (a renamed
                     // re-export) goes back as it was extracted: under the name

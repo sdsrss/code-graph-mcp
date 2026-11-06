@@ -2084,7 +2084,7 @@ fn a_deletion_only_run_resolves_the_calls_it_buffers() {
 fn a_js_family_call_binds_what_its_file_imports() {
     let f_ts = ("t.ts", "export function f() { return 1; }\n");
     type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a str, Vec<&'a str>);
-    let table: Vec<Case> = vec![
+    let mut table: Vec<Case> = vec![
         (
             "tsx -> ts",
             vec![
@@ -2273,6 +2273,38 @@ fn a_js_family_call_binds_what_its_file_imports() {
             vec!["A -> sub/t.ts.f"],
         ),
     ];
+    // Each file's imports are its own (FileImports is read per file): three
+    // callers of three names, so that both the deferred pass and the sweep
+    // read a second file's imports.
+    let three: Vec<(&str, &str)> = vec![
+        ("v.ts", "export function g() { return 1; }\n"),
+        ("u.js", "export function f() { return 2; }\n"),
+        ("w.js", "export function h() { return 3; }\n"),
+        (
+            "a.tsx",
+            "import { g } from './v';\nexport function A() { return g(); }\n",
+        ),
+        (
+            "z.tsx",
+            "import { f } from './u';\nexport function Z() { return f(); }\n",
+        ),
+        (
+            "y.tsx",
+            "import { h } from './w';\nexport function Y() { return h(); }\n",
+        ),
+    ];
+    for (caller, want) in [
+        ("A", "A -> v.ts.g"),
+        ("Z", "Z -> u.js.f"),
+        ("Y", "Y -> w.js.h"),
+    ] {
+        table.push((
+            "three files import three names",
+            three.clone(),
+            caller,
+            vec![want],
+        ));
+    }
     let mut failures = Vec::new();
     for (label, files, caller, want) in table {
         let (_p, _d, db) = fresh_index_of(&files);
@@ -2305,6 +2337,7 @@ fn a_js_family_import_call_matches_a_rebuild_through_edits() {
     let guarded = "import { f } from './t';\nexport function A(o: any) { o.f(); return f(); }\n";
     let renamed = "function r() { return 1; }\nexport { r as f };\n";
     let with_method = "export function f() { return 1; }\nexport class K { f() { return 2; } }\n";
+    let twin = "export function f() { return 2; }\n";
     let two_imports = "import { f } from './t';\nimport { f as g } from './v';\n\
                        export function A() { return f() + g(); }\n";
     let long_caller = format!(
@@ -2448,6 +2481,43 @@ fn a_js_family_import_call_matches_a_rebuild_through_edits() {
             &[("a.tsx", &long_caller), ("c.js", callee)],
             &[("t.ts", Some(callee))],
             &["a.tsx.A -> t.ts.f"],
+        ),
+        // A renamed export's node is named `r`: 2d-bind moved the call of `f`
+        // onto it from the own-language twin (pre-tag review of 0.189.0, H1).
+        (
+            "a renamed export's file is touched beside an own-language twin",
+            &[("a.tsx", caller), ("t.ts", renamed), ("b.tsx", twin)],
+            &[("t.ts", Some(&format!("// touched\n{renamed}")))],
+            &["a.tsx.A -> t.ts.r"],
+        ),
+        (
+            "a renamed export's file is touched beside a twin the prune keeps",
+            &[("a.tsx", guarded), ("t.ts", renamed), ("b.tsx", twin)],
+            &[("t.ts", Some(&format!("// touched\n{renamed}")))],
+            &["a.tsx.A -> b.tsx.f", "a.tsx.A -> t.ts.r"],
+        ),
+        (
+            "a renamed export's file gains a second `r` beside an own-language twin",
+            &[("a.tsx", caller), ("t.ts", renamed), ("b.tsx", twin)],
+            &[(
+                "t.ts",
+                Some(&format!(
+                    "{renamed}export class K {{ r() {{ return 2; }} }}\n"
+                )),
+            )],
+            &[],
+        ),
+        (
+            "a namespace import's file gains a class method of the name",
+            &[
+                (
+                    "a.tsx",
+                    "import * as T from './t';\nexport function A() { return T.f(); }\n",
+                ),
+                ("t.ts", callee),
+            ],
+            &[("t.ts", Some(with_method))],
+            &["a.tsx.A -> t.ts.K.f", "a.tsx.A -> t.ts.f"],
         ),
         (
             // The prune keeps `b.tsx:f` (the caller's member call of the name);
