@@ -3839,6 +3839,10 @@ fn restore_inbound_edges(
 
         // Memoized source-file lookup for the requeue path below.
         let mut src_file_info: HashMap<i64, (String, String)> = HashMap::new();
+        let batch_file_language: HashMap<i64, &str> = batch_parsed
+            .iter()
+            .map(|pf| (pf.file_id, pf.language.as_str()))
+            .collect();
 
         let mut restored = 0usize;
         let mut skipped_intra_batch = 0usize;
@@ -3920,8 +3924,22 @@ fn restore_inbound_edges(
                 .then(|| super::resolve::python_attr_of(metadata.as_deref()))
                 .flatten()
                 .filter(|attr| batch_name_to_ids.contains_key(&(*target_file_id, attr.as_str())));
+            // A bare JS-family call bound to a sibling language's definition
+            // went to its file's only import target of the name: through its
+            // own language's pool and 2d-bind, or, that pool empty, through
+            // the widened one (D#742). The edited file may now hold a second
+            // node of the name, which the import's edge names too, and a
+            // rebuild then binds neither: the call is decided again by the
+            // pending sweep and the post-passes, never restored by name onto
+            // every node of the name (D#746).
+            let family_call = relation.as_str() == REL_CALLS
+                && super::resolve::may_widen_to_family(&src_lang, metadata.as_deref())
+                && batch_file_language
+                    .get(target_file_id)
+                    .is_some_and(|l| super::resolve::family_fallback(&src_lang, l));
             let new_target_ids: Option<Vec<i64>> = (!renamed_import
                 && !receiver_typed
+                && !family_call
                 && attr_import.is_none())
             .then(|| batch_name_to_ids.get(&(*target_file_id, target_name.as_str())))
             .flatten()
@@ -3973,7 +3991,8 @@ fn restore_inbound_edges(
                 }
             } else {
                 // The symbol this edge pointed at no longer exists in the changed
-                // file (renamed or removed). A full rebuild would RE-RESOLVE the
+                // file (renamed or removed), or the edge is one of the call
+                // shapes above that are re-resolved. A full rebuild would RE-RESOLVE the
                 // surviving caller's relation against the whole tree — possibly
                 // binding a same-name candidate elsewhere — so dropping here made
                 // incremental diverge permanently (audit 2026-08-02 P1-2: the
@@ -4279,6 +4298,9 @@ fn resolve_deferred_relations(
     let mut field_types: Option<super::resolve::CppFieldTypes> = None;
     let mut typed_call: DeferredRelation;
     let mut written = WrittenFanouts::default();
+    // Read at the first call that needs it: calls come after every other
+    // relation, so this run's imports are bound by then.
+    let mut imports = super::resolve::FileImports::default();
     loop {
         if next == queue.len() {
             if calls_queued {
@@ -5151,7 +5173,35 @@ fn resolve_deferred_relations(
                     node_id_to_path.get(id).map(|p| p.as_str()) != Some(d.rel_path.as_str())
                 })
                 .collect();
-            let same_language_targets = same_lang_of(&cross_file, &d.language, &[]);
+            let mut same_language_targets = same_lang_of(&cross_file, &d.language, &[]);
+            // D#742: the sibling-language definition the caller's file imports
+            // under the name, by the rule the pending sweep applies to a row.
+            // Decided here too because a call the sweep binds has both ends'
+            // context strings rendered a second time: 0.8 s of a 2.9 s full index
+            // of 4,400 files with 6,000 such calls.
+            if same_language_targets.is_empty()
+                && super::resolve::may_widen_to_family(&d.language, call_meta)
+            {
+                let siblings: Vec<i64> = cross_file
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        node_id_to_language
+                            .get(id)
+                            .and_then(|l| l.as_deref())
+                            .is_some_and(|l| super::resolve::family_fallback(&d.language, l))
+                    })
+                    .collect();
+                if !siblings.is_empty() {
+                    if let Some(target) =
+                        imports.target(db.conn(), all_file_paths, &d.rel_path, &d.target_name)?
+                    {
+                        if siblings.contains(&target) {
+                            same_language_targets = vec![target];
+                        }
+                    }
+                }
+            }
             if !same_language_targets.is_empty() {
                 let final_targets =
                     refine_ambiguous_targets(&same_language_targets, &d.rel_path, &node_id_to_path);
