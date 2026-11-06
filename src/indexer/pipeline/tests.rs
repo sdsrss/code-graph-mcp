@@ -15368,6 +15368,28 @@ fn a_same_name_member_is_left_to_the_other_rules() {
             "def h():\n    pass\n\n\nclass C:\n    def h():\n        pass\n\n    x = h()\n",
             &["<module>@1 -> h@1", "<module>@1 -> h@6"],
         ),
+        // Pre-tag review of 0.187.0, round 2, LOW-3: a decorated class and a
+        // nested class have a class body too, and a class is no method.
+        (
+            "py: a decorated class's body",
+            "m.py",
+            "def h():\n    pass\n\n\ndef dec(c):\n    return c\n\n\n@dec\nclass C:\n    def h():\n        \
+             pass\n\n    x = h()\n",
+            &["<module>@1 -> h@1", "<module>@1 -> h@11"],
+        ),
+        (
+            "py: a nested class's body",
+            "m.py",
+            "def h():\n    pass\n\n\nclass O:\n    class I:\n        def h():\n            pass\n\n        \
+             x = h()\n",
+            &["<module>@1 -> h@1", "<module>@1 -> h@7"],
+        ),
+        (
+            "py: a class of the name beside a function",
+            "m.py",
+            "def h():\n    pass\n\n\nclass h:\n    pass\n\n\ndef g():\n    h()\n",
+            &["g@9 -> h@1", "g@9 -> h@5"],
+        ),
         (
             "py: a class body inside a function",
             "m.py",
@@ -15465,8 +15487,12 @@ fn a_python_call_among_many_same_named_methods_stays_linear() {
     );
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let (_p, _d, db) = fresh_index_of(&[("m.py", &code)]);
-        let _ = tx.send(same_file_call_lines(&db));
+        let (project, db_dir, db) = fresh_index_of(&[("m.py", &code)]);
+        let lines = same_file_call_lines(&db);
+        // Removed before the answer goes: once it has, the harness may exit
+        // with this thread still running, and the temp dirs would stay.
+        drop((db, db_dir, project));
+        let _ = tx.send(lines);
     });
     let calls = rx
         .recv_timeout(std::time::Duration::from_secs(60))

@@ -48,13 +48,27 @@ Every removed edge is a `calls` edge to a method. The oracle judged 54 of the
 80, all wrong. Of the other 26, all in the standard library, 25 bound a
 method the call cannot reach, among them `open()` in `webbrowser.open_new`,
 `open_new_tab` and `main`, which bound the `open` methods of 8 browser classes
-beside the module's `open`. The 26th is the one Python runs:
+beside the module's `open`. The 26th named the method that runs:
 `mimetypes._read_windows_registry(cls, add_type)` calls its parameter, which
-holds the `MimeTypes.add_type` method (see Not covered). No other edge of
+its one caller in the standard library fills with a lambda calling
+`self.add_type` (with `self.add_type` itself when `strict=False`; see Not
+covered). No other edge of
 the two corpora changed, its confidence included, and a full index of this
 repository's own Rust, JavaScript and Python files has the same edges. A
 full index of the standard library took 3,027–3,054 ms against 3,021–3,065
 ms (3 runs each, alternating).
+
+### fix: many bare calls among many same-named methods index in linear time
+
+Since 0.185.0 a JavaScript or TypeScript bare call that sees a definition of
+its name asked of each same-named candidate whether it is a method by
+scanning the file's whole node list, so N such calls among N same-named
+methods in a file of F definitions cost N × N × F. It is a set lookup now,
+and the Python calls above take the same path. A 588 KB file with a
+top-level `function h`, 20,000 other functions, 6,000 classes each with a
+method `h` and one function making 6,000 `h()` calls indexes in 2.2 s
+instead of 164.4 s as JavaScript and in 2.2–2.3 s instead of 161.1 s as
+TypeScript, with the same edges (0.186.0 and this build from source).
 
 ### Not covered
 
@@ -65,17 +79,19 @@ ms (3 runs each, alternating).
   Python sees only the defs earlier in that body: another class's method, a
   method defined after the call, and from a nested class body the outer
   class's methods.
-- A class body's calls are recorded under the file's `<module>`, as before,
-  so a top-level `h()` and a class-body `h()` in one file give `<module>` one
-  edge to each `h`, the method included.
+- A class body's calls are recorded under the function around the class, or
+  under the file's `<module>` for a class at the top level, as before, so a
+  top-level `h()` and a top-level class's `h()` in one file give `<module>`
+  one edge to each `h`, the method included.
 - A parameter or local variable of the name does not hide the module's
   definition: `def g(self, h): h()` and `h = self.h; h()` bind the module's
   `h`, and no longer `C.h` as well, although a method passed in or assigned
   that way is what runs. In the standard library,
-  `mimetypes._read_windows_registry(cls, add_type)` is called with
-  `self.add_type` (or a lambda calling it) and now binds only the module's
-  `add_type`. Likewise a `global h` in a class body makes its `def h` the
-  module's `h`, and a function's `h()` no longer binds it.
+  `mimetypes._read_windows_registry(cls, add_type)` is called with a lambda
+  calling `self.add_type` (or with `self.add_type` when `strict=False`) and
+  now binds only the module's `add_type`. Likewise, beside a module-level
+  `def h`, a `global h` in a class body makes the body's `def h` the
+  module's `h`, and a function's `h()` binds only the module-level one.
 - A call that sees no definition of its name keeps every candidate, a method
   included: `h()` in a method of a file whose only `h` is a method binds it.
 
