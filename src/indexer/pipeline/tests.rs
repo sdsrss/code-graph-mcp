@@ -15275,6 +15275,55 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
              go(): number { return now(); }\n}\n",
             &["go@4 -> now@1"],
         ),
+        // D#735: a Python name in a `def` or `lambda` body is looked up in the
+        // function, the functions around it, the module and the builtins, never
+        // in a class body, so such a call that sees a lexical definition binds
+        // no method either; nor does a call at the module's top level.
+        (
+            "py: method beside a module function",
+            "m.py",
+            "def h():\n    pass\n\n\nclass C:\n    def h(self):\n        pass\n\n    def g(self):\n        h()\n",
+            &["g@9 -> h@1"],
+        ),
+        (
+            "py: the method is another class's",
+            "m.py",
+            "def h():\n    pass\n\n\nclass A:\n    def h(self):\n        pass\n\n\nclass B:\n    \
+             def g(self):\n        h()\n",
+            &["g@11 -> h@1"],
+        ),
+        (
+            "py: a def nested in a method",
+            "m.py",
+            "def h():\n    pass\n\n\nclass C:\n    def h(self):\n        pass\n\n    def g(self):\n        \
+             def inner():\n            h()\n        inner()\n",
+            &["g@9 -> inner@10", "inner@10 -> h@1"],
+        ),
+        (
+            "py: method of a class inside the calling function",
+            "m.py",
+            "def h():\n    pass\n\n\ndef f():\n    class C:\n        def h(self):\n            pass\n    h()\n",
+            &["f@5 -> h@1"],
+        ),
+        (
+            "py: a lambda body in a class body",
+            "m.py",
+            "def h():\n    pass\n\n\nclass C:\n    def h(self):\n        pass\n\n    k = lambda self: h()\n",
+            &["<module>@1 -> h@1"],
+        ),
+        (
+            "py: a call at the module's top level",
+            "m.py",
+            "def h():\n    pass\n\n\nclass C:\n    def h(self):\n        pass\n\n\nh()\n",
+            &["<module>@1 -> h@1"],
+        ),
+        (
+            "py: async and static methods",
+            "m.py",
+            "def h():\n    pass\n\n\nclass C:\n    def h(self):\n        pass\n\n    async def a(self):\n        \
+             h()\n\n    @staticmethod\n    def s():\n        h()\n",
+            &["a@9 -> h@1", "s@12 -> h@1"],
+        ),
     ];
     let mut failures = Vec::new();
     for (label, path, code, want) in table {
@@ -15287,13 +15336,53 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// D#714 A3, rows the rule must leave as they were before it: outside JS/TS a
-/// method of the same name as a lexical definition stays a candidate (a Python
-/// class body's bare call does reach an earlier def of that body), and a call
-/// that sees no lexical definition keeps every candidate, a member too.
+/// D#714 A3, rows the rule must leave as they were before it: a call that sees
+/// no lexical definition keeps every candidate, a member too, and Python code
+/// that runs in a class body keeps that body's methods (D#735): the body's own
+/// statements, a default argument, a decorator and a `lambda` default are
+/// evaluated there. A comprehension in a class body is kept too, although its
+/// body does not see the class (only the first iterable does): the rule only
+/// takes edges away, and leaving one is the safe side.
 #[test]
 fn a_same_name_member_is_left_to_the_other_rules() {
     let table: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "py: a class-body call reaches the body's method",
+            "m.py",
+            "def h():\n    pass\n\n\nclass C:\n    def h():\n        pass\n\n    x = h()\n",
+            &["<module>@1 -> h@1", "<module>@1 -> h@6"],
+        ),
+        (
+            "py: a default argument is evaluated in the class body",
+            "m.py",
+            "def h():\n    pass\n\n\nclass C:\n    def h():\n        pass\n\n    def g(self, x=h()):\n        pass\n",
+            &["g@9 -> h@1", "g@9 -> h@6"],
+        ),
+        (
+            "py: a decorator is evaluated in the class body",
+            "m.py",
+            "def h():\n    return id\n\n\nclass C:\n    def h():\n        return id\n\n    @h()\n    \
+             def g(self):\n        pass\n",
+            &["<module>@1 -> h@1", "<module>@1 -> h@6"],
+        ),
+        (
+            "py: a comprehension in a class body",
+            "m.py",
+            "def h():\n    pass\n\n\nclass C:\n    def h():\n        pass\n\n    xs = [h() for _ in range(2)]\n",
+            &["<module>@1 -> h@1", "<module>@1 -> h@6"],
+        ),
+        (
+            "py: a method's call that sees only methods",
+            "m.py",
+            "class C:\n    def h(self):\n        pass\n\n    def g(self):\n        h()\n",
+            &["g@5 -> h@2"],
+        ),
+        (
+            "py: a lambda default in a class body",
+            "m.py",
+            "def h():\n    pass\n\n\nclass C:\n    def h():\n        pass\n\n    k = lambda self, x=h(): x\n",
+            &["<module>@1 -> h@1", "<module>@1 -> h@6"],
+        ),
         (
             "js: class method, no lexical definition visible",
             "a.js",
@@ -15307,22 +15396,10 @@ fn a_same_name_member_is_left_to_the_other_rules() {
             &["a@3 -> h@1"],
         ),
         (
-            "py: method beside a module function",
-            "m.py",
-            "def h():\n    pass\n\n\nclass C:\n    def h(self):\n        pass\n\n    def g(self):\n        h()\n",
-            &["g@9 -> h@1", "g@9 -> h@6"],
-        ),
-        (
             "rs: method beside a free fn",
             "src/lib.rs",
             "fn h() {}\nstruct S;\nimpl S {\n    fn h(&self) {}\n    fn g(&self) {\n        h();\n    }\n}\n",
             &["g@5 -> h@1"],
-        ),
-        (
-            "py: method of a class inside the calling function",
-            "m.py",
-            "def h():\n    pass\n\n\ndef f():\n    class C:\n        def h(self):\n            pass\n    h()\n",
-            &["f@5 -> h@1", "f@5 -> h@7"],
         ),
         (
             "rs: method of an impl inside the calling fn",

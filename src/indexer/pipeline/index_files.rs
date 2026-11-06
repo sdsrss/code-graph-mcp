@@ -2625,15 +2625,19 @@ fn resolve_batch_relations(
 /// definitions whose scope sees the call, the innermost stay: `app()` in one
 /// `describe` callback binds that callback's `const app`, not the next one's,
 /// and a local `const ok` shadows the top-level `function ok`. A candidate
-/// that is no lexical binding stays, except a JS/TS method once the call sees
-/// a lexical definition: a bare call there never reaches a class or object
-/// member, while a Python class body's bare call does reach an earlier def of
-/// that body. Every candidate stays when the call sees none: the rule only
-/// takes from the set, and the definition it sees is always kept.
+/// that is no lexical binding stays, except a method once the call sees a
+/// lexical definition and cannot reach a member ([`BareCall`]): any JS/TS bare
+/// call, and a Python one outside a class body (D#735), while a Python class
+/// body's bare call does reach an earlier def of that body. Every candidate
+/// stays when the call sees none: the rule only takes from the set, and the
+/// definition it sees is always kept.
+///
+/// [`BareCall`]: crate::parser::treesitter::BareCall
 fn visible_same_file_targets(targets: Vec<i64>, rel: &ParsedRelation, pf: &FileParsed) -> Vec<i64> {
-    let Some(at) = rel.call_at else {
+    let Some(call) = rel.call_at else {
         return targets;
     };
+    let at = call.at;
     let Some(innermost) = targets
         .iter()
         .filter_map(|id| pf.node_scopes.get(id))
@@ -2643,12 +2647,11 @@ fn visible_same_file_targets(targets: Vec<i64>, rel: &ParsedRelation, pf: &FileP
     else {
         return targets;
     };
-    let members_unreachable = matches!(pf.language.as_str(), "javascript" | "typescript" | "tsx");
     targets
         .into_iter()
         .filter(|id| match pf.node_scopes.get(id) {
             Some(scope) => scope.sees(at) && scope.width() == innermost,
-            None => !(members_unreachable && pf.node_type_of(*id) == Some("method")),
+            None => call.reaches_members || pf.node_type_of(*id) != Some("method"),
         })
         .collect()
 }

@@ -141,10 +141,89 @@ fn is_nested_block(n: &tree_sitter::Node, language: &str, functions: &[&str]) ->
             .is_some_and(|p| functions.contains(&p.kind()) || NAMESPACES.contains(&p.kind()))
 }
 
-/// D#714: where a bare call in a language [`lexical_scope`] covers starts,
-/// for the resolver to pick the same-file definitions it sees.
-pub(crate) fn bare_call_at(call: &tree_sitter::Node, language: &str) -> Option<usize> {
-    lexical_scope_kinds(language).map(|_| call.start_byte())
+/// A bare call in a language [`lexical_scope`] covers (D#714): where it starts,
+/// for the resolver to pick the same-file definitions it sees, and whether a
+/// class or object member is a name it can reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BareCall {
+    pub at: usize,
+    pub reaches_members: bool,
+}
+
+/// D#714: [`BareCall`] for a call in a language [`lexical_scope`] covers.
+///
+/// A JS/TS bare call never reaches a member. A Python one may, from a class
+/// body: [`mark_python_class_body_calls`] decides that for the whole file once
+/// its relations are in, and until then it reaches none. Rust is left as it was
+/// (its shape rules already keep associated functions from a bare call).
+pub(crate) fn bare_call_at(call: &tree_sitter::Node, language: &str) -> Option<BareCall> {
+    lexical_scope_kinds(language)?;
+    Some(BareCall {
+        at: call.start_byte(),
+        reaches_members: language == "rust",
+    })
+}
+
+/// D#735: a Python bare call reaches the methods of a class body only from
+/// code that runs in that body. A name in a `def` or `lambda` body is looked up
+/// in the functions around it, the module and the builtins, never in a class
+/// body, and module code sees no class body either. A default argument, an
+/// annotation, a decorator and a class's bases are evaluated in the scope
+/// around their `def` or `class`, so what decides is the innermost `body` of a
+/// `def`, `lambda` or `class` that holds the call. A comprehension counts as
+/// no function: in a class body its first iterable runs there, and keeping the
+/// members is the side the rule can afford.
+///
+/// One walk of the tree and one sweep over the calls in byte order, so the cost
+/// is linear in the file: asking each call's ancestors instead costs the depth
+/// squared per call (`Node::parent` descends from the root), 3.0 s -> 60 s on
+/// 900 KB of calls nested 200 deep.
+pub(crate) fn mark_python_class_body_calls<'a>(
+    root: tree_sitter::Node,
+    calls: impl Iterator<Item = &'a mut BareCall>,
+) {
+    let mut calls: Vec<&mut BareCall> = calls.collect();
+    if calls.is_empty() {
+        return;
+    }
+    // (start, end, is a class body), nested or disjoint as tree ranges are.
+    let mut bodies: Vec<(usize, usize, bool)> = Vec::new();
+    let mut cursor = root.walk();
+    'walk: loop {
+        let n = cursor.node();
+        let class = match n.kind() {
+            "class_definition" => Some(true),
+            "function_definition" | "lambda" => Some(false),
+            _ => None,
+        };
+        if let Some(body) = class.and_then(|c| n.child_by_field_name("body").map(|b| (b, c))) {
+            bodies.push((body.0.start_byte(), body.0.end_byte(), body.1));
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    bodies.sort_unstable_by_key(|&(start, end, _)| (start, std::cmp::Reverse(end)));
+    calls.sort_unstable_by_key(|c| c.at);
+    // The bodies started before the call, in start order. Once the ones that
+    // ended are off the top, the top is the innermost body holding the call: a
+    // later start that still holds it is nested in every earlier one that does.
+    let mut open: Vec<(usize, usize, bool)> = Vec::new();
+    let mut next = bodies.into_iter().peekable();
+    for call in calls {
+        open.extend(std::iter::from_fn(|| {
+            next.next_if(|&(start, _, _)| start <= call.at)
+        }));
+        while open.last().is_some_and(|&(_, end, _)| end <= call.at) {
+            open.pop();
+        }
+        call.reaches_members = open.last().is_some_and(|&(_, _, class)| class);
+    }
 }
 
 thread_local! {

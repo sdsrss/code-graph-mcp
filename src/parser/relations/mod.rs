@@ -150,12 +150,12 @@ pub struct ParsedRelation {
     /// `@overload` stubs, nested `def index()` handlers) instead of giving every
     /// one of them this relation.
     pub source_line: Option<u32>,
-    /// Byte where a bare call starts (`app()`, not `x.app()` or a call through
-    /// an import), in a language whose definitions carry a
-    /// [`LexicalScope`](crate::parser::treesitter::LexicalScope): the resolver
-    /// keeps the same-file definitions of that name the call sees (D#714). In
-    /// memory only.
-    pub call_at: Option<usize>,
+    /// Where a bare call starts (`app()`, not `x.app()` or a call through an
+    /// import), in a language whose definitions carry a
+    /// [`LexicalScope`](crate::parser::treesitter::LexicalScope), and whether
+    /// it can reach a member: the resolver keeps the same-file definitions of
+    /// that name the call sees (D#714, D#735). In memory only.
+    pub call_at: Option<crate::parser::treesitter::BareCall>,
 }
 
 pub fn extract_relations(source: &str, language: &str) -> Result<Vec<ParsedRelation>> {
@@ -224,6 +224,10 @@ pub fn extract_relations_from_tree(
             });
         }
         imports::count_python_import_sources(&mut relations);
+        super::treesitter::mark_python_class_body_calls(
+            tree.root_node(),
+            relations.iter_mut().filter_map(|r| r.call_at.as_mut()),
+        );
     }
     // Stamp source_language on every relation. walk_for_relations constructs
     // ParsedRelation with source_language: String::new(), and we fill it in

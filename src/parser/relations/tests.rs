@@ -1409,6 +1409,36 @@ fn test_python_class_rule_costs_stay_linear() {
     );
 }
 
+// D#735: which Python bare calls run in a class body is decided in one sweep
+// per file. Asking each call's ancestors costs the depth squared per call
+// (`Node::parent` descends from the root): 900 KB of calls nested 200 deep
+// indexed in 60 s instead of 3.0 s.
+#[test]
+fn test_python_class_body_marking_stays_linear() {
+    let stmt = format!("        x = {}{}\n", "h(".repeat(200), ")".repeat(200));
+    let code = format!(
+        "def h(*a):\n    return 0\n\n\nclass C:\n    def h(self):\n        pass\n\n    \
+         def g(self):\n{}\n    y = h()\n",
+        stmt.repeat(300_000 / stmt.len())
+    );
+    assert!(
+        code.len() < 1 << 20,
+        "keep the input under the 1 MiB file cap"
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(extract_relations(&code, "python").unwrap());
+    });
+    let rels = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("marking the calls nested 200 deep took over 60 s");
+    let calls: Vec<_> = rels.iter().filter_map(|r| r.call_at).collect();
+    assert!(calls.len() > 1_000, "{} bare calls", calls.len());
+    // Every call is in `g`'s body but the last, which runs in the class body.
+    let in_class = calls.iter().filter(|c| c.reaches_members).count();
+    assert_eq!(in_class, 1);
+}
+
 // Review round 2 of D#370(g): each class's MRO is merged once. The walk that
 // merged every base's MRO again for each path to it doubled with each class
 // of `Ki(K(i-1), …, K0)` (22 classes: 0.6 s, 26: 10 s); 30 is hours.
