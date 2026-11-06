@@ -3355,11 +3355,11 @@ Restart every code-graph server on this project so they run one version.",
     // target_name now resolves against a same-language node. Cheap when the
     // table is empty (typical after a full index of a self-contained codebase).
     //
-    // Gated on this batch having PARSED something, because the sweep does two
-    // things and the second one is not free. Resolution: a buffered row can only
-    // start resolving once its target node exists, and nodes appear only from
-    // parsed files — so on a batch that parsed nothing the sweep provably finds
-    // nothing new. Retention: the same call ages every survivor by one attempt.
+    // Gated on this run having PARSED or DELETED something, because the sweep
+    // does two things and the second one is not free. Resolution: a buffered row
+    // resolves once a target node exists, and nodes appear only from parsed
+    // files; a deletion is the other change it answers. Retention: the same
+    // call ages every survivor by one attempt.
     // Ungated, that spent the row's 50-attempt budget on ambient watcher and
     // periodic-rescan ticks (measured on this repo: attempts = 4 after 26h /
     // 4 scans, ~2 weeks to the ceiling with the code untouched), and an evicted
@@ -3367,10 +3367,14 @@ Restart every code-graph server on this project so they run one version.",
     // reference could go permanently unresolved for no reason but elapsed time.
     // Attempts now count resolution OPPORTUNITIES.
     //
-    // Deletions do not qualify: removing nodes can only shrink the candidate set.
+    // Deletions qualify (D#743). Phase 0 buffers every call into a deleted file,
+    // and those rows were never resolved against what is left: a call that
+    // still binds another file's `r` kept a row a rebuild does not have, and
+    // one whose deleted `r` had been preferred over a test file's bound
+    // nothing where a rebuild binds the test file's.
     let mut pending_sources = std::collections::BTreeSet::new();
     let mut swept_ends = HashSet::new();
-    let pending_resolved = if all_indexed.is_empty() {
+    let pending_resolved = if all_indexed.is_empty() && delete_paths.is_empty() {
         0
     } else {
         super::resolve::resolve_pending_calls_touching(

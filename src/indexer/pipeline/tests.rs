@@ -2011,6 +2011,69 @@ fn assert_incremental_matches_rebuild(before: &[(&str, &str)], after: &[(&str, O
     );
 }
 
+/// D#743: a run that only deletes files re-resolves the calls it buffers out
+/// of them, as a rebuild of what is left does. The sweep was skipped in such a
+/// run ("removing nodes can only shrink the candidate set"), so the buffered
+/// call kept a row a rebuild has no use for and, where the deleted definition
+/// had been preferred over a test file's, no edge at all.
+#[test]
+fn a_deletion_only_run_resolves_the_calls_it_buffers() {
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+    let table: &[Case] = &[
+        (
+            "the kept target was preferred over a test file's",
+            &[
+                ("c.js", "export function r() { return 1; }\n"),
+                ("tests/x.js", "export function r() { return 2; }\n"),
+                ("o.js", "export function o() { return r(); }\n"),
+            ],
+            "c.js",
+        ),
+        (
+            "another file's same-named function survives",
+            &[
+                ("c.js", "export function r() { return 1; }\n"),
+                ("d.js", "function r() { return 2; }\nexport { r as f };\n"),
+                ("o.js", "export function o() { return r(); }\n"),
+            ],
+            "c.js",
+        ),
+        (
+            "js: a member call keeps another class's method",
+            &[
+                ("a.js", "export function u(x) { return x.m(); }\n"),
+                ("b.js", "export class B {\n  m() { return 1; }\n}\n"),
+                ("c.js", "export class C {\n  m() { return 2; }\n}\n"),
+            ],
+            "b.js",
+        ),
+        (
+            "py: a member call keeps another class's method",
+            &[
+                ("a.py", "def u(x):\n    return x.m()\n"),
+                ("b.py", "class B:\n    def m(self):\n        return 1\n"),
+                ("c.py", "class C:\n    def m(self):\n        return 2\n"),
+            ],
+            "b.py",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, tree, gone) in table {
+        let (project, _d, db) = fresh_index_of(tree);
+        fs::create_dir_all(project.path().join("tests")).unwrap();
+        fs::remove_file(project.path().join(gone)).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        let left: Vec<(&str, &str)> = tree.iter().copied().filter(|(p, _)| p != gone).collect();
+        let (_p2, _d2, control) = fresh_index_of(&left);
+        let got = (call_edges_with_confidence(&db), pending_set(&db));
+        let want = (call_edges_with_confidence(&control), pending_set(&control));
+        if got != want {
+            failures.push(format!("{label}:\n    got  {got:?}\n    want {want:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// Pre-ship review of D#89: every way an incremental run bound a typed call
 /// differently from a rebuild.
 #[test]
