@@ -2450,6 +2450,22 @@ fn a_js_family_import_call_matches_a_rebuild_through_edits() {
             &["a.tsx.A -> t.ts.f"],
         ),
         (
+            // The prune keeps `b.tsx:f` (the caller's member call of the name);
+            // the sweep re-binds it as it stands, and 2d-bind must still run on
+            // the caller to bring back the import's target.
+            "the callee file is touched beside an own-language twin the prune keeps",
+            &[
+                ("a.tsx", guarded),
+                ("t.ts", callee),
+                ("b.tsx", "export function f() { return 2; }\n"),
+            ],
+            &[(
+                "t.ts",
+                Some("// touched\nexport function f() { return 1; }\n"),
+            )],
+            &["a.tsx.A -> b.tsx.f", "a.tsx.A -> t.ts.f"],
+        ),
+        (
             // 2d-bind moved the call from `b.tsx:f` to the import's target; with
             // two targets of the name it binds neither, and the prune drops `b.tsx:f`.
             "the callee file gains a class method beside an own-language twin",

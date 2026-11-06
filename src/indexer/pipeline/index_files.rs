@@ -2855,6 +2855,10 @@ Restart every code-graph server on this project so they run one version.",
     // real edges at exactly the scale where a full rebuild is least likely to be
     // re-run — the failure this pipeline has already been bitten by twice.
     let mut deferred: Vec<DeferredRelation> = Vec::new();
+    // Files whose cross-language JS-family calls Phase 2c sent back to the
+    // pending buffer (D#746): in the post-pass scope whatever the sweep binds.
+    let mut requeued_family_sources: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
 
     // Same sort+dedup rationale as `files` above: `delete_paths` arrives from
     // `compute_diff`'s HashMap walk, and the pending-buffer rows Phase 0 writes
@@ -3215,6 +3219,7 @@ Restart every code-graph server on this project so they run one version.",
             &run_file_paths,
             &done_paths,
             &mut deferred,
+            &mut requeued_family_sources,
         )?;
         done_paths.extend(batch_file_paths.iter().map(|p| p.to_string()));
 
@@ -3493,6 +3498,7 @@ Restart every code-graph server on this project so they run one version.",
                 .iter()
                 .map(|d| d.rel_path.as_str())
                 .chain(pending_sources.iter().map(String::as_str))
+                .chain(requeued_family_sources.iter().map(String::as_str))
                 .collect();
             if !deferred_sources.is_empty() {
                 let conn = db.conn();
@@ -3784,6 +3790,7 @@ fn mint_external_sentinels(
 ///
 /// Returns the number of edges actually inserted.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn restore_inbound_edges(
     db: &Database,
     batch_parsed: &[FileParsed],
@@ -3800,6 +3807,7 @@ fn restore_inbound_edges(
     run_file_paths: &HashSet<&str>,
     done_paths: &HashSet<String>,
     deferred: &mut Vec<DeferredRelation>,
+    requeued_family_sources: &mut std::collections::BTreeSet<String>,
 ) -> Result<usize> {
     let mut edges_created = 0usize;
     // Phase 2c: Restore cross-file inbound edges lost to cascade delete.
@@ -4066,6 +4074,13 @@ fn restore_inbound_edges(
                         &src_lang,
                         metadata.as_deref(),
                     )?;
+                    // The sweep may bind it by name to an own-language edge
+                    // the caller still holds, writing nothing new; 2d-bind
+                    // brings back the import's target only if it looks at
+                    // the caller (D#746).
+                    if family_call {
+                        requeued_family_sources.insert(src_path.clone());
+                    }
                 } else {
                     // A JS import bound under another name (a renamed
                     // re-export) goes back as it was extracted: under the name
