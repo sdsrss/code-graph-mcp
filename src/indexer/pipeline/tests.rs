@@ -6650,6 +6650,97 @@ fn a_deletion_ages_a_pending_row_at_most_once() {
     );
 }
 
+/// D#747: a member call whose namesakes are all free functions binds nothing
+/// and is buffered by the deferred pass; the sweep of the same run drained the
+/// row as resolved. Once the functions went, a rebuild held the row and an
+/// incremental run had nothing to bring it back (hono: 16 `.then` rows after
+/// deleting `src/jsx/streaming.ts`). A typed receiver's class without the
+/// method falls back to the same member pool.
+#[test]
+fn a_member_call_reaching_only_free_functions_stays_pending() {
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, &'a str);
+    let cases: &[Case] = &[
+        (
+            "a JS member call",
+            &[
+                ("s.ts", "export function then(p: any) { return p; }\n"),
+                ("c.ts", "export function C(x: any) { return x.then(1); }\n"),
+            ],
+            "s.ts",
+            "c.ts:C => then {\"q\":\"member\"}",
+        ),
+        (
+            "a JS member call beside a nested function",
+            &[
+                (
+                    "s.ts",
+                    "export function w() { const then = (p: any) => p; return then(1); }\n",
+                ),
+                ("c.ts", "export function C(x: any) { return x.then(1); }\n"),
+            ],
+            "s.ts",
+            "c.ts:C => then {\"q\":\"member\"}",
+        ),
+        (
+            "a Python member call",
+            &[
+                ("s.py", "def then(p):\n    return p\n"),
+                ("c.py", "def C(x):\n    return x.then(1)\n"),
+            ],
+            "s.py",
+            "c.py:C => then {\"q\":\"member\"}",
+        ),
+        (
+            "a typed receiver's class without the method",
+            &[
+                ("s.ts", "export function then(p: any) { return p; }\n"),
+                (
+                    "k.ts",
+                    "export class K { m() { return 1; } }\n\
+                     export function C(k: K) { return k.then(1); }\n",
+                ),
+            ],
+            "s.ts",
+            "k.ts:C => then {\"q\":\"rtype\",\"v\":\"K\"}",
+        ),
+    ];
+    let rows = |db: &Database| -> Vec<String> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT f.path || ':' || n.name || ' => ' || p.target_name || ' ' \
+                 || COALESCE(p.metadata, '') FROM pending_unresolved_calls p \
+                 JOIN nodes n ON n.id = p.source_id JOIN files f ON f.id = n.file_id \
+                 ORDER BY 1",
+            )
+            .unwrap();
+        let got = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        got.filter_map(Result::ok).collect()
+    };
+    let mut failures = Vec::new();
+    for (label, tree, deleted, row) in cases {
+        let (project, _d, db) = fresh_index_of(tree);
+        if !rows(&db).iter().any(|r| r == row) {
+            failures.push(format!(
+                "{label}: fresh index rows {:?}, want {row}",
+                rows(&db)
+            ));
+        }
+        fs::remove_file(project.path().join(deleted)).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        let rest: Vec<(&str, &str)> = tree.iter().filter(|(p, _)| p != deleted).copied().collect();
+        let (_p2, _d2, control) = fresh_index_of(&rest);
+        let got = (call_edges_with_confidence(&db), rows(&db));
+        let want = (call_edges_with_confidence(&control), rows(&control));
+        if got != want {
+            failures.push(format!(
+                "{label}, {deleted} deleted:\n    got  {got:?}\n    want {want:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// Boundary guard for the incremental-edge-timing guarantee under bounded
 /// retention: a row aged to ONE sweep short of eviction must still bridge —
 /// resolution in the same sweep wins over eviction (resolved rows are drained

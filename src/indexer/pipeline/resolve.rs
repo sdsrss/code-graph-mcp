@@ -692,6 +692,9 @@ pub(super) fn resolve_pending_calls_touching(
                             // Stays buffered, as the deferred pass buffers it:
                             // only the class gaining the method answers it.
                             continue;
+                        } else if pool.is_empty() {
+                            // Free functions only: buffered too (D#747).
+                            continue;
                         } else {
                             pool
                         }
@@ -786,9 +789,17 @@ pub(super) fn resolve_pending_calls_touching(
                     )?,
                 }
             }
-            // Member call: the same free-function exclusion as Phase 2.
+            // Member call: the same free-function exclusion as Phase 2. With
+            // nothing left it stays buffered, as the deferred pass buffers it:
+            // drained here, the row was gone once the functions went, and a
+            // rebuild held it (D#747).
             Some(CalleeMeta::Member) => {
-                classes.member_call_candidates(db, row.metadata.as_deref(), candidates)?
+                let pool =
+                    classes.member_call_candidates(db, row.metadata.as_deref(), candidates)?;
+                if pool.is_empty() {
+                    continue;
+                }
+                pool
             }
             // A Rust `x.f()` whose receiver type narrowed the pool (D#112): the
             // deferred pass's unique-method rule over that pool, which a later
