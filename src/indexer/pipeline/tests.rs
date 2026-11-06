@@ -2338,6 +2338,7 @@ fn a_js_family_import_call_matches_a_rebuild_through_edits() {
     let renamed = "function r() { return 1; }\nexport { r as f };\n";
     let with_method = "export function f() { return 1; }\nexport class K { f() { return 2; } }\n";
     let twin = "export function f() { return 2; }\n";
+    let aliased = "export function f() { return 1; }\nexport { f as g };\n";
     let two_imports = "import { f } from './t';\nimport { f as g } from './v';\n\
                        export function A() { return f() + g(); }\n";
     let long_caller = format!(
@@ -2506,6 +2507,75 @@ fn a_js_family_import_call_matches_a_rebuild_through_edits() {
                 )),
             )],
             &[],
+        ),
+        // A node imported under two names (`export { f as g }`): which one the
+        // call was made under is not on its edge (second pre-tag review of
+        // 0.189.0, H1).
+        (
+            "a node imported under two names gains a class method beside it",
+            &[
+                (
+                    "a.tsx",
+                    "import { f, g } from './t';\nexport function A() { return f(); }\n",
+                ),
+                ("t.ts", aliased),
+            ],
+            &[(
+                "t.ts",
+                Some(&format!(
+                    "{aliased}export class K {{ f() {{ return 2; }} }}\n"
+                )),
+            )],
+            &[],
+        ),
+        (
+            "a node imported by two statements gains a class method beside it",
+            &[
+                (
+                    "a.tsx",
+                    "import { f } from './t';\nimport { g } from './t';\n\
+                     export function A() { return f() + g(); }\n",
+                ),
+                ("t.ts", aliased),
+            ],
+            &[(
+                "t.ts",
+                Some(&format!(
+                    "{aliased}export class K {{ f() {{ return 2; }} }}\n"
+                )),
+            )],
+            &[],
+        ),
+        (
+            "a node imported under two names gains an object method beside it",
+            &[
+                (
+                    "a.tsx",
+                    "import { f, g } from './t';\nexport function A() { return f(); }\n",
+                ),
+                ("t.js", aliased),
+            ],
+            &[(
+                "t.js",
+                Some(&format!(
+                    "{aliased}export const o = {{ f() {{ return 2; }} }};\n"
+                )),
+            )],
+            &[],
+        ),
+        (
+            // Both ways into a file that already has two `f`s, touched.
+            "a file with two nodes of the name imported both ways is touched",
+            &[
+                (
+                    "a.tsx",
+                    "import { f } from './t';\nimport * as T from './t';\n\
+                     export function A() { return f() + T.f(); }\n",
+                ),
+                ("t.ts", with_method),
+            ],
+            &[("t.ts", Some(&format!("// touched\n{with_method}")))],
+            &["a.tsx.A -> t.ts.K.f", "a.tsx.A -> t.ts.f"],
         ),
         (
             "a namespace import's file gains a class method of the name",

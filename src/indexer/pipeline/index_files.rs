@@ -3843,20 +3843,6 @@ fn restore_inbound_edges(
             .iter()
             .map(|pf| (pf.file_id, pf.language.as_str()))
             .collect();
-        // (importing file, imported file, node name) -> the names its imports
-        // of that node import it under, from the saved `imports` edges.
-        let mut imported_as: HashMap<(i64, i64, &str), std::collections::BTreeSet<String>> =
-            HashMap::new();
-        for (_, source_file_id, target_file_id, target_name, relation, metadata, _) in
-            saved_inbound_edges
-        {
-            if relation.as_str() == REL_IMPORTS {
-                imported_as
-                    .entry((*source_file_id, *target_file_id, target_name.as_str()))
-                    .or_default()
-                    .insert(super::js_exports::as_extracted(metadata.as_deref(), target_name).0);
-            }
-        }
 
         let mut restored = 0usize;
         let mut skipped_intra_batch = 0usize;
@@ -3943,29 +3929,34 @@ fn restore_inbound_edges(
             // own language's pool and 2d-bind, or, that pool empty, through
             // the widened one (D#742). When the edited file now holds two
             // nodes of the name, the import's edge names both and a rebuild
-            // binds neither: the call goes back to the pending buffer, under
-            // the name its file imports (a renamed export's node is named
-            // otherwise), for the sweep and the post-passes to decide, never
-            // restored by name onto both (D#746). With one node it is restored
-            // as any call is: requeued under the node's name, a call through
-            // `export { r as f }` stayed pending where a rebuild binds `r`, and
-            // 40,000 calls into one file went through the sweep one by one.
-            let family_requeue: Option<&String> = (relation.as_str() == REL_CALLS
+            // binds neither, where restoring by name binds both: the caller's
+            // file is re-extracted in the fan-out round instead, as a rebuild
+            // resolves it (D#746). Not requeued: a pending row needs the name
+            // the call was made under, and a node imported under two names
+            // (`export { f as g }`) or renamed (`export { r as f }`) does not
+            // say which (pre-tag reviews of 0.189.0). With one node the call is
+            // restored by name, as any call is.
+            if relation.as_str() == REL_CALLS
                 && super::resolve::may_widen_to_family(&src_lang, metadata.as_deref())
                 && batch_file_language
                     .get(target_file_id)
                     .is_some_and(|l| super::resolve::family_fallback(&src_lang, l))
                 && batch_name_to_ids
                     .get(&(*target_file_id, target_name.as_str()))
-                    .is_some_and(|found| found.len() > 1))
-            .then(|| imported_as.get(&(*source_file_id, *target_file_id, target_name.as_str())))
-            .flatten()
-            .filter(|names| names.len() == 1)
-            .and_then(|names| names.iter().next());
-            let family_call = family_requeue.is_some();
+                    .is_some_and(|found| found.len() > 1)
+            {
+                // A caller in a later batch of this run is re-extracted by it
+                // already; one in an earlier batch bound the old node.
+                let later_batch =
+                    run_file_paths.contains(src_path.as_str()) && !done_paths.contains(&src_path);
+                if !src_path.is_empty() && !later_batch {
+                    super::js_exports::requeued_walk_import(db.conn(), &src_path)?;
+                }
+                requeued += 1;
+                continue;
+            }
             let new_target_ids: Option<Vec<i64>> = (!renamed_import
                 && !receiver_typed
-                && !family_call
                 && attr_import.is_none())
             .then(|| batch_name_to_ids.get(&(*target_file_id, target_name.as_str())))
             .flatten()
@@ -4085,16 +4076,10 @@ fn restore_inbound_edges(
                     continue;
                 }
                 if relation.as_str() == REL_CALLS {
-                    let pending_name = match family_requeue {
-                        Some(name) => name.clone(),
-                        None => {
-                            super::resolve::js_import_pending_name(metadata.as_deref(), target_name)
-                        }
-                    };
                     crate::storage::queries::insert_pending_unresolved_call(
                         db.conn(),
                         *source_id,
-                        &pending_name,
+                        &super::resolve::js_import_pending_name(metadata.as_deref(), target_name),
                         &src_lang,
                         metadata.as_deref(),
                     )?;
