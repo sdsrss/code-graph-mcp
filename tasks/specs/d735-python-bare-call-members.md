@@ -58,8 +58,18 @@
 - 语义变异（表格）：类体当函数（MA）、用整个 def 范围代替 body（MB，默认参数行红）、lambda 不算函数（MC）、任一外层是类就算（MD）——4 个都被杀。
 - 计时（release，`--no-embed`，各 3 次）：deep 900 KB BASE 3,022–3,340 / HEAD 2,839–2,852 ms；嵌套 lambda 900 KB 138–153 / 155–157 ms；wide 1 MB（30,000 个方法）3,085–3,151 / 2,840–3,356 ms；stdlib 全量 3,099–3,127 / 3,085–3,121 ms（交替跑，负载 0.84）。
 - oracle（BASE = 30bb2aa1 源码构建 md5 839d70bf，HEAD = 工作树 e9c8ff84，同一副本）：
-  - stdlib：默认下限 10,971/13,400 = 81.87% → 10,971/13,356 = 82.14%，错边 2,429 → 2,385；召回 10,759/12,375 不变；判定边去掉 44 条全是 wrong_target，新增 0、换层 0。全部边（含未判定）114,843 → 114,773：去掉 70 条，全是指向 `method` 的 `calls`，新增 0。未判定的 26 条逐类读源码：`webbrowser.open_new/open_new_tab/main` 调模块函数 `open`（去掉的是 8 个浏览器类的 `open` 方法）；`mimetypes._read_windows_registry` 里 `add_type` 是参数；tkinter `_substitute` 里 `getboolean = self.tk.getboolean` 是局部变量——方法都碰不到。
+  - stdlib：默认下限 10,971/13,400 = 81.87% → 10,971/13,356 = 82.14%，错边 2,429 → 2,385；召回 10,759/12,375 不变；判定边去掉 44 条全是 wrong_target，新增 0、换层 0。全部边（含未判定）114,843 → 114,773：去掉 70 条，全是指向 `method` 的 `calls`，新增 0。未判定的 26 条逐类读源码：`webbrowser.open_new/open_new_tab/main` 调模块函数 `open`（去掉的是 8 个浏览器类的 `open` 方法）；tkinter `_substitute` 里 `getboolean = self.tk.getboolean` 是局部变量——这 25 条的方法都碰不到。第 26 条 `mimetypes._read_windows_registry(cls, add_type)` 的 `add_type` 是参数，调用方传入的是 `self.add_type`（或调用它的 lambda），去掉的正是运行时会执行的那条（第 1 轮评审 LOW-1，写进 Not covered）。
   - nltk：默认下限 5,782/6,475 = 89.30% → 5,782/6,465 = 89.44%，错边 693 → 683；召回 4,984/5,838 不变；去掉 10 条全是判定错边，全部边 30,414 → 30,404，新增 0。
   - 判定为对的边一条没丢（两个语料的"去掉"里没有 correct），D#735 上限里那 1 条对边不在去掉的边里。
 - 增量 = 重建：5 步编辑链（方法体调用 → 类体调用 → 删模块函数 → 加回并加另一文件的 `h` → 改成 lambda 体调用），BASE、HEAD 每步边集和 pending 行都与重建相同。
 - `cargo test --no-fail-fast`（sweep 改写前的第一版）：2419 通过、0 失败、7 忽略。`cargo clippy --all-targets -D warnings` 两条 feature 腿：通过。
+
+## 预发评审
+
+- 第 1 轮（新 subagent，盲简报，范围 30bb2aa1..eb76f0a0）：HIGH 0、MEDIUM 1、LOW 2、NIT 3。生成器 16,148 个形状对照 CPython 3.14.4：Python 会调到方法的 5,688 个里去掉 0 个；oracle 数字逐项复现；JS/TS/Rust 4 个语料边集不变。逐条核实：
+  - MEDIUM-1（复现）：`node_type_of` 每次扫描整个文件的节点列表，新规则让 Python 每个裸调用的每个无作用域候选都走它：N 个调用 × N 个同名方法 × F 个节点（805 KB：21 s → 162 s）。JS/TS 早就这样。改为 `FileParsed.method_ids` 集合查找。先红：`a_python_call_among_many_same_named_methods_stays_linear`（1,500 × 1,500，2 万填充函数，60 s 上限）在修复前超时，修复后 debug 4 s 内。
+  - LOW-1（复现）：mimetypes 那条去掉的是运行时调用（参数持有方法）；参数/局部别名/`global` 都属于名字解析看不到的值流，写进 Not covered，CHANGELOG 测量段改为"25 条碰不到、第 26 条是 Python 会运行的"。
+  - LOW-2（复现）：MU16（只认模块顶层的类）、MU7（类用整个节点范围）、MU10（不排序 body）存活。表里各加一行（函数里的类体调用、函数里的类的基类、方法默认参数里的 lambda），三个变异各被一行杀掉。
+  - NIT-1：类体里的调用保留文件里所有同名方法（别的类、之后定义的、外层类的），写进 Not covered，正文改措辞。NIT-2：3.14 的注解是惰性求值、作用域能看到类体，改措辞。NIT-3（Rust 标志无可观察效果）：保持"Rust 不变"的写法，不改。
+  - 修复后二进制（工作树 md5 e3f4f484）：stdlib 114,773、nltk 30,404、本仓库 26,581 条边与 eb76f0a0 构建逐行相同；评审的最坏输入（widecalls 6,000/20,000，805,815 B）BASE 20,866–20,968 ms，修复后 2,297–2,319 ms（修复前评审测 162.5 s）；stdlib 全量 BASE 3,021–3,065 / 修复后 3,027–3,054 ms（交替各 3 次，负载 0.94），CHANGELOG 计时句换成这组数。Not covered 新增的形状逐个跑过：`global h` 的类体 def 被去掉，别的类体、方法之前、嵌套类体里的调用都保留方法。
+

@@ -30,10 +30,10 @@ class C:
 `g` calls the module's `h`, never `C.h`, but 0.186.0 bound both. A bare call
 in a function body or at the top level that sees a definition of its name
 (a module-level `def`, or a `def` in the calling function or one around it)
-now binds no same-named method of the same file. Code that runs in a class
-body keeps that body's methods as candidates: the body's own statements, and
-a method's default arguments, annotations and decorators, which Python
-evaluates there.
+now binds no same-named method of the same file. A call that runs in a class
+body keeps the file's methods as candidates: the body's own statements, and a
+method's default arguments and decorators, which Python evaluates there, and
+its annotations, whose scope sees the class body.
 JavaScript and TypeScript had this rule since 0.185.0.
 
 Measured with the SCIP oracle on the same copies, 0.186.0 and this build from
@@ -45,12 +45,15 @@ source:
 | nltk 3.9.2 | 89.30% → 89.44% | 693 → 683 | 4,984/5,838, unchanged | 10 / 0 |
 
 Every removed edge is a `calls` edge to a method. The oracle judged 54 of the
-80, all wrong; the other 26 are in the standard library, among them `open()`
-in `webbrowser.open_new`, `open_new_tab` and `main`, which bound the `open`
-methods of 8 browser classes beside the module's `open`. No other edge of
+80, all wrong. Of the other 26, all in the standard library, 25 bound a
+method the call cannot reach, among them `open()` in `webbrowser.open_new`,
+`open_new_tab` and `main`, which bound the `open` methods of 8 browser classes
+beside the module's `open`. The 26th is the one Python runs:
+`mimetypes._read_windows_registry(cls, add_type)` calls its parameter, which
+holds the `MimeTypes.add_type` method (see Not covered). No other edge of
 the two corpora changed, its confidence included, and a full index of this
 repository's own Rust, JavaScript and Python files has the same edges. A
-full index of the standard library took 3,085–3,121 ms against 3,099–3,127
+full index of the standard library took 3,027–3,054 ms against 3,021–3,065
 ms (3 runs each, alternating).
 
 ### Not covered
@@ -58,14 +61,21 @@ ms (3 runs each, alternating).
 - A comprehension in a class body keeps the body's methods as candidates of
   the calls inside it, although only its first iterable runs in the class
   body: `xs = [h() for _ in range(2)]` binds both `h`s.
+- A call in a class body keeps every same-named method of the file, where
+  Python sees only the defs earlier in that body: another class's method, a
+  method defined after the call, and from a nested class body the outer
+  class's methods.
 - A class body's calls are recorded under the file's `<module>`, as before,
   so a top-level `h()` and a class-body `h()` in one file give `<module>` one
   edge to each `h`, the method included.
 - A parameter or local variable of the name does not hide the module's
   definition: `def g(self, h): h()` and `h = self.h; h()` bind the module's
-  `h` (no longer `C.h` as well). In the standard library,
-  `mimetypes._read_windows_registry(cls, add_type)` calls its parameter and
-  binds the module's `add_type`.
+  `h`, and no longer `C.h` as well, although a method passed in or assigned
+  that way is what runs. In the standard library,
+  `mimetypes._read_windows_registry(cls, add_type)` is called with
+  `self.add_type` (or a lambda calling it) and now binds only the module's
+  `add_type`. Likewise a `global h` in a class body makes its `def h` the
+  module's `h`, and a function's `h()` no longer binds it.
 - A call that sees no definition of its name keeps every candidate, a method
   included: `h()` in a method of a file whose only `h` is a method binds it.
 

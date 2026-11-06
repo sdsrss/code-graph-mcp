@@ -304,6 +304,11 @@ struct FileParsed {
     // Node id → where a bare call sees it, for this file's lexical definitions
     // (D#714, `visible_same_file_targets`).
     node_scopes: HashMap<i64, LexicalScope>,
+    // This file's `method` nodes, for the same filter: a set, because it is
+    // asked once per candidate of every bare call (pre-tag review of 0.187.0,
+    // MEDIUM-1: a scan of `node_ids` made N calls among N same-named methods
+    // cost N x N x the file's node count).
+    method_ids: HashSet<i64>,
 }
 
 impl FileParsed {
@@ -320,12 +325,6 @@ impl FileParsed {
                 super::resolve::rust_call_shape_admits(rel.metadata.as_deref(), shape)
             })
         });
-    }
-
-    /// The node type of one of this file's nodes, None for another file's.
-    fn node_type_of(&self, id: i64) -> Option<&str> {
-        let i = self.node_ids.iter().position(|n| *n == id)?;
-        self.node_types.get(i).map(String::as_str)
     }
 }
 
@@ -736,6 +735,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         let mut node_types: Vec<String> = Vec::new();
         let mut node_lines: Vec<(u32, u32)> = Vec::new();
         let mut node_scopes: HashMap<i64, LexicalScope> = HashMap::new();
+        let mut method_ids: HashSet<i64> = HashSet::new();
         let mut rust_fns: Vec<super::resolve::RustFnRow> = Vec::new();
 
         let module_node_id = insert_node_cached(
@@ -794,6 +794,9 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             if let Some(scope) = pn.lexical_scope {
                 node_scopes.insert(node_id, scope);
             }
+            if pn.node_type == "method" {
+                method_ids.insert(node_id);
+            }
             if pp.language == "rust" && pn.node_type == "function" {
                 rust_fns.push(super::resolve::RustFnRow {
                     id: node_id,
@@ -825,6 +828,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             node_lines,
             rust_fn_shapes,
             node_scopes,
+            method_ids,
         });
     }
 
@@ -2651,7 +2655,7 @@ fn visible_same_file_targets(targets: Vec<i64>, rel: &ParsedRelation, pf: &FileP
         .into_iter()
         .filter(|id| match pf.node_scopes.get(id) {
             Some(scope) => scope.sees(at) && scope.width() == innermost,
-            None => call.reaches_members || pf.node_type_of(*id) != Some("method"),
+            None => call.reaches_members || !pf.method_ids.contains(id),
         })
         .collect()
 }

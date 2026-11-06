@@ -15317,6 +15317,22 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
             "def h():\n    pass\n\n\nclass C:\n    def h(self):\n        pass\n\n\nh()\n",
             &["<module>@1 -> h@1"],
         ),
+        // Pre-tag review of 0.187.0, LOW-2: a class's bases are no part of its
+        // body, and a lambda in a default argument has a body of its own.
+        (
+            "py: the bases of a class inside a function",
+            "m.py",
+            "def h():\n    return object\n\n\nclass A:\n    def h(self):\n        pass\n\n\ndef f():\n    \
+             class D(h()):\n        pass\n",
+            &["f@10 -> h@1"],
+        ),
+        (
+            "py: a lambda in a method's default argument",
+            "m.py",
+            "def h():\n    pass\n\n\nclass C:\n    def h(self):\n        pass\n\n    \
+             def g(self, k=lambda: h()):\n        pass\n",
+            &["g@9 -> h@1"],
+        ),
         (
             "py: async and static methods",
             "m.py",
@@ -15351,6 +15367,13 @@ fn a_same_name_member_is_left_to_the_other_rules() {
             "m.py",
             "def h():\n    pass\n\n\nclass C:\n    def h():\n        pass\n\n    x = h()\n",
             &["<module>@1 -> h@1", "<module>@1 -> h@6"],
+        ),
+        (
+            "py: a class body inside a function",
+            "m.py",
+            "def h():\n    pass\n\n\ndef f():\n    class C:\n        def h():\n            pass\n\n        \
+             x = h()\n",
+            &["f@5 -> h@1", "f@5 -> h@7"],
         ),
         (
             "py: a default argument is evaluated in the class body",
@@ -15417,6 +15440,40 @@ fn a_same_name_member_is_left_to_the_other_rules() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Pre-tag review of 0.187.0, MEDIUM-1: a Python bare call outside a class
+/// body asks of each candidate without a lexical scope whether it is a method.
+/// That lookup scanned the file's whole node list, so N calls among N
+/// same-named methods in a file of F nodes cost N x N x F (805 KB: 21 s ->
+/// 162 s in a release build). It is a set lookup now.
+#[test]
+fn a_python_call_among_many_same_named_methods_stays_linear() {
+    let (n, f) = (1_500, 20_000);
+    let mut code = String::from("def h(*a):\n    return 0\n");
+    for i in 0..f {
+        code += &format!("\n\ndef f{i}():\n    pass\n");
+    }
+    for i in 0..n {
+        code += &format!("\n\nclass C{i}:\n    def h(self):\n        pass\n");
+    }
+    code += "\n\ndef g():\n";
+    code += &"    h()\n".repeat(n);
+    assert!(
+        code.len() < 1 << 20,
+        "keep the input under the 1 MiB file cap"
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (_p, _d, db) = fresh_index_of(&[("m.py", &code)]);
+        let _ = tx.send(same_file_call_lines(&db));
+    });
+    let calls = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("1,500 calls among 1,500 same-named methods took over 60 s");
+    let from_g: Vec<&String> = calls.iter().filter(|c| c.starts_with("g@")).collect();
+    assert_eq!(from_g.len(), 1, "{from_g:?}");
+    assert!(from_g[0].ends_with("-> h@1"), "{from_g:?}");
 }
 
 /// D#714 A3: editing a file whose twins the rule told apart, and editing a
