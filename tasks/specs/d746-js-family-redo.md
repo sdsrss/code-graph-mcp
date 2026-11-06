@@ -55,3 +55,18 @@
 - 真实语料增量（hono）：real_inc 15 轮 0 不一致（两边）；famchain（h2）24 步 1 步不一致，删 `src/jsx/dom/index.ts`，改名再导出（`createElement as jsx`），base 同一步也不一致；delone `src/jsx/streaming.ts` h3 0/0（base 0/16）。
 - 0.188.0 读 h3 建的 v139 索引：查询可用，`incremental-index` 拒写并提示删 `.code-graph/index.db*`；h3 遇到 v138 索引打印 "Index version mismatch (stored v138 ≠ binary v139): clearing + rebuilding"。
 - 耗时：`timing-base-h3-2.txt`（CHANGELOG 表）、`timing-bigjs-nog.txt`。原始输出与脚本在 `tasks/d746-kit/`（`results.tar.gz`）。
+
+## 预发评审
+
+- 第 1 轮（新 subagent，盲简报，范围 bd6c12da..d88eaf97）：HIGH 1、MEDIUM 3、LOW 2、NIT 1。逐条核实：
+  - H1 HIGH（复现）：e9b078c9 把所有跨语言族调用按"被调节点名"放回 pending。改名导出（`export { r as f }`）经 2d-bind 从同语言孪生改指到 `t.ts:r` 的调用，回来时成了 `A => r`，没有导入叫 `r`，只碰一下 `t.ts` 增量就丢边（0.188.0 一致）。修复（97fdd100）：只在被调文件对该名字有 ≥2 个节点时放回 pending，并用调用方文件导入该节点时的导入名（来自保存的 imports 边；只有一个名字时）；只有 1 个节点时按名恢复，同 0.188.0。21e167c5 的后处理范围扩展因此不再起作用（放回的调用导入目标必不唯一，2d-bind 无可绑、剪枝结论不变；去掉后变异存活、链测仍过），删除。
+  - M3 MEDIUM（复现，成本）：扇入树（4,000 个 .tsx 对一个 .ts 的 40,000 次调用）编辑 545 ms → 6.9–9.0 s；同一根因（全部走扫描、逐条自动提交），随 H1 修复回到按名恢复。
+  - M1 MEDIUM（复现）：FileImports 按导出名读导入，`import { f as g }` 旁的参数 `f()` 被绑；hono 298 条新边中 9 条（6 条 `useContext as useContextCommon` 旁的参数、3 条 `import type { keyframes as … }` 旁的局部变量）。同语言导入在 0.188.0 同样（2d-bind 同一读法）。修需要解析器记录本地绑定，写进 Not covered，不修。
+  - M2 MEDIUM（复现）：`walked` 只证明说明符指向已索引文件，不证明遍历绑定了目标；`export * from 'lodash'` 死路时导入按名回落到项目节点，调用随之被绑。hono、sgc 新边 0 处。写进 Not covered，注释改正。
+  - L1 LOW（复现）：D#747 的行和所有 pending 行一样 50 次解析运行后淘汰；CHANGELOG 写明。
+  - L2 LOW（复现）：存活变异 R2/R3/FF1/F7 非等价。F7（FileImports 缓存跨文件共享）补"三个文件导入三个名字"用例杀死；R2/R3 在新规则下（≥2 节点 + 导入名）分别对应 P4/P5，P4 只在一个 0.188.0 也不一致的形状上有差别，P5 在测过的形状上等价。
+  - N1：4 处注释改正。
+  - 新发现（自测，0.188.0 同样）：同一文件既 `import { f }` 又 `import * as T` 同一模块，被调文件新增方法 `f` 时 `T.f()` 只恢复到函数，重建绑两个。记入 Not covered 和待办。
+- 修复后的测量见下（rel2 = 97fdd100）。
+- rel2（97fdd100，md5 824bfb47）：13 个语料全量索引与 h3 逐字节相同；整链 s21 35、s22 42、fam1 5、fam2 15，kit38 38/38、r4sets61 61/61，rel2 独有 0；逐步链测 fam1 5/720、fam2 16/1200（rel2 独有 0）；评审的 6,600 步（gen2 种子 31/32/33 各 1,800、famgen 种子 3 1,200）base 93/100/97/37、rel2 60/73/65/18，rel2 独有 0。内容比 base 多的 10 步都在 base 已不一致的步上：9 步是 D#747 在重建侧保留的成员调用行（增量侧是一条按名恢复到自由函数上的成员调用边，base 同样），1 步（g32_56_k5）是被剪枝后不留行的调用在同语言候选消失后重建绑定、增量无从重评（base 同一步同一原因，表现为 pending 行）。
+- 耗时（rel2，`timing-base-rel2.txt`、`timing3-base-rel2-b.txt`、`timing-bigjs-nog-rel2.txt`）：CHANGELOG 0.189.0 Cost 表。hono 编辑 `src/jsx/hooks/index.ts` 72–85 → 77–79 ms（d88eaf97 时 107–116）；扇入树编辑 530–554 → 1,002–1,045 ms（d88eaf97 时评审测 6.9–9.0 s）。
