@@ -2074,6 +2074,221 @@ fn a_deletion_only_run_resolves_the_calls_it_buffers() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// D#742: a bare call in a JS-family file binds what its file imports from a
+/// sibling language (`.tsx` -> `.ts`, `.ts` -> `.tsx`, `.js` -> `.ts`, `.ts` ->
+/// `.mjs`); the call's pool held its own language only, so it stayed pending
+/// while its import was bound. A call the file does not import by that name,
+/// a call through a package or an unindexed path, and a member call keep
+/// their own-language pool.
+#[test]
+fn a_js_family_call_binds_what_its_file_imports() {
+    let f_ts = ("t.ts", "export function f() { return 1; }\n");
+    type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a str, Vec<&'a str>);
+    let table: Vec<Case> = vec![
+        (
+            "tsx -> ts",
+            vec![
+                f_ts,
+                (
+                    "a.tsx",
+                    "import { f } from './t';\nexport function A() { return f(); }\n",
+                ),
+            ],
+            "A",
+            vec!["A -> t.ts.f"],
+        ),
+        (
+            "ts -> tsx",
+            vec![
+                ("c.tsx", "export function g() { return <div />; }\n"),
+                (
+                    "a.ts",
+                    "import { g } from './c';\nexport function u() { return g(); }\n",
+                ),
+            ],
+            "u",
+            vec!["u -> c.tsx.g"],
+        ),
+        (
+            "js -> ts",
+            vec![
+                f_ts,
+                (
+                    "a.js",
+                    "import { f } from './t.ts';\nexport function u() { return f(); }\n",
+                ),
+            ],
+            "u",
+            vec!["u -> t.ts.f"],
+        ),
+        (
+            "ts -> mjs",
+            vec![
+                ("s.mjs", "export function h() { return 2; }\n"),
+                (
+                    "a.ts",
+                    "import { h } from './s.mjs';\nexport function u() { return h(); }\n",
+                ),
+            ],
+            "u",
+            vec!["u -> s.mjs.h"],
+        ),
+        (
+            "not imported by that name",
+            vec![f_ts, ("a.tsx", "export function A() { return f(); }\n")],
+            "A",
+            vec![],
+        ),
+        (
+            "through a package",
+            vec![
+                f_ts,
+                (
+                    "a.tsx",
+                    "import { f } from 'pkg';\nexport function A() { return f(); }\n",
+                ),
+            ],
+            "A",
+            vec![],
+        ),
+        (
+            "through an unindexed path",
+            vec![
+                f_ts,
+                (
+                    "a.tsx",
+                    "import { f } from '../dist/t';\nexport function A() { return f(); }\n",
+                ),
+            ],
+            "A",
+            vec![],
+        ),
+        (
+            "a member call",
+            vec![
+                ("k.ts", "export class K {\n  m() { return 1; }\n}\n"),
+                (
+                    "a.tsx",
+                    "import { K } from './k';\nexport function A(o: K) { return o.m(); }\n",
+                ),
+            ],
+            "A",
+            vec![],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, files, caller, want) in table {
+        let (_p, _d, db) = fresh_index_of(&files);
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT ns.name || ' -> ' || ft.path || '.' || nt.name FROM edges e \
+                 JOIN nodes ns ON ns.id = e.source_id \
+                 JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id \
+                 WHERE e.relation = 'calls' AND ns.name = ?1 ORDER BY 1",
+            )
+            .unwrap();
+        let rows = stmt.query_map([caller], |r| r.get::<_, String>(0)).unwrap();
+        let got: Vec<String> = rows.filter_map(Result::ok).collect();
+        if got != want {
+            failures.push(format!("{label}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// D#742: the widened pool depends on the caller's import, so every edit that
+/// moves either side gives the edges and pending rows a rebuild gives.
+#[test]
+fn a_js_family_import_call_matches_a_rebuild_through_edits() {
+    let caller = "import { f } from './t';\nexport function A() { return f(); }\n";
+    let callee = "export function f() { return 1; }\n";
+    type Tree<'a> = &'a [(&'a str, &'a str)];
+    type Edit<'a> = &'a [(&'a str, Option<&'a str>)];
+    let chains: &[(&str, Tree, Edit)] = &[
+        ("the callee arrives", &[("a.tsx", caller)], &[("t.ts", Some(callee))]),
+        ("the caller arrives", &[("t.ts", callee)], &[("a.tsx", Some(caller))]),
+        ("the callee goes", &[("a.tsx", caller), ("t.ts", callee)], &[("t.ts", None)]),
+        (
+            "an own-language twin appears",
+            &[("a.tsx", caller), ("t.ts", callee)],
+            &[("b.tsx", Some("export function f() { return 2; }\n"))],
+        ),
+        (
+            "the caller drops the import",
+            &[("a.tsx", caller), ("t.ts", callee)],
+            &[("a.tsx", Some("export function A() { return f(); }\n"))],
+        ),
+        (
+            "the callee renames it",
+            &[("a.tsx", caller), ("t.ts", callee)],
+            &[("t.ts", Some("export function g() { return 1; }\n"))],
+        ),
+        (
+            "the callee moves to js",
+            &[("a.tsx", caller), ("t.ts", callee)],
+            &[("t.ts", None), ("t.js", Some(callee))],
+        ),
+        (
+            "the callee file is touched",
+            &[("a.tsx", caller), ("t.ts", callee)],
+            &[("t.ts", Some("// touched\nexport function f() { return 1; }\n"))],
+        ),
+        (
+            "the callee re-exports it from another file",
+            &[("a.tsx", caller), ("t.ts", callee)],
+            &[
+                ("t.ts", Some("export { f } from './u';\n")),
+                ("u.ts", Some(callee)),
+            ],
+        ),
+        (
+            "a first `f` appears beside a renamed re-export",
+            &[
+                ("a.tsx", caller),
+                ("t.ts", "function r() { return 1; }\nexport { r as f };\n"),
+            ],
+            &[("c.ts", Some(callee))],
+        ),
+        (
+            "a second import of the name goes",
+            &[
+                ("a.tsx", "import { f } from './t';\nimport { f as g } from './v';\nexport function A() { return f() + g(); }\n"),
+                ("t.ts", callee),
+                ("v.ts", callee),
+            ],
+            &[("v.ts", None)],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, before, after) in chains {
+        let (project, _d, db) = fresh_index_of(before);
+        let mut tree: Vec<(String, String)> = before
+            .iter()
+            .map(|(p, b)| (p.to_string(), b.to_string()))
+            .collect();
+        for (path, body) in after.iter() {
+            tree.retain(|(p, _)| p != path);
+            match body {
+                Some(b) => {
+                    fs::write(project.path().join(path), b).unwrap();
+                    tree.push((path.to_string(), b.to_string()));
+                }
+                None => fs::remove_file(project.path().join(path)).unwrap(),
+            }
+        }
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+        let (_p2, _d2, control) = fresh_index_of(&files);
+        let got = (call_edges_with_confidence(&db), pending_set(&db));
+        let want = (call_edges_with_confidence(&control), pending_set(&control));
+        if got != want {
+            failures.push(format!("{label}:\n    got  {got:?}\n    want {want:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// Pre-ship review of D#89: every way an incremental run bound a typed call
 /// differently from a rebuild.
 #[test]

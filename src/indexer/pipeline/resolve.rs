@@ -241,6 +241,79 @@ pub(super) fn python_attr_of(metadata: Option<&str>) -> Option<String> {
     meta.get("attr")?.as_str().map(str::to_string)
 }
 
+const JS_FAMILY: [&str; 3] = ["javascript", "typescript", "tsx"];
+
+/// Whether a definition in `callee` joins the by-name pool of a call in
+/// `caller` that [`may_widen_to_family`] and whose file imports the name from
+/// one project node ([`uniquely_imported_names`]): the JS family's languages
+/// import one another's files. hono's `.tsx` tests left 182 calls of what they
+/// import from `.ts` modules without an edge, the pool holding `tsx` only
+/// (D#742). Widening every pool instead bound 331 calls hono does not import
+/// by that name, and daagu's `tseslint.config()` a `.ts` constant.
+pub(super) fn family_fallback(caller: &str, callee: &str) -> bool {
+    caller != callee && JS_FAMILY.contains(&caller) && JS_FAMILY.contains(&callee)
+}
+
+/// A bare call in a JS-family file, no qualifier at all: the only call Phase
+/// 2d-bind re-points at what its file imports, which settles the by-name pick
+/// the widened pool makes. A call through a package name (`{"q":"pkg"}`) is
+/// not one: hono's `dirname()` from `@std/path` bound a project `dirname`.
+pub(super) fn may_widen_to_family(caller: &str, metadata: Option<&str>) -> bool {
+    JS_FAMILY.contains(&caller) && metadata.is_none()
+}
+
+/// `(importing file, name)` of every name a file imports from exactly one
+/// project node, by the rule of 2d-bind's `cg_unique_imports`, each import of
+/// it through a relative specifier that names an indexed file: the walk bound
+/// those, where an import of `../../dist/x` (not indexed) bound by name.
+pub(super) fn uniquely_imported_names(
+    conn: &rusqlite::Connection,
+    files: &HashSet<String>,
+) -> Result<HashSet<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.path, COALESCE(json_extract(ie.metadata, '$.imported'), itn.name),
+                itn.id, json_extract(ie.metadata, '$.js_module')
+         FROM edges ie
+         JOIN nodes mn ON mn.id = ie.source_id
+         JOIN files f ON f.id = mn.file_id
+         JOIN nodes itn ON itn.id = ie.target_id
+         JOIN files itf ON itf.id = itn.file_id
+         WHERE ie.relation = 'imports'
+           AND itf.path <> '<external>'
+           AND json_extract(ie.metadata, '$.attr') IS NULL",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    // (target, every import through a specifier naming an indexed file), or
+    // None once two targets are seen.
+    let mut by_name: HashMap<(String, String), Option<(i64, bool)>> = HashMap::new();
+    for row in rows {
+        let (path, name, target, spec) = row?;
+        let walked = spec.is_some_and(|spec| {
+            super::js_modules::resolve_js_specifier_path(&spec, &path, files).is_some()
+        });
+        by_name
+            .entry((path, name))
+            .and_modify(|seen| {
+                *seen = seen
+                    .filter(|(t, _)| *t == target)
+                    .map(|(t, w)| (t, w && walked));
+            })
+            .or_insert(Some((target, walked)));
+    }
+    Ok(by_name
+        .into_iter()
+        .filter(|(_, seen)| matches!(seen, Some((_, true))))
+        .map(|(key, _)| key)
+        .collect())
+}
+
 /// The `pending_unresolved_calls.target_name` of a buffered call through a
 /// renamed import (D#120). The table is unique on (caller, target name,
 /// language), so the export's name alone let one caller's `m()` from './x' and
@@ -343,6 +416,7 @@ pub(super) fn resolve_pending_calls_touching(
     // Every file path, read at the first call a `use` anchors in a crate.
     let mut all_file_paths: Option<HashSet<String>> = None;
     let mut js_exports = super::js_exports::JsExports::default();
+    let mut imported: Option<HashSet<(String, String)>> = None;
 
     for row in &pending {
         // A call through a renamed import (D#120) binds what the file its
@@ -394,17 +468,48 @@ pub(super) fn resolve_pending_calls_touching(
             to_delete.push(row.id);
             continue;
         }
-        let candidates: Vec<i64> = name_to_lang_targets
+        let entries = name_to_lang_targets
             .get(&row.target_name)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|(_, lang)| *lang == row.source_language)
-                    .map(|(id, _)| *id)
-                    .filter(|id| *id != row.source_id) // self-call guard
-                    .collect()
-            })
+            .map(Vec::as_slice)
             .unwrap_or_default();
+        let pool = |keep: &dyn Fn(&str) -> bool| -> Vec<i64> {
+            entries
+                .iter()
+                .filter(|(_, lang)| keep(lang))
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let mut candidates = pool(&|l| l == row.source_language);
+        // The deferred pass's JS-family widening, decided before the self-call
+        // guard as that pass decides it: its pool still holds the caller.
+        if candidates.is_empty()
+            && may_widen_to_family(&row.source_language, row.metadata.as_deref())
+        {
+            if imported.is_none() {
+                if all_file_paths.is_none() {
+                    all_file_paths = Some(
+                        db.conn()
+                            .prepare("SELECT path FROM files")?
+                            .query_map([], |r| r.get::<_, String>(0))?
+                            .collect::<rusqlite::Result<_>>()?,
+                    );
+                }
+                let files = all_file_paths.as_ref().expect("loaded above");
+                imported = Some(uniquely_imported_names(db.conn(), files)?);
+            }
+            let caller = source_id_to_path
+                .get(&row.source_id)
+                .cloned()
+                .unwrap_or_default();
+            if imported
+                .as_ref()
+                .expect("read above")
+                .contains(&(caller, row.target_name.clone()))
+            {
+                candidates = pool(&|l| family_fallback(&row.source_language, l));
+            }
+        }
+        candidates.retain(|id| *id != row.source_id); // self-call guard
 
         let candidates = classes.rust_call_shape_candidates(
             db,

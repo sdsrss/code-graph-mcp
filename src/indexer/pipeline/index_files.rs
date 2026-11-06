@@ -4255,6 +4255,9 @@ fn resolve_deferred_relations(
             .copied()
             .collect()
     };
+    // Read at the first bare call that finds no candidate of its own language:
+    // calls come after every other relation, so this run's imports are bound.
+    let mut imported: Option<HashSet<(String, String)>> = None;
 
     let mut edges_created = 0usize;
     let mut unresolved_externals: Vec<ExternalRef> = Vec::new();
@@ -5150,7 +5153,30 @@ fn resolve_deferred_relations(
                     node_id_to_path.get(id).map(|p| p.as_str()) != Some(d.rel_path.as_str())
                 })
                 .collect();
-            let same_language_targets = same_lang_of(&cross_file, &d.language, &[]);
+            let mut same_language_targets = same_lang_of(&cross_file, &d.language, &[]);
+            if same_language_targets.is_empty()
+                && super::resolve::may_widen_to_family(&d.language, call_meta)
+            {
+                if imported.is_none() {
+                    imported = Some(super::resolve::uniquely_imported_names(
+                        db.conn(),
+                        all_file_paths,
+                    )?);
+                }
+                let imported = imported.as_ref().expect("read above");
+                if imported.contains(&(d.rel_path.clone(), d.target_name.clone())) {
+                    same_language_targets = cross_file
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            node_id_to_language
+                                .get(id)
+                                .and_then(|l| l.as_deref())
+                                .is_some_and(|l| super::resolve::family_fallback(&d.language, l))
+                        })
+                        .collect();
+                }
+            }
             if !same_language_targets.is_empty() {
                 let final_targets =
                     refine_ambiguous_targets(&same_language_targets, &d.rel_path, &node_id_to_path);
