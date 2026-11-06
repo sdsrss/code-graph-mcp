@@ -2,49 +2,14 @@
 
 ## 0.188.0
 
-**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 138 → 139
-because JavaScript/TypeScript call edges are added (below). The MCP server
-rebuilds the index when it starts; from the command line, `code-graph-mcp
-reindex` does. To pin the binary back: `npm i -g @sdsrs/code-graph@0.187.0`,
+**Upgrading: no index rebuild.** `INDEX_VERSION` stays 138: a full index
+gives the same graph as 0.187.0's (13 corpora compared byte for byte, below).
+What changes is an incremental run that deletes files, and how long indexing
+takes on files that repeat a call among many same-named definitions. To pin
+the binary back: `npm i -g @sdsrs/code-graph@0.187.0`,
 then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
-`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. 0.187.0 answers
-from an index this version wrote but will not write to it; delete
-`.code-graph/index.db*` once so it rebuilds (its error says so). The plugin's
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The plugin's
 scripts are unchanged.
-
-### fix: a JS/TS call binds what its file imports from a sibling language
-
-A bare call's candidates by name were the definitions of its own language,
-and `.js`/`.jsx`/`.mjs`/`.cjs`, `.ts` and `.tsx` are three languages here.
-So in
-
-```tsx
-// a.tsx
-import { f } from './t';
-export function A() { return f(); }
-```
-
-with `export function f` in `t.ts`, the import edge bound `t.ts:f` and the
-call bound nothing: it stayed among the unresolved calls. A bare call in a
-JavaScript, TypeScript or TSX file that finds no definition of its name in
-its own language now binds the one in another of the three that its file
-imports under that name, and nothing else: the file's only import target
-for the name, with every import of it through a relative path that names an
-indexed file. A call through a package (`import { f } from 'pkg'`), a member
-call, a call of a name the file does not import, an import of an unindexed
-path (`'../dist/t'`), and an import through a renamed re-export (`export {
-r as f }`, whose definition is named `r`) keep the old pool. A later
-definition of the name in the caller's own language re-extracts the caller,
-whose call then binds by name as before.
-
-Measured on full indexes, 0.187.0 and this build from source: hono (v4.6.14)
-gains 298 call edges and has 298 fewer unresolved calls; each new edge goes
-to the definition the caller's file imports (`.tsx` tests calling `.ts`
-modules, `.ts` benchmarks calling `.tsx` pages), 247 through the path's own
-file and 51 through a re-exporting one. sgc gains 2 (`.ts` tests calling
-`.mjs` scripts). The other 11 corpora (express, claude-mem-lite, claudemd,
-gsd-lite, llm_wiki, daagu, flask, nltk, the Python standard library, tokio
-and this repository) have byte-identical edges and unresolved calls.
 
 ### fix: deleting a file re-resolves the calls into it
 
@@ -57,17 +22,19 @@ file. A call that still bound another file's definition (a function of the
 same name, or another class's method for a member call, JavaScript and
 Python) kept an unresolved-call row that a rebuild does not have, which
 decides what it binds when a new definition appears. Deleting files now
-re-resolves them in the same run, as an edit already did.
+re-resolves them in the same run, as an edit already did. Such a run does
+not count as an attempt against the unresolved calls it leaves.
 
 ### perf: a call repeated many times among many same-named candidates
 
 A call made N times whose every run keeps the same M candidates attempted
 N × M edge inserts for M edges. Each such fan-out is now written once per
 file, the member-call candidate filter is read once per name in each batch
-instead of once per call, and a relation's enclosing definition is found through a
-per-file name index instead of a scan of the file. Edges are unchanged:
-the 13 corpora above have byte-identical edges and unresolved calls apart
-from the hono and sgc additions above.
+instead of once per call, and a relation's enclosing definition is found
+through a per-file name index instead of a scan of the file. Edges are
+unchanged: on express, claude-mem-lite, claudemd, gsd-lite, llm_wiki, daagu,
+hono, sgc, flask, nltk, the Python standard library, tokio and this
+repository, a full index gives byte-identical edges and unresolved calls.
 
 Full index, 3 runs each alternating, 0.187.0 and this build from source
 (`--no-embed`). The first six inputs are 6,000 classes each with a method
@@ -76,49 +43,35 @@ either build.
 
 | Input | 0.187.0 | 0.188.0 |
 |---|---|---|
-| Python, calls in one function, same file | 19,611–19,916 ms | 935–949 ms |
-| Python, calls in a class body, same file | 19,238–19,519 ms | 738–760 ms |
-| Python, calls from another file | 21,394–21,594 ms | 2,855–3,074 ms |
-| JavaScript, bare calls, same file | 19,376–19,588 ms | 916–918 ms |
-| JavaScript, bare calls from another file | 21,517–21,690 ms | 2,881–3,030 ms |
-| JavaScript, member calls `o.h()`, same file | 30,618–30,779 ms | 731–765 ms |
-| Python, 50,000 calls in a file of 20,000 functions (899 KB) | 1,513–1,573 ms | 908–944 ms |
-| hono | 481–504 ms | 457–479 ms |
-| Python 3.14 standard library | 3,028–3,143 ms | 2,877–2,974 ms |
-| 4,400 TS/TSX files, 100,000 imports, 6,000 `.tsx` calls of imported `.ts` functions | 1,809–1,842 ms | 1,869–1,880 ms |
-| the same tree, one file edited (incremental) | 348–369 ms | 346–360 ms |
-
-The last two rows: 0.187.0 binds 6,000 calls and leaves 10,000 unresolved,
-this build binds 12,000 and leaves 4,000 (the `.tsx` files' calls).
+| Python, calls in one function, same file | 19,718–19,791 ms | 949–957 ms |
+| Python, calls in a class body, same file | 19,313–19,534 ms | 754–755 ms |
+| Python, calls from another file | 21,642–21,713 ms | 3,085–3,244 ms |
+| JavaScript, bare calls, same file | 19,729–20,383 ms | 940–985 ms |
+| JavaScript, bare calls from another file | 21,954–22,178 ms | 2,983–3,127 ms |
+| JavaScript, member calls `o.h()`, same file | 31,228–31,371 ms | 756–791 ms |
+| Python, 50,000 calls in a file of 20,000 functions (899 KB) | 1,615–1,627 ms | 963–987 ms |
+| hono | 463–500 ms | 449–461 ms |
+| Python 3.14 standard library | 3,167–3,191 ms | 3,044–3,120 ms |
 
 ### Not covered
 
+- A bare call in a `.js`, `.ts` or `.tsx` file of what the file imports from
+  a file of another of the three (a `.tsx` test calling a function of a
+  `.ts` module) still binds nothing and stays unresolved: hono has 298 such
+  calls, sgc 2. A fix was withdrawn before this release: after an edit that
+  added a same-named method to the imported file, its incremental and full
+  indexes differed.
 - Deleting a file can still leave fewer unresolved member calls than a
   rebuild: in hono, deleting `src/jsx/streaming.ts` (which defines a local
   `const then`) leaves 16 `x.then()` calls without the unresolved row a
   rebuild gives them. Edges are equal; 0.187.0 does the same.
-- The JS-family binding reads an import by the name the module exports, as
-  the existing re-pointing of same-language calls does, so a few calls that
-  do not go through the import bind it: beside `import { f as g } from
-  './t'`, a parameter `f` called as `f()` binds `t.ts:f`; so does `f()` after
-  `export { f } from './t'`, which binds no local name; and an import of a
-  name `t.ts` does not export, bound by name to another file's `f`, takes the
-  call with it. The same-language versions of these bind the same way in
-  0.187.0. In hono, `common.case.test.tsx` calls a local variable named
-  `rawCssString` (its import is `rawCssString as rawCssStringHelper`), and
-  those calls now bind `css/common.ts`'s `rawCssString`.
-- C and C++ are not widened to each other (a `.cc` call of a function only
-  a `.c` file defines), and a JS/TS value reference (`onClick={handler}`) to
-  a sibling language is not either.
 - The incremental/rebuild divergence of 0.186.0's Not covered (a call through
   `export { r as f }` when the last other `f` goes) remains: 77 of 600
-  JavaScript edit chains (seeds 21 and 22, 35 + 42), the same chains with the
-  same differences on 0.187.0 and this build. On edit chains whose files also
-  move between `.ts`, `.tsx` and `.js` (120 + 200 chains of 5 steps), 0.187.0
-  diverges on 5 + 21 and this build on 0 + 15, all 15 among 0.187.0's 21.
+  JavaScript edit chains (35 + 42 for seeds 21 and 22) diverge, the same
+  chains with the same differences on 0.187.0 and this build.
 - Resolving the repeated call still visits its M candidates on each of its N
   runs, without writing: 6,000 `h()` from another file among 6,000 methods
-  named `h` index in 2.9–3.1 s (the table's "from another file" rows).
+  named `h` index in 3.0–3.2 s (the table's "from another file" rows).
 
 ## 0.187.0
 

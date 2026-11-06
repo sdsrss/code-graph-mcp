@@ -4279,9 +4279,6 @@ fn resolve_deferred_relations(
     let mut field_types: Option<super::resolve::CppFieldTypes> = None;
     let mut typed_call: DeferredRelation;
     let mut written = WrittenFanouts::default();
-    // Read at the first call that needs it: calls come after every other
-    // relation, so this run's imports are bound by then.
-    let mut imports = super::resolve::FileImports::default();
     loop {
         if next == queue.len() {
             if calls_queued {
@@ -5154,35 +5151,7 @@ fn resolve_deferred_relations(
                     node_id_to_path.get(id).map(|p| p.as_str()) != Some(d.rel_path.as_str())
                 })
                 .collect();
-            let mut same_language_targets = same_lang_of(&cross_file, &d.language, &[]);
-            // D#742: the sibling-language definition the caller's file imports
-            // under the name, by the rule the pending sweep applies to a row.
-            // Decided here too because a call the sweep binds has both ends'
-            // context strings rendered a second time: 0.8 s of a 2.9 s full index
-            // of 4,400 files with 6,000 such calls.
-            if same_language_targets.is_empty()
-                && super::resolve::may_widen_to_family(&d.language, call_meta)
-            {
-                let siblings: Vec<i64> = cross_file
-                    .iter()
-                    .copied()
-                    .filter(|id| {
-                        node_id_to_language
-                            .get(id)
-                            .and_then(|l| l.as_deref())
-                            .is_some_and(|l| super::resolve::family_fallback(&d.language, l))
-                    })
-                    .collect();
-                if !siblings.is_empty() {
-                    if let Some(target) =
-                        imports.target(db.conn(), all_file_paths, &d.rel_path, &d.target_name)?
-                    {
-                        if siblings.contains(&target) {
-                            same_language_targets = vec![target];
-                        }
-                    }
-                }
-            }
+            let same_language_targets = same_lang_of(&cross_file, &d.language, &[]);
             if !same_language_targets.is_empty() {
                 let final_targets =
                     refine_ambiguous_targets(&same_language_targets, &d.rel_path, &node_id_to_path);
