@@ -3,42 +3,15 @@
 ## 0.189.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 138 → 139
-because call edges and unresolved-call rows move (below). The MCP server
-rebuilds the index when it starts, and so does the first `code-graph-mcp
-incremental-index` (it prints "Index version mismatch (stored v138 ≠ binary
-v139): clearing + rebuilding"). An index built by 0.189.0 can still be queried
-by 0.188.0, but 0.188.0 will not write to it and says to delete
-`.code-graph/index.db*` first. To pin the binary back: `npm i -g
-@sdsrs/code-graph@0.188.0`, then delete `~/.cache/code-graph/bin/code-graph-mcp`
-and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The
-plugin's scripts are unchanged.
-
-### fix: a `.js`/`.ts`/`.tsx` call binds what its file imports from another of the three
-
-A call's candidates were taken from its own language only, and `.js`, `.ts`
-and `.tsx` are three languages: a `.tsx` test calling `useState` imported from
-a `.ts` module bound nothing and stayed unresolved, although the import itself
-was bound. A bare call (no `obj.` or package qualifier) whose own language has
-no definition of the name now binds the definition its file imports under
-that name from one of the other two, when that is the only definition the
-file's imports of the name reach and each of them goes through a relative path
-to an indexed file. Member calls, calls through a package, names the file's
-imports do not name, and imports of unindexed paths (`../dist/x`) are
-unchanged. The new edges are `inferred`.
-
-On 13 projects (express, claude-mem-lite, claudemd, gsd-lite, llm_wiki,
-daagu, hono, sgc, flask, nltk, the Python 3.14 standard library, tokio, this
-repository) a full index gains 298 call edges in hono and 2 in sgc, each
-replacing an unresolved call; the other 11 have the same edges as 0.188.0.
-
-When an edit gives the imported file a second definition of the name (a class
-method, object method, namespace function or nested function beside the
-imported function), an incremental run now re-reads the calling file, as a
-rebuild reads it, and binds neither; restoring the call by name bound both.
-0.188.0 did this already to a call whose own language also defines the name
-(an import moves such a call onto the imported definition): `a.tsx`
-importing `f` from `t.ts`, with another `f` in `b.tsx`, kept `t.ts:f` and the
-new `t.ts:K.f` after `class K { f() {} }` was added to `t.ts`.
+because a full index keeps more unresolved-call rows (below); its edges are
+unchanged on all 13 projects measured. The MCP server rebuilds the index when
+it starts, and so does the first `code-graph-mcp incremental-index` (it prints
+"Index version mismatch (stored v138 ≠ binary v139): clearing + rebuilding").
+An index built by 0.189.0 can still be queried by 0.188.0, but 0.188.0 will
+not write to it and says to delete `.code-graph/index.db*` first. To pin the
+binary back: `npm i -g @sdsrs/code-graph@0.188.0`, then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set `CODE_GRAPH_NO_AUTO_UPDATE=1`,
+as described under 0.171.0. The plugin's scripts are unchanged.
 
 ### fix: a member call that reaches only functions keeps its unresolved row
 
@@ -50,82 +23,58 @@ functions went, a rebuild had the row and an incremental index did not: in
 hono, deleting `src/jsx/streaming.ts` (which defines a local `then`) left 16
 `.then()` calls without it. The row is now kept (and, like every
 unresolved-call row, dropped after 50 indexing runs that parse files without
-resolving it). Edges are unchanged on all 13
-projects; unresolved-call rows grow by 903 in claude-mem-lite (12,397 before),
-646 in daagu (24,584), 422 in this repository, 145 in the standard library, 111
-in hono, 31 in gsd-lite, 29 in claudemd and flask, 9 in sgc, 3 in nltk and 1 in
-express; llm_wiki and tokio are unchanged.
+resolving it). On express, claude-mem-lite, claudemd, gsd-lite, llm_wiki,
+daagu, hono, sgc, flask, nltk, the Python 3.14 standard library, tokio and
+this repository a full index has the same edges as 0.188.0; unresolved-call
+rows grow by 903 in claude-mem-lite (12,397 before), 646 in daagu (24,584),
+422 in this repository, 145 in the standard library, 111 in hono, 31 in
+gsd-lite, 29 in claudemd and flask, 9 in sgc, 3 in nltk and 1 in express;
+llm_wiki and tokio are unchanged.
 
 ### Cost
 
-3 runs each (hono: 6, from two sets), alternating 0.188.0 and this build from
-source (`--no-embed`). "Edit" appends a comment to one file and runs
-`incremental-index`. Synthetic trees:
-
-- *imports*: 4,000 `.ts`/`.tsx` files each import 25 functions from one of
-  400 `.ts` modules (100,000 imports, 6,000 calls this release binds) and call
-  a `gfn()` that only a `.js` file defines and none imports;
-- *fan-in*: 4,000 `.tsx` files each import and call 10 of 50 functions of one
-  `.ts` file (40,000 calls this release binds into that file);
-- *member calls*: 4,000 `.js` files each make 10 member calls `o.h0()` …
-  `o.h9()`, which only free functions `h0` … `h9` define (40,000 rows this
-  release keeps).
+3 runs each, alternating 0.188.0 and this build from source (`--no-embed`).
+"Edit" appends a comment to one file and runs `incremental-index`. The
+*member calls* tree is 4,000 `.js` files each making 10 member calls
+`o.h0()` … `o.h9()`, which only free functions `h0` … `h9` define (40,000
+rows this release keeps).
 
 | Input | 0.188.0 | 0.189.0 |
 |---|---|---|
-| hono, full index | 418–502 ms | 433–478 ms |
-| hono, edit `src/jsx/hooks/index.ts` (191 calls from `.tsx` files point into it) | 67–82 ms | 72–103 ms |
-| hono, edit `src/context.ts` | 101–121 ms | 99–119 ms |
-| claude-mem-lite, full index | 2,042–2,082 ms | 1,991–2,031 ms |
-| claude-mem-lite, edit `adopt-cli.mjs` | 138–153 ms | 142–162 ms |
-| daagu, full index | 3,746–3,791 ms | 3,805–3,843 ms |
-| daagu, edit one test file | 177–178 ms | 173–183 ms |
-| imports, full index | 1,883–1,952 ms | 2,031–2,110 ms |
-| imports, edit `lib/m0.ts` | 352–359 ms | 494–503 ms |
-| imports, edit `app/f1.tsx` | 361–367 ms | 493–504 ms |
-| fan-in, full index | 916–939 ms | 1,131–1,135 ms |
-| fan-in, edit the `.ts` file | 531–556 ms | 1,009–1,025 ms |
-| fan-in, the `.ts` file gains a method of each of its 50 names | 975–983 ms | 3,552–3,571 ms |
-| member calls, full index | 2,432–2,898 ms | 627–651 ms |
-| member calls, edit `app/f1.js` | 61–68 ms | 98–104 ms |
+| hono, full index | 414–448 ms | 434–444 ms |
+| hono, edit `src/context.ts` | 101–111 ms | 101–109 ms |
+| claude-mem-lite, full index | 2,084–2,094 ms | 2,009–2,022 ms |
+| claude-mem-lite, edit `adopt-cli.mjs` | 144–156 ms | 144–154 ms |
+| daagu, full index | 3,779–3,801 ms | 3,662–3,777 ms |
+| daagu, edit one test file | 170–180 ms | 172–181 ms |
+| member calls, full index | 2,442–2,469 ms | 617–627 ms |
+| member calls, edit `app/f1.js` | 62–69 ms | 98–99 ms |
 
 ### Not covered
 
-- Each run re-reads, for every unresolved bare call whose name only another
-  of the three languages defines, its file's imports: 129–147 ms more per edit
-  on the *imports* tree above (4,000 such calls; without the `gfn()` calls the
-  same edits take 352–379 ms with either build). hono has 46 such calls in 27
-  files.
-- An edit of a file that many calls this release binds point into restores
-  each of them: on the *fan-in* tree (40,000 such calls) the edit takes
-  469–482 ms more. When the edit gives the file a second definition of the
-  names, every calling file is re-read: 2.57–2.59 s more there (4,000 files).
-  Each run also visits the unresolved rows this release keeps: on the *member
-  calls* tree (40,000 such rows) an edit takes 34–37 ms more.
-- A call whose imported file defines the name twice (a function and a method,
-  nested function or namespace function of the same name) binds neither and
-  stays unresolved, as an import's edge names both.
-- The import is read by the name the module exports, as an import within one
-  language already was. So `import { f as g }` (also `import type`) makes a
-  call of a parameter or local named `f` in that file bind the module's `f`:
-  9 of hono's 298 new edges are such calls (6 edges from functions calling a
-  parameter `useContext` beside `useContext as useContextCommon` in
-  `src/jsx/dom/context.test.tsx`; 3 from calls of locals such as `let
-  keyframes` beside `import type { keyframes as keyframesHelper }` in
-  `src/helper/css/common.case.test.tsx`). And `import { f }` binds `f` when
-  the module defines `f` only as its default export or does not export it.
-- An import whose re-export walk ends at a package (`export * from 'lodash'`
-  in the imported file) is bound to a project definition of the name, and a
-  call of it now binds that definition too. hono's and sgc's new edges have
-  none.
+- A bare call in a `.js`, `.ts` or `.tsx` file of what the file imports from
+  a file of another of the three (a `.tsx` test calling a function of a `.ts`
+  module) still binds nothing and stays unresolved: hono has 298 such calls,
+  sgc 2. A fix was withdrawn again before this release, after three review
+  rounds: each version of it let an incremental index differ from a rebuild
+  on some edit where 0.188.0 does not. The last one found a call through a
+  re-export that swaps names (`export { Z as A, A as Z }`) bound to the
+  wrong one of the two after an edit of another file; touching the module
+  whose functions it re-exports does that on 0.188.0 too.
+- A typed call kept unresolved by this release can carry the ambiguity mark
+  of the edge it had before an edit where a rebuild's row has none: in hono,
+  after `src/jsx/hooks/index.ts` loses a class with methods `use`,
+  `useState` and others, 29 rows differ from a rebuild's by that mark alone.
+  (Adding such a class back, 0.188.0 misses 35 edges a rebuild has; this
+  release misses none.)
+- Each run visits the unresolved rows this release keeps: on the *member
+  calls* tree (40,000 such rows) an edit takes 29–37 ms more.
+- The incremental/rebuild divergence of 0.186.0's Not covered (a call through
+  `export { r as f }`) remains: 35 + 42 of 600 JavaScript edit chains, the
+  same chains diverging at the same step as on 0.188.0.
 - A file that imports a name both as `{ f }` and through `* as T` keeps only
   `T.f()`'s edge to the function when the imported file gains a method `f`;
   a rebuild binds both. 0.188.0 does the same.
-- The incremental/rebuild divergence of 0.186.0's Not covered (a call through
-  `export { r as f }`) remains: 35 + 42 of 600 JavaScript edit chains, the same
-  chains diverging at the same step as on 0.188.0. Of 320 edit chains whose files
-  move between `.ts`, `.tsx` and `.js`, 20 diverge (0.188.0: 38), each at the
-  same step as on 0.188.0.
 
 ## 0.188.0
 

@@ -1,6 +1,6 @@
 # 0.189.0：D#746 JS 语言族导入调用（D#742 重做）、D#747 成员调用 pending 行
 
-状态：实现与测量完成，0.189.0 预发评审中（2026-11-06）。
+状态：0.189.0 只发 D#747；D#746 在第 3 轮评审后按用户事先的决定撤回，回到待办（2026-11-06）。
 
 ## 背景
 
@@ -77,3 +77,11 @@
   - 深度上限两轮已到。6f5cfc4a 没有经过评审，是否再做一轮只看增量的评审后发版、或撤回 D#746 只发 D#747，交用户决定（见汇报）。
 - rel3（6f5cfc4a，md5 b0d28b2d）：13 个语料全量索引与 rel2 逐字节相同。逐步链测 13,320 步（第 2 轮评审的 famgen2 种子 101/102/103 共 4,800，第 1 轮的 6,600，我的 fam1/fam2 1,920）：base 61/81/77、93/100/97/37、12/29，rel3 33/48/43、60/73/65/18、5/16，rel3 独有 0。整链 g102 45/300、g103 40/300（base 69、64）：8 条与 base 不同的行都是 base 先在更早一步出问题，rel3 晚出问题的那一步在逐步测试里 base 也不一致。s21 35、s22 42、fam1 5、fam2 15，kit38 38/38、r4sets61 61/61，rel3 独有 0。
 - 耗时（rel3，`timing-base-rel3.txt`、`timing3-base-rel3.txt`、`timing4-base-rel3.txt`、`timing-bigjs-nog-rel3.txt`）：CHANGELOG Cost 表。新场景：扇入树的 `.ts` 文件给 50 个名字各加一个同名方法，4,000 个调用方文件重抽，975–983 → 3,552–3,571 ms；之后两边增量与重建都是 0 条调用边、40,000 行 pending。
+- 2026-11-06 用户选择：对 6f5cfc4a 再做一轮只看增量的评审（第 3 轮，超出两轮上限，经用户同意），通过就发版；再发现问题则撤回 D#746、只发 D#747，不再修补。
+- 第 3 轮（新 subagent，只看 97fdd100..92833f0d，经用户同意超出两轮上限）：HIGH 0、MEDIUM 2、LOW 4、NIT 3。逐条核实（R1min、R2min_lose_second、S_amb_lose 三个复现在 base/rel2/rel3 上自跑）：
+  - F1 MEDIUM（复现）：6f5cfc4a 的重抽把调用方放进后处理范围，范围内 2d-bind 对"指向该文件的边"按目标节点名读调用（`export { Z as A, A as Z }` 换名桶），编辑另一个文件后增量多出 `c2.ts:C2 -> a.js:Z`；base 与 rel2 一致。误读本身 0.188.0 就有（只碰 `a.js` 三个版本都出），D#746 给了新的触发路径。
+  - F2 MEDIUM（复现）：D#742 的扫描新绑定把调用方放进后处理范围，触发同一误读（`t.tsx` 失去第二个 `f` 后多出 `c2.tsx:C2 -> a.ts:A`）；rel2 与 rel3 都有，base 一致。
+  - F3 LOW：fan-out 轮让 pending 行一次运行老化两次（6f5cfc4a）。F4 LOW（复现，D#747 自身）：被放回 pending 的 typed receiver 调用带着旧的 `"amb":1` 标记，重建的行没有；hono 删掉 hooks 文件里带 `use` 等方法的类后 29 行只差这个标记，反方向（加类）0.188.0 少 35 条边、D#747 一条不少。F5：`{ f }` + `* as T` 那条 Not covered 对跨语言调用方已过时。F6：放宽条件的变异会改输出（spec 里"只多耗时"不成立）。N1–N3：注释、日志、刷新路径的成本。
+  - 按用户事先定的规则：第 3 轮再发现问题就撤回 D#746、只发 D#747、不再修补。撤回（1c6514b9）：`index_files.rs`、`domain.rs` 回到 bd6c12da（0.188.0），`resolve.rs`、`tests.rs` 回到 bd6c12da 加 55fb20a6（D#747）；INDEX_VERSION 139 只为 D#747。F4 写进 Not covered。
+  - D#746 重做前要先修的根因：作用域 2d-bind 按目标节点名（而不是调用名）读边，改名导出时会误绑（F1/F2 的共同根因，0.188.0 就有）。
+- 撤回后（w = 1c6514b9，md5 879d4fb2）：13 个语料边与 0.188.0 逐字节相同，pending 行只增（与 D#747 的数相同：claude-mem-lite +903 … express +1，llm_wiki、tokio 不变）。逐步链测 13,320 步 w 独有 0（base 不一致 587 步，w 527 步）；整链 s21 35、s22 42、fam1 10、fam2 25，w 独有 0；kit38 38/38、r4sets61 61/61。w 比 base 多出的内容只在 base 已不一致的 12 步上（重建侧显示 D#747 保留的成员调用行，增量侧是按名恢复到自由函数的旧问题）。hono 删 `streaming.ts`：base 0/16，w 0/0。hono hooks 文件加/删带 `use` 等方法的类：base 加时少 35 条边、删时一致；w 加时一致、删时 29 行只差 `"amb":1`（第 3 轮 F4，写进 Not covered）。耗时：`timing-base-w.txt`、`timing3-base-w.txt`（CHANGELOG 表）。升级/降级提示实测与 CHANGELOG 相同。
