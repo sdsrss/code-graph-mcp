@@ -85,3 +85,12 @@
   - 按用户事先定的规则：第 3 轮再发现问题就撤回 D#746、只发 D#747、不再修补。撤回（1c6514b9）：`index_files.rs`、`domain.rs` 回到 bd6c12da（0.188.0），`resolve.rs`、`tests.rs` 回到 bd6c12da 加 55fb20a6（D#747）；INDEX_VERSION 139 只为 D#747。F4 写进 Not covered。
   - D#746 重做前要先修的根因：作用域 2d-bind 按目标节点名（而不是调用名）读边，改名导出时会误绑（F1/F2 的共同根因，0.188.0 就有）。
 - 撤回后（w = 1c6514b9，md5 879d4fb2）：13 个语料边与 0.188.0 逐字节相同，pending 行只增（与 D#747 的数相同：claude-mem-lite +903 … express +1，llm_wiki、tokio 不变）。逐步链测 13,320 步 w 独有 0（base 不一致 587 步，w 527 步）；整链 s21 35、s22 42、fam1 10、fam2 25，w 独有 0；kit38 38/38、r4sets61 61/61。w 比 base 多出的内容只在 base 已不一致的 12 步上（重建侧显示 D#747 保留的成员调用行，增量侧是按名恢复到自由函数的旧问题）。hono 删 `streaming.ts`：base 0/16，w 0/0。hono hooks 文件加/删带 `use` 等方法的类：base 加时少 35 条边、删时一致；w 加时一致、删时 29 行只差 `"amb":1`（第 3 轮 F4，写进 Not covered）。耗时：`timing-base-w.txt`、`timing3-base-w.txt`（CHANGELOG 表）。升级/降级提示实测与 CHANGELOG 相同。
+
+## 发版记录
+
+- 2026-11-07 发布 0.189.0（只含 D#747；D#746 第二次撤回，仍为待办）。tag v0.189.0 指向 1df81370；main CI 42344599206 7/7 通过，macOS、Windows 日志里新测试 `a_member_call_reaching_only_free_functions_stays_pending` 都是 ok。
+- Release 42345650439：10/10 通过（06:08:11Z → 06:30:40Z，22 分 29 秒）。发版说明取自 CHANGELOG 0.189.0（正文相同），非草稿，14 个资产。
+- npm：`npm view @sdsrs/code-graph version` = 0.189.0；6 个包的 packument 都有 0.189.0，`_npmUser` = GitHub Actions，`trustedPublisher.id` = github。
+- 真实安装：`npm install --prefix <scratch> --cache <scratch>/cache @sdsrs/code-graph@0.189.0` 装上 2 个包；平台包自带二进制 `--version` = `code-graph-mcp 0.189.0`（md5 10305a61）。
+- 信号 3：发布的二进制对源码构建 w（1c6514b9，md5 879d4fb2），`tasks/d742-kit/diff2.sh` 13 个语料全量索引，边集（带元数据）和 pending 行 13/13 逐字节相同。
+- 收尾：D#747 关闭；D#746 仍开（重做前先修作用域 2d-bind 按目标节点名读调用的问题）；D#748 新增；D#741 仍开（13 个真实语料 0 处）。三轮评审的复现材料在 `tasks/d746-kit/review-keep.tar.gz`。

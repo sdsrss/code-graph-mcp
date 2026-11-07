@@ -27,3 +27,11 @@ e9b078c9, `h2` 55fb20a6, `h3` 21e167c5); point them at a new work directory.
 - `timing3.sh A B` — hono and the reviewer's adversarial trees (fan-in,
   sibling-only, member calls); `timing4.sh A B` — the fan-in tree's `.ts` file
   gaining a method of each of its 50 names (every caller re-extracted).
+- `review-keep.tar.gz` — what the three pre-tag reviewers of 0.189.0 kept:
+  round 1 `agent-tmp-review-0189/keep/` (H1 renamed-export cases r1–r5,
+  M1/M2 shapes al*/nx*, gen2.py, steps.py, advgen.py adversarial trees),
+  round 2 `agent-tmp-review-0189b/keep/` (famgen2.py, the alias-two-names
+  repros r01*), round 3 `agent-tmp-review-0189c/keep/` (R1min / R2min, the
+  swapped-name re-export through the scoped 2d-bind; P_age_toggle; S_amb_lose;
+  famgen3.py; ivc.sh with the query-time refresh mode). Starting material for
+  the next D#746 attempt.
