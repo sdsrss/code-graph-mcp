@@ -241,93 +241,6 @@ pub(super) fn python_attr_of(metadata: Option<&str>) -> Option<String> {
     meta.get("attr")?.as_str().map(str::to_string)
 }
 
-const JS_FAMILY: [&str; 3] = ["javascript", "typescript", "tsx"];
-
-/// Whether a definition in `callee` is a sibling of a call in `caller`: the
-/// JS family's languages import one another's files. hono's `.tsx` tests left
-/// 290 calls of what they import from `.ts` modules without an edge (and 8
-/// calls went the other way), the call's pool holding its own language only
-/// (D#742).
-pub(super) fn family_fallback(caller: &str, callee: &str) -> bool {
-    caller != callee && JS_FAMILY.contains(&caller) && JS_FAMILY.contains(&callee)
-}
-
-/// A bare call in a JS-family file, no qualifier at all. A call through a
-/// package name (`{"q":"pkg"}`) is not one, nor a member call.
-pub(super) fn may_widen_to_family(caller: &str, metadata: Option<&str>) -> bool {
-    JS_FAMILY.contains(&caller) && metadata.is_none()
-}
-
-/// The definition a file imports under a name, read once per file: the
-/// file's only import target for that name, every import of it through a
-/// relative path that names an indexed file (an import of an unindexed
-/// `../dist/x` was bound by name). That the specifier names an indexed file
-/// does not prove the walk bound the target: `export * from 'pkg'` dead-ends
-/// and the import falls back to a project node of the name. The name is the
-/// one the module exports (`import { f as g }` imports `f`; a parameter `f`
-/// beside it reads as the import), as 2d-bind reads it.
-#[derive(Default)]
-pub(super) struct FileImports {
-    by_file: HashMap<String, HashMap<String, Option<i64>>>,
-}
-
-impl FileImports {
-    pub(super) fn target(
-        &mut self,
-        conn: &rusqlite::Connection,
-        files: &HashSet<String>,
-        file: &str,
-        name: &str,
-    ) -> Result<Option<i64>> {
-        if !self.by_file.contains_key(file) {
-            // `CROSS JOIN` in file-first order: without statistics (a fresh
-            // index has none yet) SQLite drove this from `idx_edges_relation`,
-            // every import edge of the index once per file: 28 s of a 30 s full
-            // index of 4,400 files with 100,000 imports.
-            let mut stmt = conn.prepare_cached(
-                "SELECT COALESCE(json_extract(ie.metadata, '$.imported'), itn.name),
-                        itn.id, json_extract(ie.metadata, '$.js_module')
-                 FROM files f
-                 CROSS JOIN nodes mn ON mn.file_id = f.id
-                 CROSS JOIN edges ie ON ie.source_id = mn.id AND ie.relation = 'imports'
-                 CROSS JOIN nodes itn ON itn.id = ie.target_id
-                 CROSS JOIN files itf ON itf.id = itn.file_id
-                 WHERE f.path = ?1
-                   AND itf.path <> '<external>'
-                   AND json_extract(ie.metadata, '$.attr') IS NULL",
-            )?;
-            let rows = stmt.query_map([file], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                ))
-            })?;
-            // (target, every import walked), or None once two targets are seen.
-            let mut seen: HashMap<String, Option<(i64, bool)>> = HashMap::new();
-            for row in rows {
-                let (imported, target, spec) = row?;
-                let walked = spec.is_some_and(|spec| {
-                    super::js_modules::resolve_js_specifier_path(&spec, file, files).is_some()
-                });
-                seen.entry(imported)
-                    .and_modify(|s| {
-                        *s = s
-                            .filter(|(t, _)| *t == target)
-                            .map(|(t, w)| (t, w && walked));
-                    })
-                    .or_insert(Some((target, walked)));
-            }
-            let named = seen
-                .into_iter()
-                .map(|(k, s)| (k, s.filter(|(_, walked)| *walked).map(|(t, _)| t)))
-                .collect();
-            self.by_file.insert(file.to_string(), named);
-        }
-        Ok(self.by_file[file].get(name).copied().flatten())
-    }
-}
-
 /// The `pending_unresolved_calls.target_name` of a buffered call through a
 /// renamed import (D#120). The table is unique on (caller, target name,
 /// language), so the export's name alone let one caller's `m()` from './x' and
@@ -346,11 +259,9 @@ pub(super) fn js_import_pending_name(metadata: Option<&str>, target_name: &str) 
 /// edge and the pending row is dropped; rows that still don't resolve stay
 /// buffered for the next index pass.
 ///
-/// Resolution priority mirrors Phase 2: same-language candidates (no
-/// cross-language promotion by name — memory
-/// `feedback_edge_resolution_same_language.md` flags that as the canonical
-/// false-positive class; a JS-family bare call with none takes the sibling
-/// language's definition its file imports, D#742), with
+/// Resolution priority mirrors Phase 2: same-language candidates only (no
+/// cross-language promotion — memory `feedback_edge_resolution_same_language.md`
+/// flags that as the canonical false-positive class), with
 /// `refine_ambiguous_targets` applied when multiple candidates share the name.
 ///
 /// Returns the number of edges inserted by this sweep.
@@ -434,7 +345,6 @@ pub(super) fn resolve_pending_calls_touching(
     // Every file path, read at the first call a `use` anchors in a crate.
     let mut all_file_paths: Option<HashSet<String>> = None;
     let mut js_exports = super::js_exports::JsExports::default();
-    let mut imports = FileImports::default();
 
     for row in &pending {
         // A call through a renamed import (D#120) binds what the file its
@@ -486,48 +396,17 @@ pub(super) fn resolve_pending_calls_touching(
             to_delete.push(row.id);
             continue;
         }
-        let entries = name_to_lang_targets
+        let candidates: Vec<i64> = name_to_lang_targets
             .get(&row.target_name)
-            .map(Vec::as_slice)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(_, lang)| *lang == row.source_language)
+                    .map(|(id, _)| *id)
+                    .filter(|id| *id != row.source_id) // self-call guard
+                    .collect()
+            })
             .unwrap_or_default();
-        let pool = |keep: &dyn Fn(&str) -> bool| -> Vec<i64> {
-            entries
-                .iter()
-                .filter(|(_, lang)| keep(lang))
-                .map(|(id, _)| *id)
-                .collect()
-        };
-        let mut candidates = pool(&|l| l == row.source_language);
-        // D#742: a bare JS-family call with no candidate of its own language
-        // binds the sibling-language definition its file imports under that
-        // name, and nothing else; the deferred pass applies the same rule to
-        // the call before it is buffered.
-        if candidates.is_empty()
-            && may_widen_to_family(&row.source_language, row.metadata.as_deref())
-        {
-            let siblings = pool(&|l| family_fallback(&row.source_language, l));
-            if !siblings.is_empty() {
-                if all_file_paths.is_none() {
-                    all_file_paths = Some(
-                        db.conn()
-                            .prepare("SELECT path FROM files")?
-                            .query_map([], |r| r.get::<_, String>(0))?
-                            .collect::<rusqlite::Result<_>>()?,
-                    );
-                }
-                let files = all_file_paths.as_ref().expect("loaded above");
-                let caller = source_id_to_path
-                    .get(&row.source_id)
-                    .map(String::as_str)
-                    .unwrap_or_default();
-                if let Some(target) = imports.target(db.conn(), files, caller, &row.target_name)? {
-                    if siblings.contains(&target) {
-                        candidates = vec![target];
-                    }
-                }
-            }
-        }
-        candidates.retain(|id| *id != row.source_id); // self-call guard
 
         let candidates = classes.rust_call_shape_candidates(
             db,
@@ -1826,23 +1705,6 @@ pub(super) fn bare_name_callers_of_new_duplicates(
            -- the path, not the bare name: the re-export arm below judges them.
            AND (e.metadata IS NULL OR e.metadata NOT LIKE '%\"rx\"%')"
     );
-    // A JS-family call bound to a sibling language's definition because its
-    // own language had none (D#742): when the name gains a definition in the
-    // caller's language, a rebuild picks from that pool by name instead, and
-    // the call holds no pending row and no `ambiguous` edge to bring it back.
-    let family_sql = format!(
-        "SELECT DISTINCT f.path
-         FROM cg_fanout_up u
-         CROSS JOIN nodes tgt ON tgt.name = u.nm
-         CROSS JOIN files tf ON tf.id = tgt.file_id
-                           AND tf.language IN ('javascript', 'typescript', 'tsx')
-                           AND tf.language IS NOT u.lang
-         CROSS JOIN edges e ON e.target_id = tgt.id AND e.relation = '{REL_CALLS}'
-         CROSS JOIN nodes src ON src.id = e.source_id
-         CROSS JOIN files f ON f.id = src.file_id AND f.language IS u.lang
-         WHERE u.lang IN ('javascript', 'typescript', 'tsx')
-           AND f.path NOT IN (SELECT path FROM cg_fanout_paths)"
-    );
     // A Rust `use crate::a::widget` bound by name to another file's `widget`,
     // because `a` had none (D#124 F9): the import edge is no `calls` edge and
     // is not `ambiguous`, so the half above misses it, and its call follows the
@@ -1951,13 +1813,6 @@ pub(super) fn bare_name_callers_of_new_duplicates(
         let mut paths: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        paths.extend(
-            conn.prepare(&family_sql)?
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?,
-        );
-        paths.sort_unstable();
-        paths.dedup();
         let reexported: Vec<ReexportRow> = conn
             .prepare(&reexport_sql)?
             .query_map([], |row| {
