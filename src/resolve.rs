@@ -149,9 +149,10 @@ pub fn file_path_message(typed: &str, paths: &[String], surface: Surface) -> Str
 ///
 /// Exact qualified matches are filtered by `explicit_file`. One match keeps the
 /// qualified spelling for traversal; multiple matches are ambiguous. With no
-/// exact match, a dotted input some node is named keeps that name; otherwise
-/// it falls back to its final bare component only when no file filter was
-/// supplied. Bare input keeps the normal name lookup.
+/// exact match, a dotted input some node is named keeps that name; with a file
+/// filter, anything else is a miss; an indexed file's path (or a `/`-bounded
+/// suffix of one) is refused as a file (D#456); otherwise it falls back to its
+/// final bare component. Bare input keeps the normal name lookup.
 ///
 /// One function for both surfaces. The MCP tools each picked a symbol their
 /// own way: a dotted name nothing is qualified-named ran the fuzzy step over
@@ -1417,6 +1418,38 @@ mod fuzzy_tests {
         assert_eq!(pick("tools.rs", None), "symbol rs");
         // A file selector keeps its own miss.
         assert_eq!(pick("app.py", Some("src/tools.py")), "<miss>");
+    }
+
+    /// D#456 review: a definition qualified-named as typed is the symbol even
+    /// when a file has that path (`class app` with a method `py`, and `app.py`),
+    /// and the message lists at most five paths.
+    #[test]
+    fn a_qualified_definition_outranks_a_file_of_that_name() {
+        let (_p, _d, db) = indexed(&[
+            ("app.py", "def other():\n    return 2\n"),
+            (
+                "src/shapes.py",
+                "class app:\n    def py(self):\n        return 1\n",
+            ),
+        ]);
+        match select_symbol(db.conn(), "app.py", None).unwrap() {
+            Ok(s) => assert_eq!(
+                (s.lookup_name.as_str(), s.lookup),
+                ("app.py", SymbolLookup::ExactQualified)
+            ),
+            Err(SymbolSelectionError::File(paths)) => {
+                panic!("the method app.py must be selected, not the files {paths:?}")
+            }
+            Err(_) => panic!("the method app.py must be selected"),
+        }
+
+        let paths: Vec<String> = (1..=7).map(|i| format!("p{i}/app.py")).collect();
+        assert_eq!(
+            file_path_message("app.py", &paths, Surface::Mcp),
+            "'app.py' is a file path, not a symbol (indexed: p1/app.py, p2/app.py, \
+             p3/app.py, p4/app.py, p5/app.py and 2 more). To list its symbols, use \
+             module_overview with path \"p1/app.py\"."
+        );
     }
 
     /// D#426 (7): only the whitespace around a name goes; inside it stays, and

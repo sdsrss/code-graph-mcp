@@ -12199,6 +12199,36 @@ fn a_file_path_is_not_a_symbol() {
             out.get("risk").is_none(),
             "{cmd} must not emit a risk verdict for an input it did not resolve: {out}"
         );
+        // D#456: the refusal says it is a file and how to list its symbols,
+        // inside the command's own empty answer, as the 0.190.0 notes say.
+        assert_eq!(
+            out["error"],
+            "'one.py' is a file path, not a symbol (indexed: one.py). \
+             To list its symbols, run `code-graph-mcp overview one.py`.",
+            "{cmd}: {out}"
+        );
+        assert_eq!(out["symbol"], "one.py", "{cmd}: {out}");
+        assert_eq!(out["files"], serde_json::json!(["one.py"]), "{cmd}: {out}");
+        let mut keys: Vec<&str> = out
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let envelope: &[&str] = match cmd {
+            "callgraph" => &["error", "files", "results", "symbol"],
+            "refs" => &[
+                "by_relation",
+                "error",
+                "files",
+                "references",
+                "symbol",
+                "total_references",
+            ],
+            _ => &["error", "files", "symbol"],
+        };
+        assert_eq!(keys, envelope, "{cmd}: {out}");
     }
 
     // Control: a real qualified name in the same index still resolves, so the

@@ -2403,6 +2403,16 @@ mod tests {
             msg.contains("unable to open database file"),
             "SQLite's own error stays in the chain: {msg}"
         );
+        // The read-only open (secondary MCP instances, `snapshot inspect`)
+        // names the same cause.
+        let err = Database::open_readonly_named(&path_of_len(505))
+            .err()
+            .expect("SQLite refuses 505 bytes read-only too");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("505 bytes") && msg.contains("at most 504"),
+            "the read-only open must name the length as the cause: {msg}"
+        );
 
         // A short name whose symlinked directory resolves to 510 bytes: SQLite
         // refuses it, and the cause names the resolved length, not the typed one.

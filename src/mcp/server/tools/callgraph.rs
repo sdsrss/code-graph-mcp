@@ -194,9 +194,10 @@ impl McpServer {
         // The symbol CLI `callgraph` selects (`resolve::select_symbol`). Two
         // definitions of one qualified name are ambiguous: two test-code ones
         // were merged (D#447), and so were two in the one file a file_path
-        // names. A dotted name nothing is qualified-named is its last part: the
-        // fuzzy step ran over the whole string, and flask `Flask.route`
-        // answered for `FlaskGroup` (D#435).
+        // names. An indexed file's path is refused (D#456). Any other dotted
+        // name nothing is qualified-named is its last part: the fuzzy step ran
+        // over the whole string, and flask `Flask.route` answered for
+        // `FlaskGroup` (D#435).
         let selection = match crate::resolve::select_symbol(self.db.conn(), typed, file_path)? {
             Ok(selection) => selection,
             Err(crate::resolve::SymbolSelectionError::Ambiguous(cands)) => {

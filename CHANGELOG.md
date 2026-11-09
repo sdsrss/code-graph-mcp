@@ -3,11 +3,15 @@
 ## 0.190.0
 
 **Upgrading: no index rebuild.** `INDEX_VERSION` stays 139. Two answers
-change for scripts and MCP clients. A file path given where a symbol is
-expected (`refs app.py`, or MCP `get_call_graph` with `symbol_name:
-"app.py"`) is refused as a file: the CLI exits 1 where it could exit 0 with
-an answer for a definition named like the extension, and the MCP tools
-return an error (below). And a project path too long for SQLite now says so.
+change for scripts and MCP clients. An indexed file's path given where a
+symbol is expected (`refs app.py`, or MCP `get_call_graph` with
+`symbol_name: "app.py"`) is refused as a file: the CLI exits 1 where it could
+exit 0 with an answer for a definition named like the extension, and the MCP
+tools return an error (below). That includes a dotted name that happens to
+be an indexed file's name, such as `response.json` for a method `json` when
+a `response.json` fixture is indexed; spell it `json` or `Response.json`.
+Other spellings of a path still answer as before (Not covered). And on
+Linux and macOS a project path too long for SQLite now says so.
 To pin the binary back: `npm i -g @sdsrs/code-graph@0.189.0` (or, from
 source, `cargo install --locked --git https://github.com/sdsrss/code-graph-mcp
 --tag v0.189.0 --features embed-model`), then delete
@@ -34,7 +38,11 @@ extension. What came back depended on what the index held under that name
   said `cmd/solo.go` was not found in the index.
 
 Now a name that is an indexed file's path, or ends one right after a `/`
-(`app.py`, `./src/app.py`, `lib.rs`), gets the same answer on all six:
+(`app.py`, `./src/app.py`, `lib.rs`), with one leading `./` dropped and case
+and separators as indexed, gets the same answer on all six. A qualified name
+a definition has still names it (with a method `py` in `class app` and a
+file `app.py`, `refs app.py` answers for the method), and a Markdown heading
+with that name hides the file (Not covered). The answer:
 "'app.py' is a file path, not a symbol (indexed: pkg/app.py, src/app.py). To
 list its symbols, run `code-graph-mcp overview pkg/app.py`." (the MCP tools:
 "use module_overview with path …"). The CLI exits 1, and with `--json`
@@ -42,7 +50,15 @@ prints `error`, `symbol` and `files` inside the command's own empty answer
 (`results: []` for `callgraph`, `references: []` for `refs`); the MCP tools
 return it as an error. On the same fixture, `tools.rs` where the file is
 `tools.py` still answers for `rs` with the note, and `Store.get`, a
-qualified name a definition has, answers as before. (D#456)
+qualified name a definition has, answers as before.
+
+One answer that was right is now refused: a dotted name naming a member,
+where a file anywhere in the tree has that name. With `class Response` and
+its method `json` called as `response.json()` in `src/client.py`, and a
+file `tests/fixtures/response.json`, `refs response.json` answered for
+`json` in 0.189.0 (the caller `fetch`, exit 0) and is now refused as that
+file (exit 1). `refs json` and `refs Response.json` answer for the method
+(the caller `fetch`, exit 0). (D#456)
 
 ### fix: a project path too long for SQLite says so
 
@@ -50,7 +66,8 @@ SQLite opens a database path of at most 504 bytes (on Linux: 504 opens, 505
 is refused), counting the path with symlinks resolved, so a project whose
 root resolves to more than 483 bytes (`<root>/.code-graph/index.db`) cannot
 be indexed. `incremental-index` there exited 1 with SQLite's "unable to open
-database file" and no cause. It now says first: "the index database path is
+database file" and no cause. On Linux and macOS it now says first (Windows
+is unchanged): "the index database path is
 608 bytes; SQLite opens a database path of at most 504 bytes (its 512-byte
 limit less the 8 bytes of `-journal`). Move the project to a shorter path."
 (a 587-byte root). The limit itself is unchanged. (D#673)
@@ -67,13 +84,29 @@ marker still gets it). (D#346)
 
 ### Not covered
 
-- An absolute path (`refs /home/me/proj/src/app.py`) is not recognised as
-  a file: it still falls back to its last part, as in 0.189.0 (measured:
-  it answered for `py` with the stderr note).
-- The GitHub Release pages of 0.49.0, 0.116.0 and 0.142.0–0.165.2 still
-  tell readers to `cargo install code-graph-mcp --version X`; no such crate
-  exists on crates.io. This file's copies of those entries now name the git
-  tag instead.
+- Only an indexed file's path as the index spells it is recognised. These
+  still fall back to their last part, as in 0.189.0, with the stderr note
+  and exit 0 (measured with `refs`, where `app.py` is `src/app.py`): an
+  absolute path, `src\app.py`, `App.py`, `././src/app.py`, `src//app.py`,
+  `../lib/conf.js`, and `src/app.py:1` (noted as "Resolved 'py:1' → 'py'").
+  So do files the index does not hold: `refs Cargo.toml` answered for
+  `toml`, and a `.py` file created since the last index answered for `py`
+  (the call did not index it).
+- A Markdown heading with a file's name hides the file: with `## solo.go`
+  in README.md and `cmd/solo.go` indexed, `refs solo.go` says "No references
+  found for 'solo.go'.", as 0.189.0 did.
+- `rebuild-index` builds into `.code-graph/index.db.rebuild-<pid>`, longer
+  than `index.db` by 9 bytes plus the PID's digits, so it needs a shorter
+  root than indexing does. At a 470-byte root `incremental-index` succeeded
+  and `rebuild-index --confirm` exited 1 with "the index database path is
+  507 bytes" (470 + 13 for `/.code-graph/` + 17 for `index.db.rebuild-` + 7
+  PID digits): the number is that file's path, not `index.db`'s.
+- The GitHub Release pages of 0.143.0–0.163.0 (with 0.145.1) and 0.166.0,
+  23 pages, still tell readers to `cargo install code-graph-mcp --version
+  X`; no such crate exists on crates.io. This file's copies of those
+  entries, and 0.19.0's `cargo install code-graph-mcp@0.18.4`, now name the
+  git tag instead. The 0.134.0 and v0.18.4 entries still describe a
+  `cargo install code-graph-mcp` build.
 
 ## 0.189.0
 
@@ -19280,7 +19313,7 @@ required. Users feel three new behaviors automatically:
 - C/C++ `#include` directives now produce IMPORTS edges in the dependency graph.
 - gtest macro invocations (`TEST` / `TEST_F` / `TEST_P` / `TEST_CASE` / `TYPED_TEST` / `TYPED_TEST_P`) are now marked `is_test=true` and named `Suite.Name`.
 
-To revert any individual feature, pin to v0.18.4 (`cargo install code-graph-mcp@0.18.4`
+To revert any individual feature, pin to v0.18.4 (`cargo install --git https://github.com/sdsrss/code-graph-mcp --tag v0.18.4`
 or downgrade the npm-installed binary). No env-flag opt-out — the additions are
 graph data shape, not behavior toggles.
 
