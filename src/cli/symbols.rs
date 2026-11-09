@@ -104,7 +104,17 @@ pub(crate) fn emit_file_selector_miss(
         if miss.elsewhere.len() > crate::resolve::SUGGESTION_CAP {
             out["candidates_total"] = serde_json::json!(miss.elsewhere.len());
         }
-        match envelope {
+        envelope.fill(&mut out);
+        println!("{out}");
+    }
+    eprintln!("[code-graph] {}", miss.message(name, file));
+    std::process::exit(1);
+}
+
+impl MissEnvelope {
+    /// Add the command's empty answer to a miss object.
+    fn fill(&self, out: &mut serde_json::Value) {
+        match self {
             MissEnvelope::Results => out["results"] = serde_json::json!([]),
             MissEnvelope::Plain => {}
             MissEnvelope::References => {
@@ -113,9 +123,30 @@ pub(crate) fn emit_file_selector_miss(
                 out["total_references"] = serde_json::json!(0);
             }
         }
+    }
+}
+
+/// An indexed file's path given as the symbol (D#456): say it is a file and
+/// how to list its symbols, where the last part (its extension) used to be
+/// answered for. JSON: `error`, `symbol`, `files`, in the command's own
+/// [`MissEnvelope`]. Exits 1.
+pub(crate) fn emit_file_path_symbol(
+    typed: &str,
+    paths: &[String],
+    json_mode: bool,
+    envelope: MissEnvelope,
+) -> ! {
+    let message = crate::resolve::file_path_message(typed, paths, crate::resolve::Surface::Cli);
+    if json_mode {
+        let mut out = serde_json::json!({
+            "error": message,
+            "symbol": typed,
+            "files": paths,
+        });
+        envelope.fill(&mut out);
         println!("{out}");
     }
-    eprintln!("[code-graph] {}", miss.message(name, file));
+    eprintln!("[code-graph] {message}");
     std::process::exit(1);
 }
 

@@ -297,6 +297,9 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                 let miss = crate::resolve::file_selector_miss(conn, raw_symbol, fp)?;
                 emit_file_selector_miss(&miss, raw_symbol, fp, json_mode, MissEnvelope::References)
             }
+            Err(CliSymbolSelectionError::File(paths)) => {
+                emit_file_path_symbol(raw_symbol, &paths, json_mode, MissEnvelope::References)
+            }
         };
         if selection.lookup == CliSymbolLookup::ExactQualified {
             let qualified_ids =

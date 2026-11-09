@@ -20,6 +20,23 @@ It now names the cause first: "the index database path is 600 bytes; SQLite
 opens a database path of at most 504 bytes … Move the project to a shorter
 path." (measured on a 579-byte root). The limit itself is unchanged. (D#673)
 
+### fix: a file path given as a symbol is answered as a file
+
+`refs`, `callgraph` and `impact`, and MCP `get_call_graph`,
+`find_references` and `get_ast_node`, took a dotted name nothing is
+qualified-named by its last part, so a file path became its extension:
+`get_call_graph app.py` answered for a function named `py`, `refs
+src/resolve.rs` listed seven functions near the name `rs`. A name that is an
+indexed file's path, or ends one after a `/` (`app.py`, `./src/app.py`,
+`lib.rs`), now gets "'app.py' is a file path, not a symbol (indexed:
+pkg/app.py, src/app.py). To list its symbols, run `code-graph-mcp overview
+pkg/app.py`" (MCP: "use module_overview"); the CLI exits 1 and its `--json`
+carries `error`, `symbol`, `files` in the command's usual empty answer, and
+the MCP tools return an error. A dotted name that is not an indexed file
+(`tools.rs` where the file is `tools.py`) still falls back to its last part,
+and a name a definition is qualified-named (`Database.open`) is unchanged.
+(D#456)
+
 ## 0.189.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 138 → 139

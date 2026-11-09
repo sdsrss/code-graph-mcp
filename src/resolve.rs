@@ -114,6 +114,35 @@ pub enum SymbolSelectionError {
     Ambiguous(Vec<NameCandidate>),
     /// A file selector makes a missing qualifier a strict miss.
     QualifiedNotFound,
+    /// The input is the path of an indexed file (or a `/`-bounded suffix of
+    /// one), not a symbol: the matching paths. Its last part is the file
+    /// extension, and answering for that named an unrelated symbol (D#456).
+    File(Vec<String>),
+}
+
+/// What every surface says for [`SymbolSelectionError::File`].
+pub fn file_path_message(typed: &str, paths: &[String], surface: Surface) -> String {
+    let shown = paths
+        .iter()
+        .take(SUGGESTION_CAP)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = paths.len().saturating_sub(SUGGESTION_CAP);
+    let more = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    let first = &paths[0];
+    let how = match surface {
+        Surface::Cli => format!("run `code-graph-mcp overview {first}`"),
+        Surface::Mcp => format!("use module_overview with path \"{first}\""),
+    };
+    format!(
+        "'{typed}' is a file path, not a symbol (indexed: {shown}{more}). \
+         To list its symbols, {how}."
+    )
 }
 
 /// Select a symbol with exact-qualified precedence and compatible fallback.
@@ -177,6 +206,10 @@ pub fn select_symbol(
         if explicit_file.is_some() {
             return Ok(Err(SymbolSelectionError::QualifiedNotFound));
         }
+        let files = indexed_files_named(conn, raw_symbol)?;
+        if !files.is_empty() {
+            return Ok(Err(SymbolSelectionError::File(files)));
+        }
     }
     Ok(Ok(SymbolSelection {
         lookup_name: if raw_symbol.contains('.') {
@@ -188,6 +221,21 @@ pub fn select_symbol(
         file_filter: explicit_file.map(str::to_string),
         lookup: SymbolLookup::Bare,
     }))
+}
+
+/// Indexed file paths `typed` names: a path itself (less a leading `./`), or a
+/// suffix of one that starts right after a `/` (D#456).
+fn indexed_files_named(conn: &Connection, typed: &str) -> Result<Vec<String>> {
+    let name = typed.strip_prefix("./").unwrap_or(typed);
+    let mut stmt = conn.prepare_cached(
+        "SELECT path FROM files \
+         WHERE path = ?1 OR substr(path, -length(?1) - 1) = '/' || ?1 \
+         ORDER BY path",
+    )?;
+    let paths = stmt
+        .query_map([name], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(paths)
 }
 
 /// Whether [`select_symbol`] keeps a dotted name no definition is
@@ -1320,6 +1368,7 @@ mod fuzzy_tests {
             Ok(s) => (s.lookup_name, s.bare_name),
             Err(SymbolSelectionError::QualifiedNotFound) => ("<miss>".into(), String::new()),
             Err(SymbolSelectionError::Ambiguous(_)) => ("<ambiguous>".into(), String::new()),
+            Err(SymbolSelectionError::File(_)) => ("<file>".into(), String::new()),
         };
         let kept = |typed: &str| (typed.to_string(), typed.to_string());
         assert_eq!(
@@ -1333,6 +1382,41 @@ mod fuzzy_tests {
         assert_eq!(pick("Widget.zap", None), ("zap".into(), "zap".into()));
         // An import is in no file a selector can name.
         assert_eq!(pick("xml.etree.ElementTree", Some("app.py")).0, "<miss>");
+    }
+
+    /// D#456: a file path given as the symbol fell back to its last part, the
+    /// extension, and answered for an unrelated symbol (`app.py` -> fn `py`).
+    /// An indexed file's path, or a `/`-bounded suffix of one, is a file; any
+    /// other dotted name keeps the fallback.
+    #[test]
+    fn an_indexed_file_path_is_a_file_not_its_extension() {
+        let (_p, _d, db) = indexed(&[
+            ("app.py", "def other():\n    return 2\n"),
+            ("src/app.py", "def create_app():\n    return 1\n"),
+            (
+                "src/tools.py",
+                "def py():\n    return 0\n\n\ndef rs():\n    return py()\n",
+            ),
+            ("src/lib.rs", "pub fn run() {}\n"),
+        ]);
+        let pick = |typed: &str, file: Option<&str>| match select_symbol(db.conn(), typed, file)
+            .unwrap()
+        {
+            Ok(s) => format!("symbol {}", s.lookup_name),
+            Err(SymbolSelectionError::File(paths)) => format!("file {}", paths.join(",")),
+            Err(SymbolSelectionError::QualifiedNotFound) => "<miss>".into(),
+            Err(SymbolSelectionError::Ambiguous(_)) => "<ambiguous>".into(),
+        };
+        assert_eq!(pick("src/app.py", None), "file src/app.py");
+        assert_eq!(pick("./src/app.py", None), "file src/app.py");
+        assert_eq!(pick("app.py", None), "file app.py,src/app.py");
+        assert_eq!(pick("lib.rs", None), "file src/lib.rs");
+        // `src/lib.rs` ends with `b.rs`, but not at a `/`.
+        assert_eq!(pick("b.rs", None), "symbol rs");
+        // Not an indexed file: the dotted fallback stays.
+        assert_eq!(pick("tools.rs", None), "symbol rs");
+        // A file selector keeps its own miss.
+        assert_eq!(pick("app.py", Some("src/tools.py")), "<miss>");
     }
 
     /// D#426 (7): only the whitespace around a name goes; inside it stays, and

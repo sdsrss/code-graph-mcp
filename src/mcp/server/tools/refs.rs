@@ -75,6 +75,14 @@ impl McpServer {
                     }
                     // Only with a file_path: the file branch below reports it.
                     Err(crate::resolve::SymbolSelectionError::QualifiedNotFound) => None,
+                    // An indexed file's path: its last part is the extension (D#456).
+                    Err(crate::resolve::SymbolSelectionError::File(paths)) => {
+                        return Err(anyhow!(crate::resolve::file_path_message(
+                            name,
+                            &paths,
+                            crate::resolve::Surface::Mcp
+                        )));
+                    }
                 }
             }
             _ => None,

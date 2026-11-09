@@ -4520,12 +4520,16 @@ fn cli_and_mcp_agree_on_one_qualified_symbol() {
 /// selection layer. That is how the same input got a refusal from
 /// `find_references` and a success envelope from `get_call_graph` — the
 /// one-input-two-verdicts shape this repo has shipped three times.
+///
+/// D#456: the refusal used to be a "not found" for the path's last part, which
+/// held only while nothing was named like the extension. `def py()` below is
+/// that namesake: with it, all three tools answered for `py`.
 #[test]
 fn mcp_tools_agree_that_a_file_path_is_not_a_symbol() {
     let project = TempDir::new().unwrap();
     fs::write(
         project.path().join("uniq.py"),
-        "class Health:\n    def probe(self):\n        return 1\n\ndef ping():\n    return Health.probe(None)\n",
+        "class Health:\n    def probe(self):\n        return 1\n\ndef ping():\n    return Health.probe(None)\n\ndef py():\n    return ping()\n",
     )
     .unwrap();
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
@@ -4559,7 +4563,8 @@ fn mcp_tools_agree_that_a_file_path_is_not_a_symbol() {
         // what must never happen is an answer ABOUT the path.
         let text = raw.as_deref().unwrap_or_default().to_string();
         assert!(
-            text.contains("not found"),
+            text.contains("'uniq.py' is a file path, not a symbol (indexed: uniq.py)")
+                && text.contains("module_overview"),
             "{tool} answered for a file path instead of refusing it: {text}"
         );
     }

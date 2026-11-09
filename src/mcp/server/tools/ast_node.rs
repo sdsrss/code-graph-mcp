@@ -247,6 +247,14 @@ impl McpServer {
                     Err(crate::resolve::SymbolSelectionError::QualifiedNotFound) => {
                         (typed.to_string(), false)
                     }
+                    // An indexed file's path: its last part is the extension (D#456).
+                    Err(crate::resolve::SymbolSelectionError::File(paths)) => {
+                        return Err(anyhow!(crate::resolve::file_path_message(
+                            typed,
+                            &paths,
+                            crate::resolve::Surface::Mcp
+                        )));
+                    }
                 };
             let note = super::super::fuzzy_switch_note(typed, &sym);
             let sym = sym.as_str();

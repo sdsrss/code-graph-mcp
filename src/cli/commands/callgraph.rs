@@ -138,6 +138,9 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
             let miss = crate::resolve::file_selector_miss(conn, raw_symbol, fp)?;
             emit_file_selector_miss(&miss, raw_symbol, fp, json_mode, MissEnvelope::Results)
         }
+        Err(CliSymbolSelectionError::File(paths)) => {
+            emit_file_path_symbol(raw_symbol, &paths, json_mode, MissEnvelope::Results)
+        }
     };
     let is_exact_qualified = selection.lookup == CliSymbolLookup::ExactQualified;
     let symbol = selection.lookup_name.as_str();
@@ -271,7 +274,9 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
                     outcome.disclose();
                     emit_exact_ambiguity(raw_symbol, &candidates, json_mode);
                 }
-                Ok(_) | Err(CliSymbolSelectionError::QualifiedNotFound) => {
+                Ok(_)
+                | Err(CliSymbolSelectionError::QualifiedNotFound)
+                | Err(CliSymbolSelectionError::File(_)) => {
                     // Let the ordinary empty-result branch below render the
                     // command's established not-found envelope and hint.
                 }

@@ -210,6 +210,14 @@ impl McpServer {
                 let miss = crate::resolve::file_selector_miss(self.db.conn(), typed, fp)?;
                 return Err(anyhow!(miss.message(typed, fp)));
             }
+            // An indexed file's path: its last part is the extension (D#456).
+            Err(crate::resolve::SymbolSelectionError::File(paths)) => {
+                return Err(anyhow!(crate::resolve::file_path_message(
+                    typed,
+                    &paths,
+                    crate::resolve::Surface::Mcp
+                )));
+            }
         };
         let function_name = selection.lookup_name.as_str();
         // CLI `callgraph` skips the fuzzy step for an exact qualified name
