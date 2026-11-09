@@ -3877,7 +3877,7 @@ unchanged). Three answers change:
   nothing; it ignored everything.
 
 To pin back: `npm i -g @sdsrs/code-graph@0.165.2`, or `cargo install
-code-graph-mcp --version 0.165.2`; plugin users can set the version in the
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.165.2`; plugin users can set the version in the
 marketplace entry.
 
 ### Fixed
@@ -4516,7 +4516,7 @@ method call whose receiver the source leaves untyped is no longer labelled
 still in the graph; both commands say how many they hid, and
 `--min-confidence ambiguous` (MCP `min_confidence: "ambiguous"`) shows them.
 To pin back: `npm i -g @sdsrs/code-graph@0.162.0`, or `cargo install
-code-graph-mcp --version 0.162.0`; plugin users can set the version in the
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.162.0`; plugin users can set the version in the
 marketplace entry. An older binary leaves a v103 index intact and warns
 instead of rebuilding it; delete `.code-graph/index.db*` after pinning back to
 get its graph back.
@@ -4691,7 +4691,7 @@ eval measures the parent's prompt, not the hook.
 `INDEX_VERSION` goes 92 → 99 because the Rust and JavaScript fixes below change
 which `calls`, `imports` and `exports` edges a file produces. Nothing to run. To
 pin back: `npm i -g @sdsrs/code-graph@0.161.0`, or `cargo install
-code-graph-mcp --version 0.161.0`; plugin users can set the version in the
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.161.0`; plugin users can set the version in the
 marketplace entry. An older binary leaves a v99 index intact and warns instead
 of rebuilding it; delete
 `.code-graph/index.db*` after pinning back to get its graph back.
@@ -5619,8 +5619,8 @@ holding a file the index skips, the patterns above, and `grep -R`).
 **Upgrading: every index rebuilds once, automatically, on first use.**
 `INDEX_VERSION` goes 87 → 92 because the Rust fixes below change which `calls`
 edges a file produces. Nothing to run. To pin back: `npm i -g
-@sdsrs/code-graph@0.160.0`, or `cargo install code-graph-mcp --version
-0.160.0`; plugin users can set the version in the marketplace entry. An older
+@sdsrs/code-graph@0.160.0`, or `cargo install --git https://github.com/sdsrss/code-graph-mcp --tag
+v0.160.0`; plugin users can set the version in the marketplace entry. An older
 binary leaves a v92 index intact and warns instead of rebuilding it; delete
 `.code-graph/index.db*` after pinning back to get its graph back.
 
@@ -5733,8 +5733,8 @@ way before and after, so the `tokio::spawn` fix stands.
 **Upgrading: every index rebuilds once, automatically, on first use.**
 `INDEX_VERSION` goes 79 → 87 because the Rust fixes below change which `calls`
 and `imports` edges a file produces. Nothing to run. To pin back: `npm i -g
-@sdsrs/code-graph@0.159.0`, or `cargo install code-graph-mcp --version
-0.159.0`; plugin users can set the version in the marketplace entry. An older
+@sdsrs/code-graph@0.159.0`, or `cargo install --git https://github.com/sdsrss/code-graph-mcp --tag
+v0.159.0`; plugin users can set the version in the marketplace entry. An older
 binary leaves a v87 index intact and warns instead of rebuilding it; delete
 `.code-graph/index.db*` after pinning back to get its graph back.
 
@@ -5916,7 +5916,7 @@ counts as the flag.
 `inherits` edges a file produces, and an existing index keeps the wrong ones
 until each file's content changes. Nothing to run; the rebuild itself is faster
 than 0.158.0's full index (below). To pin back: `npm i -g
-@sdsrs/code-graph@0.158.0`, or `cargo install code-graph-mcp --version 0.158.0`;
+@sdsrs/code-graph@0.158.0`, or `cargo install --git https://github.com/sdsrss/code-graph-mcp --tag v0.158.0`;
 plugin users can set the version in the marketplace entry. An older binary
 leaves a v79 index intact and warns instead of rebuilding it; delete
 `.code-graph/index.db*` after pinning to get its graph back.
@@ -6140,8 +6140,8 @@ including anything after the `sed`. The hint still arrives as
 `INDEX_VERSION` goes 72 → 74 because the call-graph errors below change which
 nodes and `calls` edges a file produces, and an existing index keeps the wrong
 ones until each file's content changes. Nothing to run. To pin back:
-`npm i -g @sdsrs/code-graph@0.157.0`, or `cargo install code-graph-mcp --version
-0.157.0`; plugin users can set the version in the marketplace entry. An older
+`npm i -g @sdsrs/code-graph@0.157.0`, or `cargo install --git https://github.com/sdsrss/code-graph-mcp --tag
+v0.157.0`; plugin users can set the version in the marketplace entry. An older
 binary leaves a v74 index intact and warns instead of rebuilding it; delete
 `.code-graph/index.db*` after pinning to get its graph back.
 
@@ -6324,7 +6324,7 @@ restart. The first incremental run after upgrading re-parses any file that
 itself, once each. If `health-check` still
 shows files you believe are fine, `code-graph-mcp rebuild-index --confirm`
 rebuilds from scratch. To pin back: `npm i -g @sdsrs/code-graph@0.156.0`, or
-`cargo install code-graph-mcp --version 0.156.0`; plugin users can set the
+`cargo install --git https://github.com/sdsrss/code-graph-mcp --tag v0.156.0`; plugin users can set the
 version in the marketplace entry.
 
 ### A server left running from before an upgrade no longer rewrites the index
@@ -6395,7 +6395,7 @@ coming from 0.154.0 or older, 0.155.0's one-time rebuild still applies. One hook
 behavior is corrected: a grep whose pattern holds an escaped quote (`"a\"b"`) is
 no longer misread, so the PostToolUse hook stops attaching results for a
 different pattern than the one you ran. To pin back: `npm i -g
-@sdsrs/code-graph@0.155.0`, or `cargo install code-graph-mcp --version 0.155.0`;
+@sdsrs/code-graph@0.155.0`, or `cargo install --git https://github.com/sdsrss/code-graph-mcp --tag v0.155.0`;
 plugin users can set the version in the marketplace entry.
 
 ### A grep pattern with an escaped quote no longer injects every line of the file
@@ -6448,7 +6448,7 @@ typed.
 tree-sitter-rust 0.24, and an existing index keeps symbols the old Rust grammar
 lost until the file that holds them is next edited. Nothing to run; the first
 query or index run after upgrading re-extracts. To pin back: `npm i -g
-@sdsrs/code-graph@0.154.0` or `cargo install code-graph-mcp --version 0.154.0`;
+@sdsrs/code-graph@0.154.0` or `cargo install --git https://github.com/sdsrss/code-graph-mcp --tag v0.154.0`;
 plugin users can set the version in the marketplace entry. An older binary
 leaves a v72 index intact and warns on every open instead of rebuilding it — to
 get the old grammar's output back, delete `.code-graph/index.db*` after pinning.
@@ -6522,7 +6522,7 @@ wc -l`, `| xargs …`, a glob path) were denied. The rewritten call is
 auto-allowed (your deny/ask rules still apply to it). To keep the old deny:
 `CODE_GRAPH_NO_ANSWER_IN_DENY=1` gives the static deny with its old scope, and
 `CODE_GRAPH_NO_BLOCK_GREP=1` stops interception entirely. To pin back: `npm i -g
-@sdsrs/code-graph@0.153.0`, or `cargo install code-graph-mcp --version 0.153.0`;
+@sdsrs/code-graph@0.153.0`, or `cargo install --git https://github.com/sdsrss/code-graph-mcp --tag v0.153.0`;
 plugin users can set the version in the marketplace entry.
 
 ### An intercepted grep no longer prints a red `Error`
@@ -6654,7 +6654,7 @@ method used to be dropped and now is not; a markdown heading that used to be the
 answer is now excluded from that result and remains reachable as
 `show <Class.method> --file <the-doc>.md`. A script parsing `show --json` for a
 dotted symbol sees a different array. To pin back: `npm i -g @sdsrs/code-graph@0.152.0`,
-or `cargo install code-graph-mcp --version 0.152.0`; plugin users can set the
+or `cargo install --git https://github.com/sdsrss/code-graph-mcp --tag v0.152.0`; plugin users can set the
 version in the marketplace entry.
 
 ### `show Class.method` answered with the doc heading and the test, never the method
@@ -6762,7 +6762,7 @@ extraction fingerprint is byte-identical. The change is additive: `refs`,
 `callgraph` and `impact`, and the MCP tools `find_references`, `get_ast_node` and
 `get_call_graph`, now accept a qualified name (`Alpha.helper`) where before only a
 bare one resolved. To pin back: `npm i -g @sdsrs/code-graph@0.151.0`, or
-`cargo install code-graph-mcp --version 0.151.0`; plugin users can set the version
+`cargo install --git https://github.com/sdsrss/code-graph-mcp --tag v0.151.0`; plugin users can set the version
 in the marketplace entry.
 
 **Three envelopes move, and a script keying on any of them will see it.**
@@ -6992,7 +6992,7 @@ is the worse trade by a wide margin. An earlier draft of this paragraph called
 the absent key "the correct answer"; it is the available one.
 
 **To pin back:** `npm i -g @sdsrs/code-graph@0.150.0`, or `cargo install
-code-graph-mcp --version 0.150.0`; plugin users can set the version in the
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.150.0`; plugin users can set the version in the
 marketplace entry. Nothing written by this release needs removing first — the
 `meta` row is ignored by older binaries, and the teardown tombstone it reads is
 unchanged from 0.149.0.
@@ -7081,7 +7081,7 @@ works today gets slower — but on a large repository a CJK search that finds
 nothing now costs tens to a few hundred milliseconds instead of ~0.1 ms.
 
 To pin back: `npm i -g @sdsrs/code-graph@0.149.0`, or `cargo install
-code-graph-mcp --version 0.149.0`; plugin users can set the version in the
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.149.0`; plugin users can set the version in the
 marketplace entry. Pinning back restores the silent empty described below.
 
 ### A CJK word inside an unspaced phrase was indexed but unreachable
@@ -7164,7 +7164,7 @@ changes is what `uninstall` leaves behind, and it only shows up if you tear the
 plugin down within the first seconds of a session.
 
 To pin back: `npm i -g @sdsrs/code-graph@0.148.0`, or `cargo install
-code-graph-mcp --version 0.148.0`; plugin users can set the version in the
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.148.0`; plugin users can set the version in the
 marketplace entry. Pinning back restores the 41 MB residue described below.
 
 ### A teardown no longer loses the race to an in-flight auto-update
@@ -7224,7 +7224,7 @@ word. `claude plugin details code-graph-mcp` is where to confirm it —
 `Skills (2)`, previously `Skills (0)`.
 
 To pin back: `npm i -g @sdsrs/code-graph@0.147.0`, or `cargo install
-code-graph-mcp --version 0.147.0`; plugin users can set the version in the
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.147.0`; plugin users can set the version in the
 marketplace entry. Pinning back re-hides the two skills and restores the
 first-install crash below.
 
@@ -7351,7 +7351,7 @@ happens automatically on the next index run. Nothing migrates, no flag or exit
 code changes, and no data is lost.
 
 To pin back: `npm i -g @sdsrs/code-graph@0.146.0`, or `cargo install
-code-graph-mcp --version 0.146.0`; plugin users can set the version in the
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.146.0`; plugin users can set the version in the
 marketplace entry. Pinning back keeps the old index as-is — the missing edges
 below simply stay missing.
 
@@ -7418,7 +7418,7 @@ or exit code changes, `INDEX_VERSION` stays at 70 so no index rebuilds, and the
 one other visible difference is extra `[repair]` log lines described below.
 
 To pin back: `npm i -g @sdsrs/code-graph@0.145.1`, or `cargo install
-code-graph-mcp --version 0.145.1`; plugin users can set the version in the
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.145.1`; plugin users can set the version in the
 marketplace entry. Nothing migrates in either direction.
 
 Four items from the 2026-09-07 audit queue. What they share is the reason they
@@ -7526,7 +7526,7 @@ startup banner, and the same text prefixed `Plugin ` with the source appended in
 the debug log. The key is gone.
 
 To pin back: `npm i -g @sdsrs/code-graph@0.145.0`, or `cargo install
-code-graph-mcp --version 0.145.0`; plugin users can set the version in the
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.145.0`; plugin users can set the version in the
 marketplace entry. Nothing migrates in either direction.
 
 ### The warning was noise, and the hooks were never dark
@@ -7590,7 +7590,7 @@ a global `core.excludesFile`, say — and you would rather the tool never touche
 0.144.0.
 
 To pin back: `npm i -g @sdsrs/code-graph@0.144.0`, or `cargo install
-code-graph-mcp --version 0.144.0`; plugin users can set the version in the
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.144.0`; plugin users can set the version in the
 marketplace entry. Nothing migrates in either direction. `INDEX_VERSION` stays
 at 70.
 
@@ -7659,7 +7659,7 @@ and the measurement. `code-graph-mcp stats` readers: one follow-up rate shifts,
 also described below.
 
 To pin back: `npm i -g @sdsrs/code-graph@0.143.0`, or `cargo install
-code-graph-mcp --version 0.143.0`; plugin users can set the version in the
+--git https://github.com/sdsrss/code-graph-mcp --tag v0.143.0`; plugin users can set the version in the
 marketplace entry. Reverting restores the old deny behaviour and removes the
 launcher from PATH — nothing migrates in either direction. `INDEX_VERSION` is
 not bumped and no index needs rebuilding.
@@ -7794,8 +7794,8 @@ Two supporting changes, neither user-visible on its own:
 **Upgrading:** nothing to do. `INDEX_VERSION` is not bumped and no index needs
 rebuilding — this changes how much memory a run holds, not what it produces, and
 that is verified rather than asserted (see below). To pin back to the previous
-release: `npm i -g @sdsrs/code-graph@0.142.0`, or `cargo install code-graph-mcp
---version 0.142.0`; plugin users can set the version in the marketplace entry.
+release: `npm i -g @sdsrs/code-graph@0.142.0`, or `cargo install --git https://github.com/sdsrss/code-graph-mcp
+--tag v0.142.0`; plugin users can set the version in the marketplace entry.
 Reverting only restores the old memory profile — no index or config migration is
 involved in either direction.
 
@@ -11998,7 +11998,7 @@ repairs two independent reviews of the batch itself turned up.
   `Array.isArray(payload)` must read `payload.results` instead. Nothing in this
   repo relied on the array shape.
 - **Reverting:** pin the prior release — `npm install -g @sdsrs/code-graph@0.116.0`
-  (or `cargo install code-graph-mcp --version 0.116.0`). Downgrading never wipes
+  (or `cargo install --git https://github.com/sdsrss/code-graph-mcp --tag v0.116.0`). Downgrading never wipes
   an index: the `INDEX_VERSION` comparison is directional, so a 0.116.0 binary
   reads a 61-stamped index without destroying it, and only re-stamps on upgrade.
 
@@ -17038,7 +17038,7 @@ read existing edge data; no extraction change). Adopted from a competitive scan 
 codes — **0 = matched, 1 = no match, 2 = error/usage** (previously: 0 on no-match,
 1 on most errors). Scripts that treated any nonzero exit as failure must distinguish
 1 (no match) from 2 (trouble). Revert path: pin the previous version
-(`npm i @sdsrs/code-graph@0.49.0` / `cargo install code-graph-mcp --version 0.49.0`).
+(`npm i @sdsrs/code-graph@0.49.0` / `cargo install --git https://github.com/sdsrss/code-graph-mcp --tag v0.49.0`).
 The bundled hook consumer (`cg-answer.js`) is updated in the same release and accepts
 both old and new shapes.
 
