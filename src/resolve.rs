@@ -1450,6 +1450,11 @@ mod fuzzy_tests {
              p3/app.py, p4/app.py, p5/app.py and 2 more). To list its symbols, use \
              module_overview with path \"p1/app.py\"."
         );
+        assert!(
+            file_path_message("app.py", &paths, Surface::Cli)
+                .ends_with("To list its symbols, run `code-graph-mcp overview p1/app.py`."),
+            "the CLI hint names the first path"
+        );
     }
 
     /// D#426 (7): only the whitespace around a name goes; inside it stays, and

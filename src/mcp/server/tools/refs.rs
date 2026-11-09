@@ -65,8 +65,9 @@ impl McpServer {
 
         // The symbol CLI `refs` selects (`resolve::select_symbol`): an exact
         // qualified name, several of them (refused), an indexed file's path
-        // (refused, D#456), or a name to look up. Any other dotted name
-        // nothing is qualified-named is its last part (D#435).
+        // (refused, D#456), or a name to look up: a dotted name some node has
+        // is kept, and otherwise, without a file_path, it is its last part
+        // (D#435).
         let selection = match symbol_name_arg {
             Some(name) if node_id.is_none() => {
                 match crate::resolve::select_symbol(self.db.conn(), name, file_path)? {

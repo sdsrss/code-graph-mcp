@@ -12185,9 +12185,9 @@ fn a_file_path_is_not_a_symbol() {
     let project = setup_two_file_qualified_project();
 
     for cmd in ["refs", "callgraph", "impact"] {
-        let (stdout, _, code) = run_cli(&project, &[cmd, "one.py", "--json"]);
-        assert_ne!(
-            code, 0,
+        let (stdout, stderr, code) = run_cli(&project, &[cmd, "one.py", "--json"]);
+        assert_eq!(
+            code, 1,
             "{cmd} must not answer for a file path passed as a symbol: {stdout}"
         );
         let out: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_default();
@@ -12200,35 +12200,29 @@ fn a_file_path_is_not_a_symbol() {
             "{cmd} must not emit a risk verdict for an input it did not resolve: {out}"
         );
         // D#456: the refusal says it is a file and how to list its symbols,
-        // inside the command's own empty answer, as the 0.190.0 notes say.
-        assert_eq!(
-            out["error"],
-            "'one.py' is a file path, not a symbol (indexed: one.py). \
-             To list its symbols, run `code-graph-mcp overview one.py`.",
-            "{cmd}: {out}"
+        // on stderr and inside the command's own empty answer, as the 0.190.0
+        // notes say.
+        let message = "'one.py' is a file path, not a symbol (indexed: one.py). \
+                       To list its symbols, run `code-graph-mcp overview one.py`.";
+        assert!(
+            stderr.contains(&format!("[code-graph] {message}")),
+            "{cmd}: {stderr}"
         );
-        assert_eq!(out["symbol"], "one.py", "{cmd}: {out}");
-        assert_eq!(out["files"], serde_json::json!(["one.py"]), "{cmd}: {out}");
-        let mut keys: Vec<&str> = out
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        let envelope: &[&str] = match cmd {
-            "callgraph" => &["error", "files", "results", "symbol"],
-            "refs" => &[
-                "by_relation",
-                "error",
-                "files",
-                "references",
-                "symbol",
-                "total_references",
-            ],
-            _ => &["error", "files", "symbol"],
-        };
-        assert_eq!(keys, envelope, "{cmd}: {out}");
+        let mut want = serde_json::json!({
+            "error": message,
+            "symbol": "one.py",
+            "files": ["one.py"],
+        });
+        match cmd {
+            "callgraph" => want["results"] = serde_json::json!([]),
+            "refs" => {
+                want["references"] = serde_json::json!([]);
+                want["by_relation"] = serde_json::json!({});
+                want["total_references"] = serde_json::json!(0);
+            }
+            _ => {}
+        }
+        assert_eq!(out, want, "{cmd}");
     }
 
     // Control: a real qualified name in the same index still resolves, so the

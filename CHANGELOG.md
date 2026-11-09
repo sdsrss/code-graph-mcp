@@ -39,10 +39,13 @@ extension. What came back depended on what the index held under that name
 
 Now a name that is an indexed file's path, or ends one right after a `/`
 (`app.py`, `./src/app.py`, `lib.rs`), with one leading `./` dropped and case
-and separators as indexed, gets the same answer on all six. A qualified name
-a definition has still names it (with a method `py` in `class app` and a
-file `app.py`, `refs app.py` answers for the method), and a Markdown heading
-with that name hides the file (Not covered). The answer:
+and separators as indexed, gets the same answer on all six when no file
+selector is given. A qualified name a definition has still names it (with a
+method `py` in `class app` and a file `app.py`, `refs app.py` answers for
+the method), a Markdown heading with that name can hide the file (Not
+covered), and with `--file` (MCP: `file_path`) the answer is the selector's
+miss, as in 0.189.0 (`refs src/app.py --file src/app.py`: "Symbol
+'src/app.py' not found in file 'src/app.py'.", exit 1). The answer:
 "'app.py' is a file path, not a symbol (indexed: pkg/app.py, src/app.py). To
 list its symbols, run `code-graph-mcp overview pkg/app.py`." (the MCP tools:
 "use module_overview with path …"). The CLI exits 1, and with `--json`
@@ -53,7 +56,7 @@ return it as an error. On the same fixture, `tools.rs` where the file is
 qualified name a definition has, answers as before.
 
 One answer that was right is now refused: a dotted name naming a member,
-where a file anywhere in the tree has that name. With `class Response` and
+where an indexed file anywhere in the tree has that name. With `class Response` and
 its method `json` called as `response.json()` in `src/client.py`, and a
 file `tests/fixtures/response.json`, `refs response.json` answered for
 `json` in 0.189.0 (the caller `fetch`, exit 0) and is now refused as that
@@ -90,11 +93,13 @@ marker still gets it). (D#346)
   absolute path, `src\app.py`, `App.py`, `././src/app.py`, `src//app.py`,
   `../lib/conf.js`, and `src/app.py:1` (noted as "Resolved 'py:1' → 'py'").
   So do files the index does not hold: `refs Cargo.toml` answered for
-  `toml`, and a `.py` file created since the last index answered for `py`
-  (the call did not index it).
-- A Markdown heading with a file's name hides the file: with `## solo.go`
-  in README.md and `cmd/solo.go` indexed, `refs solo.go` says "No references
-  found for 'solo.go'.", as 0.189.0 did.
+  `toml`, and where a function `py` exists, a `.py` file created since the
+  last index answered for `py` (the call did not index it). Where nothing
+  is named `py`, the call indexed the new file and refused it as a file.
+- A Markdown heading with a file's name hides the file when no code defines
+  the name's last part: with `## solo.go` in README.md and `cmd/solo.go`
+  indexed, `refs solo.go` says "No references found for 'solo.go'.", as
+  0.189.0 did. Add a `def go()` anywhere and it is refused as the file.
 - `rebuild-index` builds into `.code-graph/index.db.rebuild-<pid>`, longer
   than `index.db` by 9 bytes plus the PID's digits, so it needs a shorter
   root than indexing does. At a 470-byte root `incremental-index` succeeded

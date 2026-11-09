@@ -2403,8 +2403,7 @@ mod tests {
             msg.contains("unable to open database file"),
             "SQLite's own error stays in the chain: {msg}"
         );
-        // The read-only open (secondary MCP instances, `snapshot inspect`)
-        // names the same cause.
+        // The read-only open names the same cause.
         let err = Database::open_readonly_named(&path_of_len(505))
             .err()
             .expect("SQLite refuses 505 bytes read-only too");
