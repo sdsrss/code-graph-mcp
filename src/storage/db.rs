@@ -261,9 +261,16 @@ impl Database {
     /// SQLite's error for an over-long database path is a bare "unable to open
     /// database file". When that is the cause, say so (D#673).
     fn explain_open_error(path: &Path, e: rusqlite::Error) -> anyhow::Error {
-        let bytes = std::path::absolute(path)
-            .map(|p| p.as_os_str().len())
-            .unwrap_or_else(|_| path.as_os_str().len());
+        // SQLite resolves symlinks in the name it opens (unixFullPathname), so
+        // measure the resolved path: macOS reaches its temp dir through
+        // `/var` -> `/private/var`, 8 bytes longer than the name as typed.
+        let resolved = path
+            .parent()
+            .and_then(|dir| std::fs::canonicalize(dir).ok())
+            .zip(path.file_name())
+            .map(|(dir, name)| dir.join(name))
+            .or_else(|| std::path::absolute(path).ok());
+        let bytes = resolved.map_or(path.as_os_str().len(), |p| p.as_os_str().len());
         if cfg!(unix)
             && bytes > SQLITE_MAX_DB_PATH_BYTES
             && e.sqlite_error_code() == Some(rusqlite::ErrorCode::CannotOpen)
@@ -2364,9 +2371,12 @@ mod tests {
     #[test]
     fn an_over_long_index_path_is_named_as_the_cause() {
         let tmp = TempDir::new().unwrap();
-        // `<tmp>/<pad>/.../index.db`, exactly `len` bytes, components ≤ 150.
+        // SQLite measures the path with symlinks resolved (macOS's temp dir is
+        // under `/var` -> `/private/var`), so build from the resolved dir.
+        let base = tmp.path().canonicalize().unwrap();
+        // `<base>/<pad>/.../index.db`, exactly `len` bytes, components ≤ 150.
         let path_of_len = |len: usize| {
-            let mut dir = tmp.path().join(format!("L{len}"));
+            let mut dir = base.join(format!("L{len}"));
             let mut remaining = len - dir.as_os_str().len() - "/index.db".len();
             while remaining > 0 {
                 let take = if remaining > 151 { 150 } else { remaining - 1 };
@@ -2392,6 +2402,26 @@ mod tests {
         assert!(
             msg.contains("unable to open database file"),
             "SQLite's own error stays in the chain: {msg}"
+        );
+
+        // A short name whose symlinked directory resolves to 510 bytes: SQLite
+        // refuses it, and the cause names the resolved length, not the typed one.
+        let real_dir = path_of_len(510).parent().unwrap().to_path_buf();
+        let link = base.join("s");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+        let typed = link.join("index.db");
+        assert!(
+            typed.as_os_str().len() < 504,
+            "fixture: {}",
+            typed.display()
+        );
+        let err = Database::open(&typed)
+            .err()
+            .expect("SQLite resolves the link and refuses the 510-byte name");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("is 510 bytes") && msg.contains("at most 504"),
+            "the cause names the resolved length: {msg}"
         );
     }
 
