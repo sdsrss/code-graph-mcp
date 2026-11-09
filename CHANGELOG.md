@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### fix: `adopt` stops printing a heal and a git-tracked note on every refresh
+
+Re-running `adopt` over a block written by an older plugin version printed
+"Healed a malformed prior block." although it was an ordinary refresh, and
+every `adopt` printed "CLAUDE.md is git-tracked — commit the block …" whether
+or not git tracked the file. The heal line now appears only when a stray
+marker line was removed, and the git line only when `git ls-files` lists
+CLAUDE.md. (D#346)
+
 ## 0.189.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 138 → 139

@@ -379,13 +379,17 @@ function stripAndHealSeams(text, re) {
 // start a match at a marker we cannot prove we wrote, and when in doubt delete
 // less. A stale block left behind is visible and removable; deleted prose is not.
 function stripSentinelBlock(text) {
-  // Line-anchored. A marker mentioned mid-sentence ("the block starts with
-  // `<!-- code-graph-mcp:begin v2 -->` — don't edit inside it") is prose, not a
-  // block opener; matching it ate everything from that sentence to the end of
-  // the real block below it.
-  const BEGIN_LINE = `^[ \\t]*${SENTINEL_BEGIN_SRC}[ \\t]*$`;
-  const END_LINE = `^[ \\t]*${escapeRegex(SENTINEL_END)}[ \\t]*$`;
+  return stripOrphanMarkers(stripWellFormedBlocks(text));
+}
 
+// Line-anchored. A marker mentioned mid-sentence ("the block starts with
+// `<!-- code-graph-mcp:begin v2 -->` — don't edit inside it") is prose, not a
+// block opener; matching it ate everything from that sentence to the end of
+// the real block below it.
+const BEGIN_LINE = `^[ \\t]*${SENTINEL_BEGIN_SRC}[ \\t]*$`;
+const END_LINE = `^[ \\t]*${escapeRegex(SENTINEL_END)}[ \\t]*$`;
+
+function stripWellFormedBlocks(text) {
   // Match ANY begin version (v1 legacy MEMORY.md block, v2 CLAUDE.md block) so a
   // single strip handles both the new target and the legacy migration cleanup.
   //
@@ -397,7 +401,12 @@ function stripSentinelBlock(text) {
     `${BEGIN_LINE}(?:(?!${SENTINEL_BEGIN_SRC})[\\s\\S])*?${END_LINE}\\n?`,
     'gm'
   );
-  let out = stripAndHealSeams(text, wellFormed);
+  return stripAndHealSeams(text, wellFormed);
+}
+
+// Runs after stripWellFormedBlocks, so every marker line left is an orphan.
+// What this removes is the only thing adopt reports as "healed".
+function stripOrphanMarkers(text) {
   // Orphan BEGIN with no matching END (truncation / partial edit): remove the
   // MARKER LINE ONLY, never the content after it.
   //
@@ -416,7 +425,7 @@ function stripSentinelBlock(text) {
   // line-anchored BEGIN *and* END, so a leftover fragment does not block
   // re-adoption — the next adopt writes a fresh, well-formed block.
   const orphanBegin = new RegExp(`${BEGIN_LINE}\\n?`, 'gm');
-  out = stripAndHealSeams(out, orphanBegin);
+  let out = stripAndHealSeams(text, orphanBegin);
   // Orphan END line by itself — same rule, one line, nothing around it. Written
   // as the same line-anchored removal the other two passes use (the old
   // split/filter/join spelling was a third predicate for "is this our END line",
@@ -594,8 +603,11 @@ function adopt({ cwd, templatePath, home } = {}) {
     const registryRecorded = recordAdopted(effectiveCwd, home);
     return { ok: true, detailPath: dPath, claudeMdPath: cPath, detailWritten, claudeMdWritten: false, created: false, healed: false, registryRecorded };
   }
-  const cleaned = exists ? stripSentinelBlock(current) : '';
-  const healed = exists && cleaned !== current;
+  // Replacing a well-formed block (an older plugin version's) is a refresh;
+  // only removing an orphan marker line is a repair worth reporting.
+  const withoutBlocks = exists ? stripWellFormedBlocks(current) : '';
+  const cleaned = stripOrphanMarkers(withoutBlocks);
+  const healed = cleaned !== withoutBlocks;
   const base = cleaned.replace(/\n+$/, '');
   const prefix = base ? base + '\n\n' : '';
   try {
@@ -911,6 +923,18 @@ function unadoptCommand() {
   return `node ${shellQuote(__filename)} unadopt`;
 }
 
+// `git ls-files --error-unmatch` exits 0 only for a path in the index. Every
+// failure (no git, not a repository, untracked, missing directory) reads as
+// "not tracked": the line this gates is advice to commit the file.
+function isGitTracked(file) {
+  try {
+    require('child_process').execFileSync('git',
+      ['ls-files', '--error-unmatch', '--', path.basename(file)],
+      { cwd: path.dirname(file), stdio: 'ignore', timeout: 5000, windowsHide: true });
+    return true;
+  } catch { return false; }
+}
+
 function formatResult(action, result) {
   if (!result.ok && result.reason === 'windows-not-supported') {
     return '[code-graph] adopt/unadopt are POSIX-only on this build. ' +
@@ -946,8 +970,10 @@ function formatResult(action, result) {
     else lines.push('[code-graph] CLAUDE.md block already up-to-date — no write');
     if (result.healed) lines.push('[code-graph] Healed a malformed prior block.');
     lines.push(`[code-graph] Detail table → ${result.detailPath}`);
-    lines.push('[code-graph] CLAUDE.md is git-tracked — commit the block, or gitignore');
-    lines.push('[code-graph]   .claude/plugin_code_graph_mcp.md (a generated copy) as you prefer.');
+    if (isGitTracked(result.claudeMdPath)) {
+      lines.push('[code-graph] CLAUDE.md is git-tracked — commit the block, or gitignore');
+      lines.push('[code-graph]   .claude/plugin_code_graph_mcp.md (a generated copy) as you prefer.');
+    }
     lines.push(`[code-graph] Reverse:  ${unadoptCommand()}`);
     lines.push('[code-graph] Opt out:  CODE_GRAPH_NO_AUTO_ADOPT=1 in ~/.claude/settings.json env');
     return lines.join('\n');

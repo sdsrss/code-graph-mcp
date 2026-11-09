@@ -171,8 +171,8 @@ test('the block spends only the bare name — no cache-path fallback', () => {
 
 // The counterweight to the test above: the obvious way to make the block
 // "always correct" is to resolve the binary at adopt time and write the answer
-// in. That is wrong here — adopt.js:864 tells the user CLAUDE.md is git-tracked
-// and to commit it, so a resolved path is right on exactly one machine and
+// in. That is wrong here — the adopt printer tells a user whose CLAUDE.md git
+// tracks to commit it, so a resolved path is right on exactly one machine and
 // re-written on every other one's next SessionStart (buildBlock's determinism
 // is what needsRefresh diffs against). The block may name a path SHAPE only.
 test('the block stays machine-independent — no resolved home path', () => {
@@ -316,6 +316,44 @@ test('adopt heals a malformed prior block (orphan BEGIN) and preserves neighbors
       'guessing whose text it is, and that guess destroyed user prose');
     assert.ok(!cmd.split('\n').slice(0, 6).some(l => l.trim() === SENTINEL_BEGIN),
       'but the orphan marker line itself is gone, so the fragment is inert');
+  } finally { sb.cleanup(); }
+});
+
+// D#346: replacing a well-formed block from an older plugin version is a refresh,
+// not a repair. `healed` was `cleaned !== current`, true whenever ANY block was
+// stripped, so every refresh printed "Healed a malformed prior block."
+test('refreshing a well-formed older block is not reported as healed', () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(sb.claudeMd,
+      `# Project\n\n${SENTINEL_BEGIN}\n- an older version of the block\n${SENTINEL_END}\n`);
+    const res = adopt({ cwd: sb.cwd });
+    assert.strictEqual(res.claudeMdWritten, true, 'the older block was replaced');
+    assert.strictEqual(res.healed, false, 'a well-formed block is refreshed, not healed');
+    assert.ok(!formatResult('adopt', res).includes('Healed'));
+  } finally { sb.cleanup(); }
+});
+
+// D#346: the "CLAUDE.md is git-tracked — commit the block" advice was printed
+// for every project, including ones whose CLAUDE.md git does not track.
+test('the adopt printer claims git-tracked only when git tracks CLAUDE.md', () => {
+  const { execFileSync } = require('child_process');
+  const sb = makeSandbox();
+  try {
+    const res = adopt({ cwd: sb.cwd });
+    // makeSandbox's `.git` is an empty directory, not a repository.
+    assert.ok(!formatResult('adopt', res).includes('git-tracked'),
+      'not a repository: no git-tracked claim');
+
+    fs.rmSync(path.join(sb.cwd, '.git'), { recursive: true });
+    const git = (...args) => execFileSync('git', ['-C', sb.cwd, ...args], { stdio: 'ignore' });
+    git('init', '-q');
+    assert.ok(!formatResult('adopt', res).includes('git-tracked'),
+      'a repository that does not track CLAUDE.md: no git-tracked claim');
+
+    git('add', 'CLAUDE.md');
+    assert.ok(formatResult('adopt', res).includes('git-tracked'),
+      'CLAUDE.md in the index: the advice is printed');
   } finally { sb.cleanup(); }
 });
 
