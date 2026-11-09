@@ -1,41 +1,79 @@
 # Changelog
 
-## Unreleased
+## 0.190.0
 
-### fix: `adopt` stops printing a heal and a git-tracked note on every refresh
-
-Re-running `adopt` over a block written by an older plugin version printed
-"Healed a malformed prior block." although it was an ordinary refresh, and
-every `adopt` printed "CLAUDE.md is git-tracked — commit the block …" whether
-or not git tracked the file. The heal line now appears only when a stray
-marker line was removed, and the git line only when `git ls-files` lists
-CLAUDE.md. (D#346)
-
-### fix: a project path too long for SQLite says so
-
-SQLite opens a database path of at most 504 bytes, so a project whose root
-is longer than 483 bytes (`<root>/.code-graph/index.db`) cannot be indexed.
-`incremental-index` there exited 1 with only "unable to open database file".
-It now names the cause first: "the index database path is 600 bytes; SQLite
-opens a database path of at most 504 bytes … Move the project to a shorter
-path." (measured on a 579-byte root). The limit itself is unchanged. (D#673)
+**Upgrading: no index rebuild.** `INDEX_VERSION` stays 139. Two answers
+change for scripts and MCP clients. A file path given where a symbol is
+expected (`refs app.py`, or MCP `get_call_graph` with `symbol_name:
+"app.py"`) is refused as a file: the CLI exits 1 where it could exit 0 with
+an answer for a definition named like the extension, and the MCP tools
+return an error (below). And a project path too long for SQLite now says so.
+To pin the binary back: `npm i -g @sdsrs/code-graph@0.189.0` (or, from
+source, `cargo install --locked --git https://github.com/sdsrss/code-graph-mcp
+--tag v0.189.0 --features embed-model`), then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The `adopt`
+change is in the plugin's script, which pinning the binary does not reach;
+it changes only the lines `adopt` prints.
 
 ### fix: a file path given as a symbol is answered as a file
 
 `refs`, `callgraph` and `impact`, and MCP `get_call_graph`,
-`find_references` and `get_ast_node`, took a dotted name nothing is
-qualified-named by its last part, so a file path became its extension:
-`get_call_graph app.py` answered for a function named `py`, `refs
-src/resolve.rs` listed seven functions near the name `rs`. A name that is an
-indexed file's path, or ends one after a `/` (`app.py`, `./src/app.py`,
-`lib.rs`), now gets "'app.py' is a file path, not a symbol (indexed:
-pkg/app.py, src/app.py). To list its symbols, run `code-graph-mcp overview
-pkg/app.py`" (MCP: "use module_overview"); the CLI exits 1 and its `--json`
-carries `error`, `symbol`, `files` in the command's usual empty answer, and
-the MCP tools return an error. A dotted name that is not an indexed file
-(`tools.rs` where the file is `tools.py`) still falls back to its last part,
-and a name a definition is qualified-named (`Database.open`) is unchanged.
-(D#456)
+`find_references` and `get_ast_node`, read a dotted name that no definition
+is qualified-named as its last part, so a file path was looked up as its
+extension. What came back depended on what the index held under that name
+(measured on 0.189.0):
+
+- a definition named like the extension: an answer for it. `refs app.py`
+  answered for a function `py`, with "No definition is named 'app.py';
+  answering for 'py'." on stderr and exit 0; MCP `get_call_graph` with
+  `app.py` answered for `py` with the note "Resolved 'app.py' → 'py'."
+- only near names: `refs src/resolve.rs` in this repository said `rs` was
+  ambiguous among 7 matches (exit 1).
+- nothing: `refs cmd/solo.go` said "Symbol not found: go", and the MCP tools
+  said `cmd/solo.go` was not found in the index.
+
+Now a name that is an indexed file's path, or ends one right after a `/`
+(`app.py`, `./src/app.py`, `lib.rs`), gets the same answer on all six:
+"'app.py' is a file path, not a symbol (indexed: pkg/app.py, src/app.py). To
+list its symbols, run `code-graph-mcp overview pkg/app.py`." (the MCP tools:
+"use module_overview with path …"). The CLI exits 1, and with `--json`
+prints `error`, `symbol` and `files` inside the command's own empty answer
+(`results: []` for `callgraph`, `references: []` for `refs`); the MCP tools
+return it as an error. On the same fixture, `tools.rs` where the file is
+`tools.py` still answers for `rs` with the note, and `Store.get`, a
+qualified name a definition has, answers as before. (D#456)
+
+### fix: a project path too long for SQLite says so
+
+SQLite opens a database path of at most 504 bytes (on Linux: 504 opens, 505
+is refused), counting the path with symlinks resolved, so a project whose
+root resolves to more than 483 bytes (`<root>/.code-graph/index.db`) cannot
+be indexed. `incremental-index` there exited 1 with SQLite's "unable to open
+database file" and no cause. It now says first: "the index database path is
+608 bytes; SQLite opens a database path of at most 504 bytes (its 512-byte
+limit less the 8 bytes of `-journal`). Move the project to a shorter path."
+(a 587-byte root). The limit itself is unchanged. (D#673)
+
+### fix: `adopt` prints a heal and a git-tracked note only when they hold
+
+`adopt` printed "CLAUDE.md is git-tracked — commit the block, or gitignore
+…" on every successful run, whether or not git tracked the file, and
+"Healed a malformed prior block." when it replaced a well-formed block from
+an older plugin version, which is an ordinary refresh. The git note now
+appears only when `git ls-files` lists CLAUDE.md, and the heal line only
+when a stray marker line was removed (a block cut short after its opening
+marker still gets it). (D#346)
+
+### Not covered
+
+- An absolute path (`refs /home/me/proj/src/app.py`) is not recognised as
+  a file: it still falls back to its last part, as in 0.189.0 (measured:
+  it answered for `py` with the stderr note).
+- The GitHub Release pages of 0.49.0, 0.116.0 and 0.142.0–0.165.2 still
+  tell readers to `cargo install code-graph-mcp --version X`; no such crate
+  exists on crates.io. This file's copies of those entries now name the git
+  tag instead.
 
 ## 0.189.0
 
