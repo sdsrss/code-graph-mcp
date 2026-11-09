@@ -1,0 +1,32 @@
+{
+  "prompt": "I'm about to change the signature of `subprocess.Popen.wait` - the method `def wait(self, timeout=None)` in subprocess.py. List every call site in this repository that calls this method, so I can update each one. Include only calls that reach `subprocess.Popen.wait`, not the `wait` methods of other classes. Finish with a section headed `CALL SITES` listing one `path:line` per line (paths relative to the repository root).",
+  "target": "subprocess.Popen.wait",
+  "defined_at": "subprocess.py:1274",
+  "corpus": "/usr/lib/python3.14 copy (stdlib recipe in memory project_python_stdlib_oracle_corpus), 569 .py files",
+  "scip_gold": [
+    "_pyrepl/pager.py:157",
+    "ctypes/_aix.py:114",
+    "imaplib.py:1712",
+    "subprocess.py:1130",
+    "subprocess.py:1213",
+    "subprocess.py:2179",
+    "subprocess.py:398",
+    "subprocess.py:570",
+    "webbrowser.py:197",
+    "webbrowser.py:262"
+  ],
+  "adjudicated_extra": {
+    "subprocess.py:1240": "self.wait(...) inside class Popen (class starts at 759)",
+    "webbrowser.py:273": "p = subprocess.Popen(...) at 255; same p",
+    "webbrowser.py:387": "p = subprocess.Popen([\"kfmclient\", ...]) at 380; same p",
+    "os.py:1051": "os._wrap_close._proc is the subprocess.Popen os.popen creates"
+  },
+  "adjudicated_not": {
+    "multiprocessing/process.py:156": "self._popen is a multiprocessing popen_* object, not subprocess.Popen",
+    "multiprocessing/popen_fork.py:54": "popen_fork.Popen.wait",
+    "multiprocessing/popen_spawn_win32.py:124": "popen_spawn_win32.Popen.wait",
+    "asyncio/subprocess.py:202": "asyncio.subprocess.Process.wait",
+    "comments": "subprocess.py:401,574,1120,1224,2060 and asyncio/staggered.py:102-103 are comments"
+  },
+  "adjudication_method": "all 62 `git grep -nE '\\.wait\\('` hits read before any session ran"
+}
