@@ -20,6 +20,11 @@ static VEC_INIT: Once = Once::new();
 /// <https://www.sqlite.org/fileformat.html#magic_header_string>
 const SQLITE_HEADER_SIZE: u64 = 100;
 
+/// The longest database path SQLite's unix VFS opens: `mxPathname` is 512 and
+/// the pager refuses a name whose `-journal` (8 more bytes) would not fit.
+/// Measured: 504 opens, 505 is CANTOPEN (D#673).
+const SQLITE_MAX_DB_PATH_BYTES: usize = 504;
+
 /// Marker in the reader-side corruption error. Matched by
 /// [`Database::is_corrupt_index_error`] so `health-check` can tell a corrupt
 /// index apart from every other open failure without a bespoke error type
@@ -128,7 +133,8 @@ impl Database {
         register_sqlite_vec();
         // A path, never a URI or `:memory:` (D#638; see `sqlite_file_name`).
         let path = sqlite_file_name(path);
-        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| Self::explain_open_error(&path, e))?;
         // PRAGMA query_only is belt-and-suspenders on top of the flag —
         // any accidental write attempt errors out at the SQL layer.
         conn.execute_batch(
@@ -252,6 +258,25 @@ impl Database {
         }
     }
 
+    /// SQLite's error for an over-long database path is a bare "unable to open
+    /// database file". When that is the cause, say so (D#673).
+    fn explain_open_error(path: &Path, e: rusqlite::Error) -> anyhow::Error {
+        let bytes = std::path::absolute(path)
+            .map(|p| p.as_os_str().len())
+            .unwrap_or_else(|_| path.as_os_str().len());
+        if cfg!(unix)
+            && bytes > SQLITE_MAX_DB_PATH_BYTES
+            && e.sqlite_error_code() == Some(rusqlite::ErrorCode::CannotOpen)
+        {
+            return anyhow::Error::new(e).context(format!(
+                "the index database path is {bytes} bytes; SQLite opens a database path \
+                 of at most {SQLITE_MAX_DB_PATH_BYTES} bytes (its 512-byte limit less the \
+                 8 bytes of `-journal`). Move the project to a shorter path."
+            ));
+        }
+        e.into()
+    }
+
     /// The reader-side corruption verdict. Carries the remedy in the message
     /// because every read command surfaces this string verbatim, and "file is
     /// not a database" on its own tells the user nothing they can act on.
@@ -312,7 +337,7 @@ impl Database {
         // Always register sqlite-vec extension (it's process-global anyway via auto_extension)
         register_sqlite_vec();
 
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(path).map_err(|e| Self::explain_open_error(path, e))?;
 
         conn.execute_batch(
             "
@@ -2330,6 +2355,46 @@ mod tests {
     // pre-commit + CI test gate fails the build instead of a user's first open.
     // Set comparison by column name (NOT ordered): ALTER ADD COLUMN always
     // appends, so column order legitimately differs between the two paths.
+    /// D#673: SQLite refuses a database path over 504 bytes (the unix VFS takes
+    /// 512 and the pager needs room for `-journal`), and the bare "unable to
+    /// open database file" left a project whose index could never be built with
+    /// no stated cause. The lengths are literals, not the constant, so a drifted
+    /// constant fails here.
+    #[cfg(unix)]
+    #[test]
+    fn an_over_long_index_path_is_named_as_the_cause() {
+        let tmp = TempDir::new().unwrap();
+        // `<tmp>/<pad>/.../index.db`, exactly `len` bytes, components ≤ 150.
+        let path_of_len = |len: usize| {
+            let mut dir = tmp.path().join(format!("L{len}"));
+            let mut remaining = len - dir.as_os_str().len() - "/index.db".len();
+            while remaining > 0 {
+                let take = if remaining > 151 { 150 } else { remaining - 1 };
+                dir.push("d".repeat(take));
+                remaining -= take + 1;
+            }
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("index.db");
+            assert_eq!(path.as_os_str().len(), len);
+            path
+        };
+
+        Database::open(&path_of_len(504)).expect("504 bytes is within SQLite's limit");
+
+        let err = Database::open(&path_of_len(505))
+            .err()
+            .expect("SQLite refuses 505 bytes");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("505 bytes") && msg.contains("at most 504"),
+            "the error must name the length as the cause: {msg}"
+        );
+        assert!(
+            msg.contains("unable to open database file"),
+            "SQLite's own error stays in the chain: {msg}"
+        );
+    }
+
     #[test]
     fn open_disables_mmap_to_avoid_sigbus_on_truncation() {
         // Regression guard for the snapshot_integration with-embed SIGBUS: sqlite

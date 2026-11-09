@@ -11,6 +11,15 @@ or not git tracked the file. The heal line now appears only when a stray
 marker line was removed, and the git line only when `git ls-files` lists
 CLAUDE.md. (D#346)
 
+### fix: a project path too long for SQLite says so
+
+SQLite opens a database path of at most 504 bytes, so a project whose root
+is longer than 483 bytes (`<root>/.code-graph/index.db`) cannot be indexed.
+`incremental-index` there exited 1 with only "unable to open database file".
+It now names the cause first: "the index database path is 600 bytes; SQLite
+opens a database path of at most 504 bytes … Move the project to a shorter
+path." (measured on a 579-byte root). The limit itself is unchanged. (D#673)
+
 ## 0.189.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 138 → 139
