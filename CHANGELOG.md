@@ -6,10 +6,12 @@
 A `.code-graph/index.db-journal` that SQLite would roll back into the index
 is now refused: the query commands, `health-check`, `incremental-index` and
 `reindex` exit 1 and the MCP server exits at start, with a message naming
-the file. Remove it and re-run. In a trace of index creation, `incremental-index`,
-`health-check`, `callgraph` and `rebuild-index`, code-graph-mcp wrote a
-rollback journal only while creating a new, empty database, and removed it,
-so an index it built is opened as before. Pinning back to 0.190.1 brings the rollback back: `npm i -g
+the file. Remove it and re-run. In a trace of index creation,
+`incremental-index`, `health-check`, `callgraph` and `rebuild-index`,
+code-graph-mcp wrote a rollback journal only while creating a new, empty
+database, and removed it, so an index it built is opened as before; the
+journal it leaves if it is killed at that moment is rolled back as in
+0.190.1 (below). Pinning back to 0.190.1 brings the rollback back: `npm i -g
 @sdsrs/code-graph@0.190.1` (or, from source, `cargo install --locked --git
 https://github.com/sdsrss/code-graph-mcp --tag v0.190.1 --features
 embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
@@ -28,9 +30,11 @@ Measured on 0.190.1 with an index of 9 files (103 nodes, 100 edges) and a
   281,474,976,645,120 bytes in apparent size (688,128 bytes allocated:
   sparse, Linux tmpfs) on one `health-check`, which went on to report
   `db_size_bytes` 622,592 and `healthy: true`. A plain copy of the grown file
-  (Python `shutil.copy`) wrote until an 18 GiB volume quota ran out. How much
-  a file system without sparse files allocates (NTFS by default) was not
-  measured.
+  (Python `shutil.copy`) wrote until an 18 GiB volume quota ran out. On ext4,
+  whose file size limit is 16 TiB, the pre-tag review measured a disk I/O
+  error for that journal instead, and 8,589,934,592 bytes apparent for one
+  recording 2,097,152 pages of 4,096 bytes. How much a file system without
+  sparse files allocates (NTFS by default) was not measured.
 - A journal recording 0 pages emptied the index: `health-check --json` went
   from 103 nodes to 0 (`healthy: false`), and the MCP server, started on it,
   built the whole index again.
@@ -42,9 +46,11 @@ roll the journal back, and refuses the open if it would:
 
 - The 18 query commands `--help` lists (`search` through `report`),
   `health-check`, `incremental-index` and `reindex` exit 1 with
-  `refusing to open <index.db>:
-  <index.db-journal> is a rollback journal SQLite would replay into the
-  index, … — remove it and re-run`. `health-check --json` answers
+  `refusing to open <index.db>: <index.db-journal> is a rollback journal
+  SQLite would replay into the index; … — remove it and re-run`.
+  `reindex --from-snapshot` exits 0 instead: it deletes the index and builds
+  a new one, and SQLite deletes the journal beside the new, empty database,
+  so nothing is rolled back. `health-check --json` answers
   `"reason": "refused"` with that message, the report a symlinked `index.db`
   gets, and the plugin's status line shows `code-graph: ✗ .code-graph
   refused (see health-check)`. `grep` answers from its text search instead.
@@ -55,6 +61,14 @@ roll the journal back, and refuses the open if it would:
 - A journal SQLite would not roll back is accepted as before: one whose
   first byte is zero, and one a live writer holds (a process creating the
   index at that moment; removing that one would fail its commit).
+- The journal code-graph-mcp itself leaves when it is killed while creating
+  a new index (a 4,096-byte database beside a journal recording 0 pages) is
+  rolled back as in 0.190.1: its playback can only empty a database that
+  holds no table yet, so it is let through when the database is at most one
+  page. Reproduced by killing `incremental-index` and `serve` at that point:
+  `health-check` then reports an empty index (0 nodes) and the next
+  `incremental-index` exits 0 with 103 nodes, as on 0.190.1. The same
+  journal beside an index of two pages or more is refused.
 - `rebuild-index --confirm` still rebuilds: it builds a new file and renames
   it into place, the journal stays, and the next command refuses until it
   is removed.
@@ -71,9 +85,12 @@ roll the journal back, and refuses the open if it would:
   edges with `healthy: true`, and `incremental-index` left it so. This and
   the `-wal` above need a rule about where `.code-graph/` came from (for
   instance, treating a `.code-graph` that git tracks as foreign); not decided.
-- If code-graph-mcp is killed while it creates a new index, the journal it
-  leaves beside that nearly empty database should be refused the same way
-  (from SQLite's code, not reproduced). Remove it and re-run.
+- If another process holds the database locked for longer than SQLite's
+  5-second busy wait while a hot journal sits beside it, the check gives up
+  and a later open can still roll the journal back: the pre-tag review
+  reproduced it with a lock held for 12 seconds (3 and 7 seconds were
+  refused). A file in a repository holds no lock; this takes a process on
+  the machine holding the database.
 
 ## 0.190.1
 
