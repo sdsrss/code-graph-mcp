@@ -13850,6 +13850,69 @@ fn test_cli_refuses_a_hot_journal_beside_the_index() {
     assert!(stdout.contains("validateToken"), "{stdout}");
 }
 
+/// D#775: an index the repository supplies can carry SQL of its own, and a
+/// trigger in it runs whenever code-graph-mcp writes. With the vendored
+/// sqlite-vec 0.1.6 two such calls killed the process instead of failing: on
+/// 0.191.0 `incremental-index` ended with "double free or corruption" (SIGABRT,
+/// `vec_distance_l2` frees a stack address when its second vector is bad) and
+/// with SIGSEGV (`vec_each` closes a cursor through a NULL cleanup). Each must
+/// now end the way any failing trigger does: the control arm's RAISE shows that
+/// this write reaches the trigger and what a trigger error exits with.
+#[test]
+fn test_cli_survives_vec_calls_planted_in_an_index_trigger() {
+    let run_with_trigger = |body: &str| {
+        let project = setup_indexed_project();
+        let db = project
+            .path()
+            .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+            .join("index.db");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER planted AFTER INSERT ON nodes BEGIN {body}; END;"
+            ))
+            .unwrap();
+        std::fs::write(
+            project.path().join("src/extra.ts"),
+            "export function extra(): number { return 1; }\n",
+        )
+        .unwrap();
+        let output = Command::new(binary_path())
+            .current_dir(project.path())
+            .args(["incremental-index", "--no-embed"])
+            .output()
+            .expect("failed to run binary");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.status, text)
+    };
+
+    let (control, text) = run_with_trigger("SELECT RAISE(ABORT, 'planted trigger fired')");
+    assert!(
+        text.contains("planted trigger fired"),
+        "the write must reach the trigger, or the arms below test nothing: {control:?} {text}"
+    );
+    let expected = control.code();
+    assert!(expected.is_some(), "{control:?} {text}");
+
+    for body in [
+        "SELECT vec_distance_l2('[1,2]', 'x')",
+        "SELECT value FROM vec_each('x')",
+    ] {
+        let (status, text) = run_with_trigger(body);
+        // Killed by a signal: `code()` is None on Unix; a Windows crash exits
+        // with an NTSTATUS, which differs from the control's code too.
+        assert_eq!(
+            status.code(),
+            expected,
+            "{body}: must fail like any trigger error, not crash: {status:?} {text}"
+        );
+    }
+}
+
 /// E2E 2026-10-16 (CLI-user QA, P0): on leveldb every `affected` answered
 /// "0 test file(s) to re-run" — `util/coding_test.cc` among them — because
 /// `is_test_path` knows no C/C++ test file naming. The gtest cases in those

@@ -6,13 +6,13 @@
 
 /// Upstream sqlite-vec release this vendored copy tracks. Bump together with the
 /// pinned hashes below when intentionally updating `vendor/sqlite-vec/`.
-const SQLITE_VEC_UPSTREAM_VERSION: &str = "v0.1.6";
+const SQLITE_VEC_UPSTREAM_VERSION: &str = "v0.1.9";
 /// blake3 of the LINE-NORMALIZED (CR-stripped) vendored sources, so the pin is
 /// stable regardless of the checkout's line endings (no .gitattributes needed).
 const SQLITE_VEC_C_BLAKE3: &str =
-    "daae6792a6ccd1b5d90275dd66e0a4443c8af57e96e760b205ba7a48e338fe1f";
+    "0302016b71a04baaa3bf1a34930fcf4e41e02d5f09c0283c92f52d3112fc7760";
 const SQLITE_VEC_H_BLAKE3: &str =
-    "0d66cd92b4ac128c33f25d95b7209f4aa78560e8f49544bccfc2f804307f4760";
+    "57b9c859a9f05bd08c48b1ad03c9b7e964269ab2311a31d101bc21974b3a1549";
 
 fn vendor_blake3(path: &str) -> String {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));

@@ -82,11 +82,12 @@ pub fn delete_node_vectors_batch(conn: &Connection, ids: &[i64]) -> Result<()> {
 
 /// `(live vectors, allocated slots)` in the sqlite-vec chunk allocator.
 ///
-/// sqlite-vec stores vectors in fixed-size chunks and only ever inserts into the
-/// NEWEST one (`vendor/sqlite-vec/sqlite-vec.c:3518`, `:7703-7716`); a DELETE
-/// clears a validity bit and the slot is never reused. So the allocated total is
-/// a high-water mark across every generation of the index, not a measure of what
-/// is stored now.
+/// sqlite-vec stores vectors in fixed-size chunks and inserts only into the
+/// NEWEST one, at its first free slot (`vendor/sqlite-vec/sqlite-vec.c:4199`,
+/// `:7872`). A DELETE clears a validity bit; since sqlite-vec v0.1.7 a chunk
+/// whose every slot is cleared is deleted (`:8721`), but a slot freed in an
+/// older chunk that still holds a live vector is never reused. So the allocated
+/// total runs ahead of what is stored now by every such stranded slot.
 pub fn vec_slot_occupancy(conn: &Connection) -> Result<(i64, i64)> {
     let live: i64 = conn.query_row("SELECT COUNT(*) FROM node_vectors_rowids", [], |r| r.get(0))?;
     let slots: i64 = conn.query_row(
@@ -108,10 +109,12 @@ fn allocated_vector_bytes(slots: i64) -> i64 {
 /// Every churn generation strands slots — an incremental re-index cascade-deletes
 /// a file's nodes (the `nodes_vectors_ad` trigger takes their vectors with them)
 /// and re-embeds under new node ids, `delete_node_vectors_batch` drops vectors
-/// for re-embedding, an INDEX_VERSION bump wipes the whole table. None of that
-/// space comes back, so `index.db` grows monotonically under churn: measured on
-/// this repo, 5,015 live vectors against 129,024 allocated slots (3.9%) and a
-/// 189 MB `node_vectors_vector_chunks00` holding ~7.7 MB of vectors.
+/// for re-embedding, an INDEX_VERSION bump wipes the whole table. Space comes
+/// back only when a whole chunk empties (sqlite-vec v0.1.7 and later); a chunk
+/// that keeps one live vector keeps all its slots. Measured on this repo with
+/// sqlite-vec v0.1.6, which reclaimed nothing: 5,015 live vectors against
+/// 129,024 allocated slots (3.9%) and a 189 MB `node_vectors_vector_chunks00`
+/// holding ~7.7 MB of vectors.
 ///
 /// Rewrites rather than dropping and letting the backfill re-embed (the audit's
 /// suggested shape). A rewrite is a byte copy of vectors that already exist, so
@@ -904,19 +907,27 @@ mod tests {
             "a healthy allocator must not be rewritten"
         );
 
-        // Strand slots the way churn does: delete most vectors, keep the chunk.
-        for id in &ids[..2080] {
+        // Strand slots the way churn does: delete most vectors but leave a live
+        // one in each of the three chunks (sqlite-vec releases a chunk only once
+        // every slot in it is clear; see `a_chunk_emptied_entirely_is_released`).
+        let keep: Vec<i64> = ids.iter().step_by(50).copied().collect();
+        assert_eq!(
+            keep.len(),
+            42,
+            "positions 0, 50, ..., 2050: chunk 3 starts at 2048"
+        );
+        for id in ids.iter().filter(|id| !keep.contains(id)) {
             conn.execute("DELETE FROM nodes WHERE id = ?1", [id])
                 .unwrap();
         }
         let (live, slots) = vec_slot_occupancy(conn).unwrap();
-        assert_eq!(live, 20, "20 vectors left alive");
+        assert_eq!(live, 42, "42 vectors left alive");
         assert!(
             slots >= 3072,
             "the allocator still holds the stranded slots ({slots})"
         );
 
-        // Below the size floor the gate stays shut even at 2% occupancy...
+        // Below the size floor the gate stays shut even under 2% occupancy...
         assert_eq!(
             compact_node_vectors_when(conn, 0.25, 16 * 1024 * 1024).unwrap(),
             0,
@@ -925,14 +936,54 @@ mod tests {
         // ...and fires once the floor is met.
         assert_eq!(
             compact_node_vectors_when(conn, 0.25, 0).unwrap(),
-            20,
+            42,
             "a mostly-dead allocator over the floor must be rewritten"
         );
         let (live_after, slots_after) = vec_slot_occupancy(conn).unwrap();
-        assert_eq!(live_after, 20, "the live vectors survive");
+        assert_eq!(live_after, 42, "the live vectors survive");
         assert!(
             slots_after < slots,
             "the rewrite must release stranded slots ({slots} -> {slots_after})"
+        );
+    }
+
+    /// What `vec_slot_occupancy` documents about the allocator since sqlite-vec
+    /// v0.1.7: a chunk whose every vector is deleted is dropped with its slots,
+    /// while a chunk that keeps one live vector keeps all 1024. (v0.1.6 kept both:
+    /// this is the release that changed `compaction_gate_fires_only_on_a_wasteful_allocator`'s
+    /// fixture.)
+    #[test]
+    fn a_chunk_emptied_entirely_is_released() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        conn.execute_batch(&crate::storage::schema::create_vec_tables_sql())
+            .unwrap();
+        let ids = seed_vectors(conn, "a.ts", 2100);
+        assert_eq!(vec_slot_occupancy(conn).unwrap(), (2100, 3072));
+
+        // Chunk 1 (positions 0..1024) entirely, chunk 2 (1024..2048) all but one.
+        for id in &ids[..2047] {
+            conn.execute("DELETE FROM nodes WHERE id = ?1", [id])
+                .unwrap();
+        }
+        assert_eq!(
+            vec_slot_occupancy(conn).unwrap(),
+            (53, 2048),
+            "chunk 1 released, chunk 2 kept for its one live vector, chunk 3 untouched"
+        );
+        // A later insert still lands in the newest chunk, after the released one.
+        let more = seed_vectors(conn, "b.ts", 1);
+        assert_eq!(vec_slot_occupancy(conn).unwrap(), (54, 2048));
+        let found: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_vectors WHERE node_id = ?1",
+                [more[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            found, 1,
+            "the new vector is readable after a chunk was released"
         );
     }
 
