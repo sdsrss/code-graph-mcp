@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.191.0
+
+**Upgrading: no index rebuild; upgrade soon.** `INDEX_VERSION` stays 139.
+A `.code-graph/index.db-journal` that SQLite would roll back into the index
+is now refused: the query commands, `health-check`, `incremental-index` and
+`reindex` exit 1 and the MCP server exits at start, with a message naming
+the file. Remove it and re-run. In a trace of index creation, `incremental-index`,
+`health-check`, `callgraph` and `rebuild-index`, code-graph-mcp wrote a
+rollback journal only while creating a new, empty database, and removed it,
+so an index it built is opened as before. Pinning back to 0.190.1 brings the rollback back: `npm i -g
+@sdsrs/code-graph@0.190.1` (or, from source, `cargo install --locked --git
+https://github.com/sdsrss/code-graph-mcp --tag v0.190.1 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### security: a planted `index.db-journal` is refused instead of rolled back into the index
+
+SQLite rolls a hot rollback journal back on the first read of every open,
+before any statement of ours runs, and the journal's header decides what
+that does to `index.db`. 0.190.1 stopped the file deletion described below;
+the rollback itself remained, and a repository can commit `.code-graph/`.
+Measured on 0.190.1 with an index of 9 files (103 nodes, 100 edges) and a
+512-byte journal beside it:
+
+- A journal recording 4,294,967,295 pages of 65,536 bytes made `index.db`
+  281,474,976,645,120 bytes in apparent size (688,128 bytes allocated:
+  sparse, Linux tmpfs) on one `health-check`, which went on to report
+  `db_size_bytes` 622,592 and `healthy: true`. A plain copy of the grown file
+  (Python `shutil.copy`) wrote until an 18 GiB volume quota ran out. How much
+  a file system without sparse files allocates (NTFS by default) was not
+  measured.
+- A journal recording 0 pages emptied the index: `health-check --json` went
+  from 103 nodes to 0 (`healthy: false`), and the MCP server, started on it,
+  built the whole index again.
+
+`health-check`, `show`, `callgraph`, `impact`, `search` and
+`incremental-index` each did this, and so did the MCP server as it started.
+0.191.0 first asks SQLite, through a read-only connection, whether it would
+roll the journal back, and refuses the open if it would:
+
+- The 18 query commands `--help` lists (`search` through `report`),
+  `health-check`, `incremental-index` and `reindex` exit 1 with
+  `refusing to open <index.db>:
+  <index.db-journal> is a rollback journal SQLite would replay into the
+  index, … — remove it and re-run`. `health-check --json` answers
+  `"reason": "refused"` with that message, the report a symlinked `index.db`
+  gets, and the plugin's status line shows `code-graph: ✗ .code-graph
+  refused (see health-check)`. `grep` answers from its text search instead.
+- `code-graph-mcp serve` exits 1 before answering `initialize`, with the same
+  message on stderr, as 0.190.1 does for a symlinked `index.db`.
+- `index.db` and the journal are left byte for byte as they were; once the
+  journal is removed, the index answers as before.
+- A journal SQLite would not roll back is accepted as before: one whose
+  first byte is zero, and one a live writer holds (a process creating the
+  index at that moment; removing that one would fail its commit).
+- `rebuild-index --confirm` still rebuilds: it builds a new file and renames
+  it into place, the journal stays, and the next command refuses until it
+  is removed.
+
+### Not covered
+
+- A planted `index.db-wal` beside an existing index is still read. Measured
+  on 0.191.0: `health-check --json` reported 0 edges (100 before) and
+  `healthy: true`. code-graph-mcp leaves a `-wal` behind in normal use (a CLI
+  query can exit with one in place, and SQLite must replay the one a killed
+  server leaves), so the file alone does not tell a planted one apart.
+- A repository that commits `.code-graph/index.db` itself is still used as
+  the index: on 0.191.0 a committed copy with its edges deleted answered 0
+  edges with `healthy: true`, and `incremental-index` left it so. This and
+  the `-wal` above need a rule about where `.code-graph/` came from (for
+  instance, treating a `.code-graph` that git tracks as foreign); not decided.
+- If code-graph-mcp is killed while it creates a new index, the journal it
+  leaves beside that nearly empty database should be refused the same way
+  (from SQLite's code, not reproduced). Remove it and re-run.
+
 ## 0.190.1
 
 **Upgrading: no index rebuild; upgrade soon.** `INDEX_VERSION` stays 139.
