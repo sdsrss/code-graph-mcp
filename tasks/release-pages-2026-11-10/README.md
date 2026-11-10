@@ -6,3 +6,5 @@
 
     python3 -c "import json,sys; p={x['tag']:x for x in json.load(open('originals.json'))}[sys.argv[1]]; open('/tmp/body.md','w',newline='').write(p['body'])" v0.150.0
     gh release edit v0.150.0 --notes-file /tmp/body.md
+
+另外，v0.190.0 的页面在同一天（2026-11-10）随 CHANGELOG 0.190.0 段的改动重新生成过（那一条说明从"仍写着"改为"已改写"），它的原文没有收进 `originals.json`：原文等于 tag v0.190.0 上 CHANGELOG 的 `## 0.190.0` 段（`git show v0.190.0:CHANGELOG.md`）。

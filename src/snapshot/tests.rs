@@ -1513,6 +1513,11 @@ fn stage_copy_takes_the_main_file_alone() {
 /// `pagerIsSuperJrnlName`, 60257) and it lists the journal being rolled back,
 /// as SQLite spells that path (61601-61651). The victim below has both, so the
 /// control still fires; any other file a journal names is safe from 3.54 on.
+/// What this test now catches is `inspect` rolling back the raw pair in place.
+/// A staged copy with the journal beside it (the withdrawn D#630 shape) sits
+/// in a temp dir whose path the victim cannot list, so under 3.54 it deletes
+/// nothing and passes here; `stage_copy_takes_the_main_file_alone` is the
+/// test that refuses a staged journal.
 #[test]
 fn inspect_does_not_delete_a_file_a_journal_names() {
     for (header, write_version) in [("rollback", 1u8), ("wal", 2u8)] {

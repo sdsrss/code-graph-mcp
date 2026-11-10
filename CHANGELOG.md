@@ -2,17 +2,34 @@
 
 ## 0.190.1
 
-**Upgrading: no index rebuild.** `INDEX_VERSION` stays 139. This release
-updates the SQLite built into the binary from 3.51.1 to 3.54.1 for a
-security advisory (rusqlite 0.38.0 → 0.41.1, libsqlite3-sys 0.36.0 →
-0.39.1, and what rusqlite 0.41 pulls in: hashlink 0.11.0 → 0.12.2, uuid
-1.22.0 → 1.29.2, hashbrown 0.17.1). No source outside the tests changed,
-and what the tool answers is unchanged on the corpora measured below. Pinning back to 0.190.0 brings the affected
-SQLite back: `npm i -g @sdsrs/code-graph@0.190.0` (or, from source,
-`cargo install --locked --git https://github.com/sdsrss/code-graph-mcp
---tag v0.190.0 --features embed-model`), then delete
-`~/.cache/code-graph/bin/code-graph-mcp` and set
+**Upgrading: no index rebuild; upgrade soon.** `INDEX_VERSION` stays 139.
+This release updates the SQLite built into the binary from 3.51.1 to
+3.54.1 (rusqlite 0.38.0 → 0.41.1, libsqlite3-sys 0.36.0 → 0.39.1, and what
+rusqlite 0.41 pulls in: hashlink 0.11.0 → 0.12.2, uuid 1.22.0 → 1.29.2,
+hashbrown 0.17.1). That closes two security problems in 0.190.0 and
+earlier, below. No code outside tests changed (`src/storage/db.rs` gained a
+`#[cfg(test)]` accessor), and what the tool answers is unchanged on the
+corpora measured below. Building from source now needs Rust 1.89 or newer
+(rusqlite 0.41.1 and uuid 1.29.2 declare it; the highest before was 1.88).
+Pinning back to 0.190.0 brings both problems back: `npm i -g
+@sdsrs/code-graph@0.190.0` (or, from source, `cargo install --locked --git
+https://github.com/sdsrss/code-graph-mcp --tag v0.190.0 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
 `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### security: a planted `index.db-journal` no longer deletes the file it names
+
+0.190.0 deleted a file named inside `.code-graph/index.db-journal` when
+that journal was a regular file (earlier releases bundle older SQLite with
+the same journal handling): SQLite 3.51.1 reads a super-journal
+path out of a journal it rolls back and deletes the file at that path. A
+repository can commit `.code-graph/` with such a journal, and the plugin's
+session-start hook and status line both run `health-check` in the project.
+Measured on an index of gin with a journal naming a file outside the
+project: one `health-check` on 0.190.0 deleted that file; on 0.190.1 it is
+still there. SQLite 3.54 deletes the file a journal names only if the name
+has the form of a super-journal (`-mj` and nine hex digits, the third from
+last a `9`) and the file lists that journal.
 
 ### security: SQLite 3.54.1 (RUSTSEC-2026-0459, CVE-2026-119375)
 
@@ -21,14 +38,15 @@ memory as query results when a database is opened together with a `-wal`
 file whose page size differs from the database's; the attacker needs the
 victim to open a crafted pair of files. code-graph opens the `index.db` it
 finds under a project's `.code-graph/` (a regular file there is used as is;
-the index runs in WAL mode, so its `-wal` is read too), and `snapshot
-inspect` opens the file it is given. 0.190.0 and earlier bundle SQLite
-3.51.1, which is in the affected range.
+the index runs in WAL mode, so its `-wal` is read too). 0.190.0 and earlier
+bundle SQLite 3.51.1, which is in the affected range.
 
-Measured, 0.190.0 against this release, both built from source with
-default features (FTS5 only), on eight corpora (flask, gin, gson, leveldb,
-express 4.21.2, hono v4.6.14, this repository at v0.190.0, and the Python
-3.14 standard library):
+### Measured: no change in answers
+
+0.190.0 against this release, both built from source with default features
+(FTS5 only), on eight corpora (flask, gin, gson, leveldb, express 4.21.2,
+hono v4.6.14, this repository at v0.190.0, and the Python 3.14 standard
+library); the scripts are in `tasks/sqlite-354-upgrade-2026-11-10/`:
 
 - the index each builds is the same row for row, ids included, in every
   table compared (`files` less its `indexed_at` time, `nodes`, `edges`,
@@ -36,7 +54,8 @@ express 4.21.2, hono v4.6.14, this repository at v0.190.0, and the Python
   the standard library's has 114,900 edges.
 - 3,088 CLI runs (`callgraph`, `refs`, `impact`, `show`, `search`,
   `overview`, `deps`, `map`, `dead-code`, `centrality`, `cycles`,
-  `surprising`, `tour`, `health-check`; text and `--json`) print the same
+  `surprising`, `tour` and `health-check`, all with `--json`, and
+  `callgraph`, `refs`, `search` and `map` also as text) print the same
   bytes and exit codes, except one `health-check --json` whose
   `last_indexed_at` and `index_age` differ by the second between the two
   indexing runs.
@@ -46,6 +65,15 @@ express 4.21.2, hono v4.6.14, this repository at v0.190.0, and the Python
 
 ### Not covered
 
+- Two error texts change, only for a damaged or hand-edited database,
+  because rusqlite 0.41 reads values and PRAGMAs differently. `snapshot
+  inspect` on a file with `user_version` 99 and a schema entry SQLite cannot
+  parse said "Database schema version v99 is newer than supported v10…" and
+  now says "… is not a valid code-graph snapshot — meta is missing or
+  unreadable …". A node whose stored text is not valid UTF-8 made `show` say
+  "Conversion error from type Text at index: 7, invalid utf-8 sequence of 1
+  bytes from index 5" and now "invalid utf-8 sequence of 1 bytes from index
+  5 at index 7". Exit codes are the same.
 - Vector search was not part of that comparison (both arms were built
   without `embed-model`); the full test suite passes with `embed-model`
   (2451 passed, 0 failed, 7 ignored).
