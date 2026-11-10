@@ -2595,6 +2595,135 @@ mod tests {
     }
 
     #[test]
+    fn sql_stored_in_an_index_reaches_nothing_outside_it() {
+        // D#772 (2026-11-10): a `.code-graph/` the repository supplies (a committed
+        // index.db or -wal) is used as the index, by decision. That holds only while
+        // SQL stored in such a file (its triggers and views) can touch nothing but
+        // the database: no function or module that reads or writes files, takes a
+        // pointer, or loads code. Anything this test starts to see beyond the lists
+        // below re-opens D#772 — check what it can reach before adding it here.
+        use std::collections::BTreeSet;
+        let tmp = TempDir::new().unwrap();
+        let db = Database::open_with_vec(&tmp.path().join("index.db")).unwrap();
+        let names = |sql: &str| -> BTreeSet<String> {
+            let mut stmt = db.conn().prepare(sql).unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let allowed =
+            |list: &[&str]| -> BTreeSet<String> { list.iter().map(|s| s.to_string()).collect() };
+
+        let functions = names("SELECT DISTINCT name FROM pragma_function_list WHERE builtin = 0");
+        let pure_functions = allowed(&[
+            // FTS3/FTS5 auxiliary functions and overload placeholders: act on the
+            // full-text cursor they are called with, inside this database.
+            "bm25",
+            "highlight",
+            "match",
+            "matchinfo",
+            "offsets",
+            "optimize",
+            "snippet",
+            // fts5() hands out its API only as a pointer value (sqlite3_result_pointer),
+            // which SQL text cannot read; the rest return constants or rewrap text.
+            "fts5",
+            "fts5_get_locale",
+            "fts5_insttoken",
+            "fts5_locale",
+            "fts5_source_id",
+            // Its two-argument form installs a tokenizer from a pointer; that form
+            // is asserted refused at the end of this test.
+            "fts3_tokenizer",
+            // R-tree introspection over this database's own tables and blobs.
+            "rtreecheck",
+            "rtreedepth",
+            "rtreenode",
+            // sqlite3_vec_init: every one registered SQLITE_INNOCUOUS | DETERMINISTIC.
+            // sqlite-vec's vec_npy_file (reads a file) and vec_static_blob_from_raw
+            // (takes a pointer) live in other init functions this crate never calls.
+            "vec_add",
+            "vec_bit",
+            "vec_debug",
+            "vec_distance_cosine",
+            "vec_distance_hamming",
+            "vec_distance_l1",
+            "vec_distance_l2",
+            "vec_f32",
+            "vec_int8",
+            "vec_length",
+            "vec_normalize",
+            "vec_quantize_binary",
+            "vec_quantize_int8",
+            "vec_slice",
+            "vec_sub",
+            "vec_to_json",
+            "vec_type",
+            "vec_version",
+        ]);
+        assert!(
+            functions.contains("vec_distance_l2"),
+            "the listing must see sqlite-vec's functions, or the check below is empty: {functions:?}"
+        );
+        assert_eq!(
+            functions.difference(&pure_functions).collect::<Vec<_>>(),
+            Vec::<&String>::new(),
+            "non-built-in SQL function(s) not reviewed for D#772"
+        );
+
+        // `pragma_*` modules join the list once used, as this test's own queries do.
+        // SQLite builds one only for a pragma that returns rows
+        // (sqlite3PragmaVtabRegister), and gives it an argument only when it is a
+        // per-object one (table_info, integrity_check, optimize, ...): a setter such
+        // as journal_mode or writable_schema can be read through it, never set.
+        let modules = names(
+            "SELECT name FROM pragma_module_list WHERE name NOT LIKE 'pragma\\_%' ESCAPE '\\'",
+        );
+        let pure_modules = allowed(&[
+            // Page statistics of an attached database; read-only.
+            "dbstat",
+            // Full-text and R-tree tables keep their data in shadow tables of the
+            // same database; fts4aux/fts5vocab read those, and fts3tokenize runs an
+            // already-registered tokenizer over the text it is given.
+            "fts3",
+            "fts3tokenize",
+            "fts4",
+            "fts4aux",
+            "fts5",
+            "fts5vocab",
+            "rtree",
+            "rtree_i32",
+            // sqlite3_vec_init's modules. vec_npy_each (reads a file) and
+            // vec_static_blobs (reads a pointer) are never registered.
+            "vec0",
+            "vec_each",
+        ]);
+        assert!(
+            modules.contains("vec0"),
+            "the listing must see sqlite-vec's modules, or the check below is empty: {modules:?}"
+        );
+        assert_eq!(
+            modules.difference(&pure_modules).collect::<Vec<_>>(),
+            Vec::<&String>::new(),
+            "virtual-table module(s) not reviewed for D#772"
+        );
+
+        let refused = |sql: &str| {
+            let err = db
+                .conn()
+                .query_row(sql, [], |_| Ok(()))
+                .expect_err(&format!("{sql} must be refused"));
+            format!("{err}")
+        };
+        assert_eq!(refused("SELECT load_extension('x')"), "not authorized");
+        assert_eq!(
+            refused("SELECT fts3_tokenizer('simple', zeroblob(8))"),
+            "fts3tokenize disabled"
+        );
+    }
+
+    #[test]
     fn fresh_schema_matches_fully_migrated_schema() {
         use std::collections::BTreeMap;
         // column name -> (declared type, notnull, pk, default expr). The default
