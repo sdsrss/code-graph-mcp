@@ -48,9 +48,10 @@ roll the journal back, and refuses the open if it would:
   `health-check`, `incremental-index` and `reindex` exit 1 with
   `refusing to open <index.db>: <index.db-journal> is a rollback journal
   SQLite would replay into the index; … — remove it and re-run`.
-  `reindex --from-snapshot` exits 0 instead: it deletes the index and builds
-  a new one, and SQLite deletes the journal beside the new, empty database,
-  so nothing is rolled back. `health-check --json` answers
+  With no snapshot to fetch, `reindex --from-snapshot` exits 0 instead: it
+  deletes the index and builds a new one, and SQLite deletes the journal
+  beside the new, empty database, so nothing is rolled back.
+  `health-check --json` answers
   `"reason": "refused"` with that message, the report a symlinked `index.db`
   gets, and the plugin's status line shows `code-graph: ✗ .code-graph
   refused (see health-check)`. `grep` answers from its text search instead.
@@ -63,12 +64,16 @@ roll the journal back, and refuses the open if it would:
   index at that moment; removing that one would fail its commit).
 - The journal code-graph-mcp itself leaves when it is killed while creating
   a new index (a 4,096-byte database beside a journal recording 0 pages) is
-  rolled back as in 0.190.1: its playback can only empty a database that
-  holds no table yet, so it is let through when the database is at most one
-  page. Reproduced by killing `incremental-index` and `serve` at that point:
-  `health-check` then reports an empty index (0 nodes) and the next
-  `incremental-index` exits 0 with 103 nodes, as on 0.190.1. The same
-  journal beside an index of two pages or more is refused.
+  rolled back as in 0.190.1: its playback can only truncate the file to 0
+  bytes, so it is let through when the database is at most one page of its
+  own page size and has no `index.db-wal` with anything in it. Reproduced by
+  killing `incremental-index` and `serve` at that point: `health-check` then
+  reports an empty index (0 nodes) and the next `incremental-index` exits 0
+  with 103 nodes, as on 0.190.1. The same journal is refused beside an index
+  of two pages or more, and beside a one-page file whose index is still in
+  its WAL: a first build killed at its first checkpoint left a 4,096-byte
+  `index.db` and a 1,215,432-byte `index.db-wal` holding 103 nodes, which
+  0.190.1 emptied once that journal was added.
 - `rebuild-index --confirm` still rebuilds: it builds a new file and renames
   it into place, the journal stays, and the next command refuses until it
   is removed.
@@ -85,12 +90,14 @@ roll the journal back, and refuses the open if it would:
   edges with `healthy: true`, and `incremental-index` left it so. This and
   the `-wal` above need a rule about where `.code-graph/` came from (for
   instance, treating a `.code-graph` that git tracks as foreign); not decided.
-- If another process holds the database locked for longer than SQLite's
-  5-second busy wait while a hot journal sits beside it, the check gives up
-  and a later open can still roll the journal back: the pre-tag review
-  reproduced it with a lock held for 12 seconds (3 and 7 seconds were
-  refused). A file in a repository holds no lock; this takes a process on
-  the machine holding the database.
+- If another process holds the database locked while a hot journal sits
+  beside it, each check gives up after SQLite's 5-second busy wait, and once
+  a command has run out its checks (two for a query, three for
+  `health-check`), the open that follows can still roll the journal back.
+  The pre-tag review reproduced it with a lock held for 12 seconds on
+  `show` (7 seconds was refused) and 17 seconds on `health-check --json`
+  (12 seconds was refused). A file in a repository holds no lock; this takes
+  a process on the machine holding the database.
 
 ## 0.190.1
 
