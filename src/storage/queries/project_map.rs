@@ -348,6 +348,15 @@ pub fn get_project_map(
         let prod_where = crate::domain::prod_source_filter_and();
         let test_where = crate::domain::test_source_filter_or();
         let target_filter = crate::domain::prod_filter_and("n", "f");
+        // Count only the callers `callgraph`/`impact` show by default
+        // (DEFAULT_RISK_CONF_FLOOR = inferred). An ambiguous edge is a by-name
+        // guess among several same-named definitions; counting it ranked gin's
+        // testdata `String` (219 ambiguous callers, no others) as a hot function.
+        let conf_floor = format!(
+            "e.confidence IN ('{}', '{}')",
+            crate::domain::CONF_EXTRACTED,
+            crate::domain::CONF_INFERRED
+        );
         let sql = format!(
             "SELECT n.name, n.type, f.path, \
                COUNT(CASE WHEN {prod_where} THEN e.id END) as prod_cnt, \
@@ -357,6 +366,7 @@ pub fn get_project_map(
              JOIN edges e ON e.target_id = n.id \
              {prod_join} \
              WHERE e.relation = ?1 \
+               AND {conf_floor} \
                AND n.type IN ('function', 'method') \
                AND n.name != '<module>' \
                AND {target_filter} \

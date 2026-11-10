@@ -2822,6 +2822,61 @@ pub fn call_bar() { bar(); bar(); bar(); }
     }
 }
 
+/// project_map.hot_functions counts only callers callgraph would show by default.
+/// An `ambiguous` edge is a by-name guess among several same-named definitions
+/// (`r.Render()` on an interface binds to every `Render`); `callgraph`/`impact`
+/// hide it unless asked (DEFAULT_RISK_CONF_FLOOR). Counting it here ranked gin's
+/// testdata `String` (219 ambiguous callers, 0 others) and flask's dict
+/// `.setdefault` among the hottest functions.
+#[test]
+fn test_project_map_hot_functions_skip_ambiguous_callers() {
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("a.go"),
+        "package app\n\ntype A struct{}\n\nfunc (a A) Render() string { return \"a\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("b.go"),
+        "package app\n\ntype B struct{}\n\nfunc (b B) Render() string { return \"b\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("c.go"),
+        r#"package app
+
+type renderer interface{ Render() string }
+
+func one(r renderer) string   { return r.Render() }
+func two(r renderer) string   { return r.Render() }
+func three(r renderer) string { return r.Render() }
+
+func helper() int { return 1 }
+
+func usesHelper1() int { return helper() }
+func usesHelper2() int { return helper() }
+"#,
+    )
+    .unwrap();
+
+    let server = common::init_server(&project);
+    let msg = tool_call_json("project_map", serde_json::json!({}));
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+
+    let hot = result["hot_functions"].as_array().unwrap();
+    let names: Vec<&str> = hot.iter().filter_map(|h| h["name"].as_str()).collect();
+    // Non-vacuous: a function with unambiguous callers is still listed.
+    assert!(
+        names.contains(&"helper"),
+        "helper has 2 same-file callers and must be hot: {result}"
+    );
+    assert!(
+        !names.contains(&"Render"),
+        "Render's only callers are ambiguous by-name edges: {result}"
+    );
+}
+
 /// Fix #3b: entry_points must carry `kind` distinguishing `main` vs `http_route`.
 #[test]
 fn test_project_map_entry_points_have_kind() {
