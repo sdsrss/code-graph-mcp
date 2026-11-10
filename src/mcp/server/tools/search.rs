@@ -20,6 +20,45 @@ struct Candidate {
     adjusted_score: f64,
 }
 
+/// Cut an uncapped fused pool to `cap` rows, keeping every row past the cut
+/// whose node is named exactly `query` (name or qualified name, trimmed and
+/// case-insensitive: the rerank's `is_exact_name` rule).
+///
+/// The cut used to happen inside the fusion, before the exact-name rerank
+/// could see the row: a symbol the vector channel outranked fell off a small
+/// pool, so on flask `semantic_code_search "send_file"` missed `send_file`
+/// at top_k 1–10 and put it first at top_k 12. Fusion scores depend only on
+/// each row's channel ranks, so the uncapped list's first `cap` rows ARE the
+/// old capped pool; only exact-name rows are added after them.
+fn cap_keeping_exact_names(
+    conn: &rusqlite::Connection,
+    mut fused_all: Vec<crate::search::fusion::SearchResult>,
+    cap: usize,
+    query: &str,
+) -> Result<Vec<crate::search::fusion::SearchResult>> {
+    if fused_all.len() <= cap {
+        return Ok(fused_all);
+    }
+    let tail = fused_all.split_off(cap);
+    let wanted = query.trim().to_lowercase();
+    let tail_ids: Vec<i64> = tail.iter().map(|r| r.node_id).collect();
+    let exact: std::collections::HashSet<i64> =
+        queries::get_nodes_with_files_by_ids(conn, &tail_ids)?
+            .into_iter()
+            .filter(|nwf| {
+                nwf.node.name.to_lowercase() == wanted
+                    || nwf
+                        .node
+                        .qualified_name
+                        .as_deref()
+                        .is_some_and(|q| q.to_lowercase() == wanted)
+            })
+            .map(|nwf| nwf.node.id)
+            .collect();
+    fused_all.extend(tail.into_iter().filter(|r| exact.contains(&r.node_id)));
+    Ok(fused_all)
+}
+
 impl McpServer {
     pub(in crate::mcp::server) fn tool_semantic_search(
         &self,
@@ -205,7 +244,12 @@ impl McpServer {
                 vec_weight,
             )
         };
-        let fused = fuse(&fts_search, &vec_search, fetch_count as usize);
+        let fused = cap_keeping_exact_names(
+            self.db.conn(),
+            fuse(&fts_search, &vec_search, usize::MAX),
+            fetch_count as usize,
+            query,
+        )?;
 
         // Match confidence: penalize when search signals are weak
         let match_confidence = {
@@ -454,7 +498,12 @@ impl McpServer {
             && retry_fetch > fetch_count
         {
             let (fts_retry, vec_retry, _, _) = retrieve(retry_fetch)?;
-            let fused_retry = fuse(&fts_retry, &vec_retry, retry_fetch as usize);
+            let fused_retry = cap_keeping_exact_names(
+                self.db.conn(),
+                fuse(&fts_retry, &vec_retry, usize::MAX),
+                retry_fetch as usize,
+                query,
+            )?;
             let (retry_candidates, retry_dropped, retry_skipped) = build_candidates(&fused_retry)?;
             widest_fetch_was_full = fused_retry.len() >= retry_fetch as usize;
             // Adoption stays on a STRICT improvement, and all five values move
@@ -1234,6 +1283,61 @@ mod tests {
         let server = McpServer::new_test_with_project(project.path());
         crate::indexer::pipeline::run_full_index(&server.db, project.path(), None, None).unwrap();
         server
+    }
+
+    /// A row named exactly like the query survives the fused-pool cut.
+    ///
+    /// The cut runs before the exact-name rerank, so a match the vector
+    /// channel outranked fell off the pool before the bonus could lift it:
+    /// on flask, `send_file` was absent at top_k 1–10 (pool 20) and first at
+    /// top_k 12 (pool 48). This harness has no vector channel, so the pool
+    /// order is built by hand; the fusion is order-stable under a wider cap
+    /// (scores depend on channel ranks only), which is what lets the caller
+    /// fuse once uncapped and cut here.
+    #[test]
+    fn test_cap_keeps_exact_name_rows_past_the_cut() {
+        use crate::search::fusion::SearchResult;
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("lib.py"),
+            "def send_file(p):\n    return p\n\ndef other_a():\n    return 1\n\n\
+             def other_b():\n    return 2\n\ndef other_c():\n    return 3\n",
+        )
+        .unwrap();
+        let server = indexed_server(&project);
+        let conn = server.db.conn();
+        let id_of = |name: &str| -> i64 {
+            conn.query_row("SELECT id FROM nodes WHERE name = ?1", [name], |r| r.get(0))
+                .unwrap()
+        };
+        let pool: Vec<SearchResult> = [
+            ("other_a", 0.9),
+            ("other_b", 0.8),
+            ("other_c", 0.7),
+            ("send_file", 0.6),
+        ]
+        .iter()
+        .map(|(n, s)| SearchResult {
+            node_id: id_of(n),
+            score: *s,
+        })
+        .collect();
+        let ids = |q: &str| -> Vec<i64> {
+            cap_keeping_exact_names(conn, pool.clone(), 2, q)
+                .unwrap()
+                .iter()
+                .map(|r| r.node_id)
+                .collect()
+        };
+
+        // The capped prefix keeps its order; the exact match past the cut is
+        // appended; a non-matching row past the cut stays cut.
+        let expected = vec![id_of("other_a"), id_of("other_b"), id_of("send_file")];
+        assert_eq!(ids("send_file"), expected);
+        // Same case and whitespace rule as the rerank's `is_exact_name`.
+        assert_eq!(ids("  SEND_FILE "), expected);
+        // A query that names nothing past the cut is the plain cut.
+        assert_eq!(ids("send"), vec![id_of("other_a"), id_of("other_b")]);
     }
 
     /// A CJK substring rescue must reach the response carrying the widened-match
