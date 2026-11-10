@@ -29,10 +29,10 @@
 
 - 旧 Release 页面（3887591c）：23 页逐页改写，每页只有那一行变化，改后读回线上正文与预期逐字节一致，23/23；全量扫描后只剩 v0.190.0 自己的描述句含该短语。原文与还原方法在 `tasks/release-pages-2026-11-10/`。v0.190.0 的 CHANGELOG 条目与线上说明同步改为"已于 2026-11-10 改写"。
 - 更正：libsqlite3-sys 0.36.0 内置的是 SQLite 3.51.1（`sqlite3.h` 的 `SQLITE_VERSION`），不是之前写的 3.53。
-- 3.54 的 super-journal 加固（`pager_delsuper`，sqlite3.c 61542–61651；`pagerIsSuperJrnlName` 60257）：只删除名字像 super-journal 且内容列出本日志路径的文件。旧夹具（名为 `victim`、内容任意）在 3.54 下对照不触发；新夹具对照触发；把 inspect 的原地只读打开改成读写打开（变异）→ 测试在 tests.rs:1575 失败（"inspect deleted the file the journal named"），还原后 `git diff` 干净。
+- 3.54 的 super-journal 加固（`pager_delsuper`，sqlite3.c 61542–61651；`pagerIsSuperJrnlName` 60257）：只删除名字像 super-journal 且内容列出本日志路径的文件。旧夹具（名为 `victim`、内容任意）在 3.54 下对照不触发；新夹具对照触发；把 inspect 的原地只读打开改成读写打开（变异）→ 测试在 tests.rs:1575 失败（R1 修复给注释加了 5 行后是 1580）（"inspect deleted the file the journal named"），还原后 `git diff` 干净。
 - 变异无法覆盖的一点：`stage_copy` 若重新复制 `-journal`（D#630 被撤回的做法），在 3.54 下受害文件必须列出暂存目录里的日志路径（随机临时目录名），攻击者无法预知，所以这个形状在 3.54 下本身不会删除文件；`stage_copy_takes_the_main_file_alone` 里的受害文件断言在 3.54 下因此是空过的，它的主断言（暂存目录只有主文件）仍有效。
 - 两条测试腿：默认特性 pre-commit 2428 通过、0 失败、7 忽略；`--features embed-model` 2451 通过、0 失败、7 忽略。
-- 语料差分（v0.190.0 与升级版都从源码构建、默认特性；base 内置 SQLite 源码 ID 2025-11-28 即 3.51.1，head 2026-10-16 即 3.54.1）：8 份语料（flask、gin、gson、leveldb、express、hono、本仓库 v0.190.0、Python 3.14 标准库），7 张表逐行比较 56/56 相同（含 id；标准库 114,900 条边）；CLI 3,088 次运行只有 1 次不同（leveldb `health-check --json` 的 `last_indexed_at`/`index_age`，两次建索引相差 1 秒的墙钟时间）；MCP 2,060 次调用 0 次不同，抽查 flask 312 次调用 0 次报错、平均 0.9–8.8 KB。脚本在 `/var/tmp/agent-tmp-sqlite-diff/drive.py`、`mcp_diff.py`（任务结束时删除）。
+- 语料差分（v0.190.0 与升级版都从源码构建、默认特性；base 内置 SQLite 源码 ID 2025-11-28 即 3.51.1，head 2026-10-16 即 3.54.1）：8 份语料（flask、gin、gson、leveldb、express、hono、本仓库 v0.190.0、Python 3.14 标准库），7 张表逐行比较 56/56 相同（含 id；标准库 114,900 条边）；CLI 3,088 次运行只有 1 次不同（leveldb `health-check --json` 的 `last_indexed_at`/`index_age`，两次建索引相差 1 秒的墙钟时间）；MCP 2,060 次调用 0 次不同，抽查 flask 257 次调用（原写 312，算错）0 次报错、平均 0.9–8.8 KB。脚本在 `/var/tmp/agent-tmp-sqlite-diff/drive.py`、`mcp_diff.py`（任务结束时删除）。
 - 版本 0.190.1；embed-model release 构建 `--version` 0.190.1，health-check 为 hybrid；提交 74cc94bb（pre-commit 通过）。
 - 干净克隆插件清点：0.190.1，Skills 2 · Agents 1 · Hooks 6 · MCP 1。
 - 发版前评审第 1 轮（新子代理，盲审，v0.190.0..74cc94bb）：HIGH 0、MEDIUM 1、LOW 7、NIT 7。评审自己的差分更大（9 份语料含 tokio、django，CLI 17,736 次、MCP 8,276 次，含增量编辑和二级只读实例、embed 构建的向量搜索），只有时间戳和版本号不同；性能无退化（tokio/pystd/django 全量索引 −3.0%/−2.2%/−0.2%）；cargo-audit：HEAD 退出 0，BASE 报 RUSTSEC-2026-0459。处理：
@@ -44,3 +44,12 @@
   - L6：去掉"`snapshot inspect` 打开给定文件"这条暴露路径（inspect 遇到非空 `-wal` 走只复制主文件的暂存，不会和 `-wal` 一起打开）。
   - L7：v0.190.0 页面也在当天重新生成过，README 写明原文在 tag 的 CHANGELOG 里。
   - N1（CLI 命令的文本/JSON 说法）、N3（"测试以外没改代码"）、N5（源码构建需要 Rust 1.89）：改说明。N2：差分脚本收进 `tasks/sqlite-354-upgrade-2026-11-10/`。N6：backlog spec 的版本已更正。N4、N7：不改（N7 在推送并核对 CI 后成立）。
+- 第 1 轮修复提交 db7fa644（pre-commit 2428/0/7），已推送；main CI 42811973060 7/7 通过，Cargo Audit 由红转绿（扫描 425 个依赖，无公告）；两个改过的测试在 macOS、Windows、with-embed 日志里都是 ok（macOS 上对照是硬断言，所以 `/private/var` 下也触发了）。
+- 发版前评审第 2 轮（新子代理，只审 db7fa644）：HIGH 0、MEDIUM 1、LOW 4、NIT 7，全部是说明/注释问题；评审照 README 重跑差分，数字全部复现（56/56、3,088、2,060）。处理：
+  - M1（删除问题不只两条插件路径：所有打开索引的命令都会触发，`serve` 一启动就会）：说明改为"谁先打开索引谁回滚"，列出 MCP 服务启动和 CLI 命令。
+  - L1（"源码构建需要 Rust 1.89"是从声明推出来的；实测两个版本都要 1.91，因为 `round_char_boundary`）：删掉这句，这次发版不改变最低版本。
+  - L2（"更早版本内置更旧的 SQLite"不准）：改为"更早版本都内置早于 3.54 的 SQLite，行为相同"。
+  - L3（相对路径也能删）：我复现（`../outside/victim.txt`，0.190.0 删、0.190.1 不删）后写进说明。
+  - L4（植入的日志仍会被回滚进索引，可把 `index.db` 撑到 8,589,934,592 字节表观大小）：我复现（两版都从 3,751,936 变为 8,589,934,592，Linux 上稀疏、实际 3,668 KiB）后写进 Not covered，记入待办。
+  - N1（会话启动钩子不总跑 health-check）：说明不再点名具体钩子。N2（UTF-8 文案在其他读该节点的命令里也变；inspect 的变化只在原地回滚模式的原始文件）：改说明。N3：测试注释补上兜底暂存分支由哪两个测试拦。N4、N5：spec 行号和次数更正。N6：`build.sh` 收进 `tasks/sqlite-354-upgrade-2026-11-10/`，README 写明标准库依赖本机 Python 补丁版本。N7：说明改为"除版本号外"。
+- 停止线：两轮评审已到上限；第 2 轮修复只改说明、测试注释和 tasks 文件，二进制与 db7fa644 相同，不派第 3 轮，由我逐条复现后改。

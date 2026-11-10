@@ -1516,8 +1516,10 @@ fn stage_copy_takes_the_main_file_alone() {
 /// What this test now catches is `inspect` rolling back the raw pair in place.
 /// A staged copy with the journal beside it (the withdrawn D#630 shape) sits
 /// in a temp dir whose path the victim cannot list, so under 3.54 it deletes
-/// nothing and passes here; `stage_copy_takes_the_main_file_alone` is the
-/// test that refuses a staged journal.
+/// nothing and passes here: `stage_copy_takes_the_main_file_alone` refuses a
+/// journal `stage_copy` stages, and `inspect_reads_a_hot_journal_pair_as_the_main_file_alone`
+/// and `inspect_reads_a_read_only_snapshot_on_every_arm` refuse one staged by
+/// the fallback arm.
 #[test]
 fn inspect_does_not_delete_a_file_a_journal_names() {
     for (header, write_version) in [("rollback", 1u8), ("wal", 2u8)] {

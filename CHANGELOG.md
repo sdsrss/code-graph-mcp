@@ -7,12 +7,11 @@ This release updates the SQLite built into the binary from 3.51.1 to
 3.54.1 (rusqlite 0.38.0 → 0.41.1, libsqlite3-sys 0.36.0 → 0.39.1, and what
 rusqlite 0.41 pulls in: hashlink 0.11.0 → 0.12.2, uuid 1.22.0 → 1.29.2,
 hashbrown 0.17.1). That closes two security problems in 0.190.0 and
-earlier, below. No code outside tests changed (`src/storage/db.rs` gained a
-`#[cfg(test)]` accessor), and what the tool answers is unchanged on the
-corpora measured below. Building from source now needs Rust 1.89 or newer
-(rusqlite 0.41.1 and uuid 1.29.2 declare it; the highest before was 1.88).
-Pinning back to 0.190.0 brings both problems back: `npm i -g
-@sdsrs/code-graph@0.190.0` (or, from source, `cargo install --locked --git
+earlier, below. Apart from version numbers, no code outside tests changed
+(`src/storage/db.rs` gained a `#[cfg(test)]` accessor), and what the tool
+answers is unchanged on the corpora measured below. Pinning back to
+0.190.0 brings both problems back: `npm i -g @sdsrs/code-graph@0.190.0`
+(or, from source, `cargo install --locked --git
 https://github.com/sdsrss/code-graph-mcp --tag v0.190.0 --features
 embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
 `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
@@ -20,13 +19,16 @@ embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
 ### security: a planted `index.db-journal` no longer deletes the file it names
 
 0.190.0 deleted a file named inside `.code-graph/index.db-journal` when
-that journal was a regular file (earlier releases bundle older SQLite with
-the same journal handling): SQLite 3.51.1 reads a super-journal
-path out of a journal it rolls back and deletes the file at that path. A
-repository can commit `.code-graph/` with such a journal, and the plugin's
-session-start hook and status line both run `health-check` in the project.
-Measured on an index of gin with a journal naming a file outside the
-project: one `health-check` on 0.190.0 deleted that file; on 0.190.1 it is
+that journal was a regular file, and every earlier release bundles a SQLite
+older than 3.54 that does the same: SQLite 3.51.1 reads a super-journal
+path out of a journal it rolls back and deletes the file at that path. The
+name may be absolute or relative to the project root. A repository can
+commit `.code-graph/` with such a journal, and whatever opens the index
+first rolls it back: the MCP server as it starts, and CLI commands such as
+`health-check`, `incremental-index` and the queries, which the plugin's
+hooks and status line also run on their own. Measured on an index of gin
+with a journal naming a file outside the project, by absolute path and by
+`../`: one `health-check` on 0.190.0 deleted the file; on 0.190.1 it is
 still there. SQLite 3.54 deletes the file a journal names only if the name
 has the form of a super-journal (`-mj` and nine hex digits, the third from
 last a `9`) and the file lists that journal.
@@ -65,15 +67,21 @@ library); the scripts are in `tasks/sqlite-354-upgrade-2026-11-10/`:
 
 ### Not covered
 
+- A planted `index.db-journal` is still rolled back into the index, as in
+  0.190.0: it can rewrite `index.db`, and one whose header claims 2,097,152
+  pages of 4,096 bytes grew it from 3,751,936 to 8,589,934,592 bytes
+  (2,097,152 × 4,096) on both versions, sparse on Linux (3,668 KiB
+  allocated). Only the deletion of other files is fixed.
 - Two error texts change, only for a damaged or hand-edited database,
   because rusqlite 0.41 reads values and PRAGMAs differently. `snapshot
-  inspect` on a file with `user_version` 99 and a schema entry SQLite cannot
-  parse said "Database schema version v99 is newer than supported v10…" and
-  now says "… is not a valid code-graph snapshot — meta is missing or
-  unreadable …". A node whose stored text is not valid UTF-8 made `show` say
-  "Conversion error from type Text at index: 7, invalid utf-8 sequence of 1
-  bytes from index 5" and now "invalid utf-8 sequence of 1 bytes from index
-  5 at index 7". Exit codes are the same.
+  inspect` on a raw rollback-mode file with `user_version` 99 and a schema
+  entry SQLite cannot parse said "Database schema version v99 is newer than
+  supported v10…" and now says "… is not a valid code-graph snapshot — meta
+  is missing or unreadable …". A node whose stored text is not valid UTF-8
+  made `show` say "Conversion error from type Text at index: 7, invalid
+  utf-8 sequence of 1 bytes from index 5" and now "invalid utf-8 sequence of
+  1 bytes from index 5 at index 7" (the same change in other commands that
+  read that node). Exit codes are the same.
 - Vector search was not part of that comparison (both arms were built
   without `embed-model`); the full test suite passes with `embed-model`
   (2451 passed, 0 failed, 7 ignored).
