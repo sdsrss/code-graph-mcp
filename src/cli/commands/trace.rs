@@ -290,15 +290,22 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         let chain = chains
             .get(&(rm.handler_name.as_str(), rm.file_path.as_str()))
             .expect("every route row's handler was traversed above");
-        for n in &chain.nodes {
-            if n.depth == 0 {
-                continue;
+        // Each call under the function that makes it (`parent_id`), children
+        // in traversal order. Printed flat and indented by depth, every
+        // depth-2 call landed under the LAST depth-1 call (flask `trace
+        // /register` put `_render` under `flash`). A filtered test node is
+        // still descended into, so the set of printed nodes is unchanged.
+        let mut children: std::collections::HashMap<i64, Vec<&crate::graph::query::CallGraphNode>> =
+            std::collections::HashMap::new();
+        let root_id = chain.nodes.iter().find(|n| n.depth == 0).map(|n| n.node_id);
+        for n in chain.nodes.iter().filter(|n| n.depth > 0) {
+            if let Some(parent) = n.parent_id.or(root_id) {
+                children.entry(parent).or_default().push(n);
             }
-            if !include_tests && crate::domain::is_test_node(n.is_test, &n.name, &n.file_path) {
-                continue;
-            }
-            let indent = "  ".repeat(n.depth as usize);
-            writeln!(stdout, "{}→ {} ({})", indent, n.name, n.file_path)?;
+        }
+        if let Some(root) = root_id {
+            let mut visited = std::collections::HashSet::from([root]);
+            print_call_tree(&mut stdout, &children, root, include_tests, &mut visited)?;
         }
         if chain.limit_hit || chain.depth_capped {
             writeln!(stdout, "  ⚠ chain truncated for {}", rm.handler_name)?;
@@ -312,6 +319,31 @@ pub fn cmd_trace(project_root: &Path, args: TraceArgs) -> Result<()> {
         )?;
     }
 
+    Ok(())
+}
+
+/// Print the nodes under `parent` in `children`, depth-first, each indented by
+/// its traversal depth. `visited` keeps a malformed parent chain from looping.
+fn print_call_tree<W: std::io::Write>(
+    out: &mut W,
+    children: &std::collections::HashMap<i64, Vec<&crate::graph::query::CallGraphNode>>,
+    parent: i64,
+    include_tests: bool,
+    visited: &mut std::collections::HashSet<i64>,
+) -> std::io::Result<()> {
+    let Some(kids) = children.get(&parent) else {
+        return Ok(());
+    };
+    for n in kids {
+        if !visited.insert(n.node_id) {
+            continue;
+        }
+        if include_tests || !crate::domain::is_test_node(n.is_test, &n.name, &n.file_path) {
+            let indent = "  ".repeat(n.depth as usize);
+            writeln!(out, "{}→ {} ({})", indent, n.name, n.file_path)?;
+        }
+        print_call_tree(out, children, n.node_id, include_tests, visited)?;
+    }
     Ok(())
 }
 

@@ -6922,6 +6922,39 @@ fn test_cli_search_invalid_node_type() {
 // trace (no HTTP routes in test project, so test graceful handling)
 // ============================================================
 
+/// Each downstream call is printed under the function that makes it. The
+/// text output used to list the chain breadth-first, indented by depth only,
+/// so every depth-2 call landed under the LAST depth-1 call: flask's
+/// `trace /register` showed `_render` under `flash`, which never calls it.
+#[test]
+fn test_cli_trace_nests_calls_under_their_caller() {
+    let project = index_project(&[(
+        "app.js",
+        "const express = require('express');\nconst app = express();\n\n\
+         function leafA() { return 1; }\nfunction leafB() { return 2; }\n\
+         function stepA() { return leafA(); }\nfunction stepB() { return leafB(); }\n\n\
+         function handler(req, res) {\n  stepA();\n  stepB();\n  res.send('ok');\n}\n\n\
+         app.get('/x', handler);\n",
+    )]);
+    let (out, err, code) = run_cli(&project, &["trace", "/x", "--depth", "3"]);
+    assert_eq!(code, 0, "out={out} err={err}");
+    let lines: Vec<&str> = out
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| l.trim_start().starts_with('→'))
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "  → stepA (app.js)",
+            "    → leafA (app.js)",
+            "  → stepB (app.js)",
+            "    → leafB (app.js)",
+        ],
+        "{out}"
+    );
+}
+
 #[test]
 fn test_cli_trace_no_routes() {
     let project = setup_indexed_project();
