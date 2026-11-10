@@ -6391,6 +6391,60 @@ fn test_cli_deps_json() {
     assert!(v["depended_by"].is_array());
 }
 
+/// `deps` follows only the edges `callgraph` shows by default, and says how
+/// many files it left out. An `ambiguous` call is a by-name guess among several
+/// same-named definitions: gin's `bytesconv.go` imports only `unsafe`, yet
+/// `unsafe.String(...)` matched every `String` in the repo and `deps` listed
+/// half of it. Here `r.Render()` on an interface matches both `Render`s.
+#[test]
+fn test_cli_deps_skips_files_reached_only_by_ambiguous_calls() {
+    let project = index_project(&[
+        (
+            "a.go",
+            "package app\n\ntype A struct{}\n\nfunc (a A) Render() string { return \"a\" }\n",
+        ),
+        (
+            "b.go",
+            "package app\n\ntype B struct{}\n\nfunc (b B) Render() string { return \"b\" }\n",
+        ),
+        (
+            "c.go",
+            "package app\n\ntype renderer interface{ Render() string }\n\n\
+             func one(r renderer) string { return r.Render() }\n\nfunc helper() int { return 1 }\n",
+        ),
+        (
+            "d.go",
+            "package app\n\nfunc useHelper() int { return helper() }\n",
+        ),
+    ]);
+
+    // d.go -> c.go is a unique by-name call (inferred) and stays; a.go and b.go
+    // sit behind c.go's ambiguous `r.Render()` and go.
+    let (out, _, code) = run_cli(
+        &project,
+        &["deps", "d.go", "--direction", "outgoing", "--json"],
+    );
+    assert_eq!(code, 0, "{out}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let files: Vec<&str> = v["depends_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["file"].as_str())
+        .collect();
+    assert_eq!(files, vec!["c.go"], "{out}");
+    assert_eq!(v["ambiguous_only_hidden"], 2, "{out}");
+
+    // A file whose only outgoing edges are ambiguous: no tracked dependency,
+    // and the text says what was left out instead of implying nothing exists.
+    let (out, err, code) = run_cli(&project, &["deps", "c.go", "--direction", "outgoing"]);
+    assert!(!out.contains("a.go") && !out.contains("b.go"), "{out}");
+    assert!(
+        format!("{out}{err}").contains("2 more file(s) reachable only through ambiguous"),
+        "code={code} out={out} err={err}"
+    );
+}
+
 // clap-migrated (audit #4): clap owns --help + unknown-flag rejection. --direction
 // stays a String validated in-handler, so test_cli_deps_invalid_direction's exact
 // "must be one of" + exit-1 contract survives (a clap ValueEnum would change both).

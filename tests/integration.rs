@@ -2877,6 +2877,57 @@ func usesHelper2() int { return helper() }
     );
 }
 
+/// MCP `dependency_graph`, CLI `deps`'s twin, follows the same confidence floor
+/// and reports the same count of files it left out.
+#[test]
+fn test_dependency_graph_skips_files_reached_only_by_ambiguous_calls() {
+    let project = TempDir::new().unwrap();
+    for (name, body) in [
+        (
+            "a.go",
+            "package app\n\ntype A struct{}\n\nfunc (a A) Render() string { return \"a\" }\n",
+        ),
+        (
+            "b.go",
+            "package app\n\ntype B struct{}\n\nfunc (b B) Render() string { return \"b\" }\n",
+        ),
+        (
+            "c.go",
+            "package app\n\ntype renderer interface{ Render() string }\n\n\
+             func one(r renderer) string { return r.Render() }\n\nfunc helper() int { return 1 }\n",
+        ),
+        (
+            "d.go",
+            "package app\n\nfunc useHelper() int { return helper() }\n",
+        ),
+    ] {
+        fs::write(project.path().join(name), body).unwrap();
+    }
+
+    let server = common::init_server(&project);
+    let msg = tool_call_json(
+        "dependency_graph",
+        serde_json::json!({"file_path": "d.go", "direction": "outgoing"}),
+    );
+    let resp = server.handle_message(&msg).unwrap();
+    let result = parse_tool_result(&resp);
+    let files: Vec<&str> = result["depends_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["file"].as_str())
+        .collect();
+    assert_eq!(files, vec!["c.go"], "{result}");
+    assert_eq!(result["ambiguous_only_hidden"], 2, "{result}");
+    assert!(
+        result["summary"]
+            .as_str()
+            .unwrap()
+            .contains("2 more file(s) reachable only through ambiguous"),
+        "{result}"
+    );
+}
+
 /// Fix #3b: entry_points must carry `kind` distinguishing `main` vs `http_route`.
 #[test]
 fn test_project_map_entry_points_have_kind() {

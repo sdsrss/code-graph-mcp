@@ -321,16 +321,35 @@ impl McpServer {
             })
             .collect();
 
-        Ok(json!({
+        // Same floor and disclosure as CLI `deps`: files only ambiguous by-name
+        // calls reach are left out of the lists above and counted here.
+        let ambiguous_hidden =
+            queries::ambiguous_only_dependencies(self.db.conn(), file_path, direction, depth)?
+                .iter()
+                .filter(|p| is_compatible_lang(p))
+                .count();
+        let mut summary = format!(
+            "{} depends on {} file{}, {} file{} depend{} on it",
+            file_path,
+            outgoing.len(),
+            if outgoing.len() == 1 { "" } else { "s" },
+            incoming.len(),
+            if incoming.len() == 1 { "" } else { "s" },
+            if incoming.len() == 1 { "s" } else { "" }
+        );
+        let mut result = json!({
             "file": file_path,
             "depends_on": outgoing,
             "depended_by": incoming,
-            "summary": format!("{} depends on {} file{}, {} file{} depend{} on it",
-                file_path,
-                outgoing.len(), if outgoing.len() == 1 { "" } else { "s" },
-                incoming.len(), if incoming.len() == 1 { "" } else { "s" },
-                if incoming.len() == 1 { "s" } else { "" })
-        }))
+        });
+        if ambiguous_hidden > 0 {
+            summary.push_str(&format!(
+                "; {ambiguous_hidden} more file(s) reachable only through ambiguous by-name calls are not listed"
+            ));
+            result["ambiguous_only_hidden"] = json!(ambiguous_hidden);
+        }
+        result["summary"] = json!(summary);
+        Ok(result)
     }
 
     pub(in crate::mcp::server) fn tool_find_similar_code(

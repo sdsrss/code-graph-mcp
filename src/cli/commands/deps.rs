@@ -58,6 +58,20 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
     let conn = ctx.db.conn();
 
     let deps = queries::get_import_tree(conn, file_path, direction, depth)?;
+    // Files only ambiguous by-name calls reach are left out of `deps` (the
+    // floor `callgraph` applies by default); say how many, so a short or empty
+    // answer does not read as "nothing else depends on it".
+    let ambiguous_hidden = queries::ambiguous_only_dependencies(conn, file_path, direction, depth)?
+        .iter()
+        .filter(|p| crate::utils::config::is_compatible_lang(file_path, p))
+        .count();
+    let hidden_note = (ambiguous_hidden > 0).then(|| {
+        format!(
+            "({ambiguous_hidden} more file(s) reachable only through ambiguous by-name calls are \
+             not shown; `code-graph-mcp callgraph <symbol> --min-confidence ambiguous` lists \
+             those calls)"
+        )
+    });
     // A file that exists but is not in the index (D#253): reached through a
     // symlink, one the index scan skips (ignored, hidden, under
     // `node_modules`; D#262), or in a language the indexer does not parse. It answered "No
@@ -107,6 +121,10 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
                     }).collect::<Vec<_>>(),
                     "note": "no tracked dep edges; barrel_scan is raw re-export/import lines from file scan",
                 });
+                let mut result = result;
+                if ambiguous_hidden > 0 {
+                    result["ambiguous_only_hidden"] = serde_json::json!(ambiguous_hidden);
+                }
                 writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
             } else {
                 writeln!(stdout, "{}", file_path)?;
@@ -116,6 +134,9 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
                 )?;
                 for (ln, text) in lines {
                     writeln!(stdout, "    {}: {}", ln, text.trim())?;
+                }
+                if let Some(note) = &hidden_note {
+                    writeln!(stdout, "  {note}")?;
                 }
             }
             return Ok(());
@@ -143,13 +164,21 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
                     "File not found"
                 },
             });
+            let mut result = result;
+            if ambiguous_hidden > 0 {
+                result["ambiguous_only_hidden"] = serde_json::json!(ambiguous_hidden);
+            }
             println!("{}", serde_json::to_string(&result)?);
         }
         let msg = if file_exists {
-            format!(
+            let base = format!(
                 "[code-graph] No tracked dependencies for: {} (not a barrel/import file \u{2014} try `code-graph-mcp overview {}` or Read directly)",
                 file_path, file_path
-            )
+            );
+            match &hidden_note {
+                Some(note) => format!("{base} {note}"),
+                None => base,
+            }
         } else if is_dir {
             format!(
                 "[code-graph] {} is a directory \u{2014} `deps` analyzes a single file. Try `code-graph-mcp overview {}` for a directory, or pass a file path.",
@@ -220,6 +249,9 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
         if unresolved_incoming > 0 {
             result["unresolved_incoming"] = serde_json::json!(unresolved_incoming);
         }
+        if ambiguous_hidden > 0 {
+            result["ambiguous_only_hidden"] = serde_json::json!(ambiguous_hidden);
+        }
         writeln!(stdout, "{}", serde_json::to_string(&result)?)?;
         return Ok(());
     }
@@ -268,6 +300,9 @@ pub fn cmd_deps(project_root: &Path, args: DepsArgs) -> Result<()> {
             "  (no resolved deps; {} unresolved outgoing, {} unresolved incoming — targets are <external> or in another language)",
             unresolved_outgoing, unresolved_incoming
         )?;
+    }
+    if let Some(note) = &hidden_note {
+        writeln!(stdout, "  {note}")?;
     }
 
     Ok(())

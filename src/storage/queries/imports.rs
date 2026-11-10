@@ -19,6 +19,22 @@ enum FileHop {
     Incoming,
 }
 
+/// SQL condition keeping only edges at or above `callgraph`'s default floor
+/// (DEFAULT_RISK_CONF_FLOOR = inferred), or nothing when `skip_ambiguous` is
+/// false. An `ambiguous` edge is a by-name guess among several same-named
+/// definitions.
+fn conf_floor_sql(edge_alias: &str, skip_ambiguous: bool) -> String {
+    if skip_ambiguous {
+        format!(
+            "AND {edge_alias}.confidence IN ('{}', '{}')",
+            crate::domain::CONF_EXTRACTED,
+            crate::domain::CONF_INFERRED
+        )
+    } else {
+        String::new()
+    }
+}
+
 /// Max file ids bound into one frontier query. Keeps the `IN (...)` list well
 /// under SQLite's variable cap on a repo whose frontier is thousands of files.
 const FRONTIER_CHUNK: usize = 400;
@@ -45,6 +61,7 @@ fn file_closure(
     max_depth: i32,
     relations: &[&str],
     hop: FileHop,
+    skip_ambiguous: bool,
 ) -> Result<Vec<(String, i32)>> {
     // Relation IN-list built from trusted constants (no user input → no injection).
     let in_list = relations
@@ -53,6 +70,7 @@ fn file_closure(
         .collect::<Vec<_>>()
         .join(", ");
     let synthetic = crate::domain::synthetic_import_sql("e");
+    let conf = conf_floor_sql("e", skip_ambiguous);
     // `n_from` is the node on the frontier side of the edge, `n_to` the node on
     // the side we are expanding towards; the edge column each binds to is what
     // makes the hop outgoing or incoming.
@@ -87,7 +105,7 @@ fn file_closure(
                 "SELECT DISTINCT f_to.id, f_to.path
                  FROM nodes n_from
                  JOIN edges e ON e.{from_col} = n_from.id AND e.relation IN ({in_list})
-                   AND NOT {synthetic}
+                   AND NOT {synthetic} {conf}
                  JOIN nodes n_to ON n_to.id = e.{to_col}
                  JOIN files f_to ON f_to.id = n_to.file_id
                  WHERE n_from.file_id IN ({placeholders})"
@@ -139,6 +157,7 @@ fn cross_file_symbol_counts(
     root_path: &str,
     relations: &[&str],
     hop: FileHop,
+    skip_ambiguous: bool,
 ) -> Result<BTreeMap<String, i64>> {
     let in_list = relations
         .iter()
@@ -146,6 +165,7 @@ fn cross_file_symbol_counts(
         .collect::<Vec<_>>()
         .join(", ");
     let synthetic = crate::domain::synthetic_import_sql("ea");
+    let conf = conf_floor_sql("ea", skip_ambiguous);
     // The counted symbol is always the edge TARGET (`nb`), as in the CTE's
     // `COUNT(DISTINCT nb.id)`; only which end is pinned to the root changes.
     let (pinned, grouped) = match hop {
@@ -157,7 +177,7 @@ fn cross_file_symbol_counts(
          FROM nodes na
          JOIN files fa ON fa.id = na.file_id
          JOIN edges ea ON ea.source_id = na.id AND ea.relation IN ({in_list})
-           AND NOT {synthetic}
+           AND NOT {synthetic} {conf}
          JOIN nodes nb ON nb.id = ea.target_id
          JOIN files fb ON fb.id = nb.file_id
          WHERE {pinned}.path = ?1
@@ -195,8 +215,10 @@ pub fn get_import_tree(
     }
     let max_depth = max_depth.clamp(1, 10);
     // Dependency-graph view: a file "depends on" another when it imports from it
-    // or calls into it. (`affected` deliberately walks a wider relation set —
-    // see `get_reverse_dependents`.)
+    // or calls into it, over the edges `callgraph` shows by default (ambiguous
+    // by-name guesses are left out; [`ambiguous_only_dependencies`] counts what
+    // that hides). `affected` deliberately walks a wider relation set and every
+    // edge — see `get_reverse_dependents`.
     let relations = [REL_IMPORTS, REL_CALLS];
     let mut results = Vec::new();
 
@@ -207,8 +229,8 @@ pub fn get_import_tree(
         if direction != dir_name && direction != "both" {
             continue;
         }
-        let closure = file_closure(conn, file_path, max_depth, &relations, hop)?;
-        let counts = cross_file_symbol_counts(conn, file_path, &relations, hop)?;
+        let closure = file_closure(conn, file_path, max_depth, &relations, hop, true)?;
+        let counts = cross_file_symbol_counts(conn, file_path, &relations, hop, true)?;
         let mut deps: Vec<FileDependency> = closure
             .into_iter()
             .map(|(path, depth)| {
@@ -281,7 +303,48 @@ pub fn get_reverse_dependents(
         REL_IMPLEMENTS,
         REL_INHERITS,
     ];
-    file_closure(conn, file_path, max_depth, &relations, FileHop::Incoming)
+    file_closure(
+        conn,
+        file_path,
+        max_depth,
+        &relations,
+        FileHop::Incoming,
+        false,
+    )
+}
+
+/// Files [`get_import_tree`] leaves out because only ambiguous edges reach
+/// them (directly, or through a file only an ambiguous edge reaches), for the
+/// same `direction` and `max_depth`. Sorted, each path once.
+pub fn ambiguous_only_dependencies(
+    conn: &Connection,
+    file_path: &str,
+    direction: &str,
+    max_depth: i32,
+) -> Result<Vec<String>> {
+    use crate::domain::{REL_CALLS, REL_IMPORTS};
+    let max_depth = max_depth.clamp(1, 10);
+    let relations = [REL_IMPORTS, REL_CALLS];
+    let mut hidden = std::collections::BTreeSet::new();
+    for (dir_name, hop) in [
+        ("outgoing", FileHop::Outgoing),
+        ("incoming", FileHop::Incoming),
+    ] {
+        if direction != dir_name && direction != "both" {
+            continue;
+        }
+        let shown: HashSet<String> =
+            file_closure(conn, file_path, max_depth, &relations, hop, true)?
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect();
+        for (path, _) in file_closure(conn, file_path, max_depth, &relations, hop, false)? {
+            if !shown.contains(&path) {
+                hidden.insert(path);
+            }
+        }
+    }
+    Ok(hidden.into_iter().collect())
 }
 
 /// All distinct cross-file `imports` edges as `(source_file, target_file)` pairs
