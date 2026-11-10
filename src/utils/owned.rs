@@ -340,6 +340,10 @@ pub(crate) fn reject_symlinked_dir(path: &Path) -> io::Result<()> {
 /// for a sidecar hard-linked to an unrelated file, that file (a `-wal` linked
 /// to a 5-byte file grew it to 12,392 bytes of WAL frames). The lstat-then-open
 /// race is not closed either: it needs a concurrent local writer.
+///
+/// This is the file-shape half. Callers opening the tool's own index go through
+/// `storage::db::reject_unowned_index`, which adds the half only SQLite can
+/// answer: a regular `-journal` it would roll back (D#759).
 pub(crate) fn reject_unowned_db(db_path: &Path) -> io::Result<()> {
     for suffix in ["", "-wal", "-shm", "-journal"] {
         let mut name = db_path.as_os_str().to_os_string();

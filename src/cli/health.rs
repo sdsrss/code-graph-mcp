@@ -251,7 +251,7 @@ pub fn cmd_health_check_opts(project_root: &Path, format: &str, deep: bool) -> R
         // The database file and its sidecars too (D#363): a symlinked index.db
         // was reported healthy with the link target's counts.
         let refusal = crate::utils::owned::reject_symlinked_dir(&cg_dir)
-            .and_then(|()| crate::utils::owned::reject_unowned_db(&db_path))
+            .and_then(|()| crate::storage::db::reject_unowned_index(&db_path))
             .err();
         if refusal.is_some() || !db_path.exists() {
             let (reason, issue) = match &refusal {

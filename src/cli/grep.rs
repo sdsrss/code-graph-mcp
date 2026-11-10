@@ -1051,7 +1051,7 @@ pub fn cmd_grep(project_root: &Path, args: GrepArgs) -> Result<()> {
         let cg_dir = effective_read_root(project_root).join(CODE_GRAPH_DIR);
         let db_path = cg_dir.join("index.db");
         if let Err(e) = crate::utils::owned::reject_symlinked_dir(&cg_dir)
-            .and_then(|()| crate::utils::owned::reject_unowned_db(&db_path))
+            .and_then(|()| crate::storage::db::reject_unowned_index(&db_path))
         {
             eprintln!("[code-graph] {e}");
         } else if let Some((done, total)) =

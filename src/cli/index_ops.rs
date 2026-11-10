@@ -436,7 +436,7 @@ pub fn cmd_incremental_index_opts(
     let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
     // Before the lock and the status sweep, as above: a dangling index.db link
     // took the "no index yet" branch and built a database at its target (D#363).
-    crate::utils::owned::reject_unowned_db(&db_path)?;
+    crate::storage::db::reject_unowned_index(&db_path)?;
     let code_graph_dir = project_root.join(CODE_GRAPH_DIR);
     // One build at a time (D#406), held to the end of the index; the embedding
     // runs without it. Taken BEFORE the server check below: a server that

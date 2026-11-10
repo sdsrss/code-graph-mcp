@@ -293,7 +293,7 @@ impl CliContext {
         let db_path = project_root.join(CODE_GRAPH_DIR).join("index.db");
         // Ahead of `exists()`, which follows a link: a dangling `index.db` link
         // read as "No index found" (D#363). The open refuses it as well.
-        crate::utils::owned::reject_unowned_db(&db_path)?;
+        crate::storage::db::reject_unowned_index(&db_path)?;
         if !db_path.exists() {
             return Err(NoIndexError { db_path }.into());
         }

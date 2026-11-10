@@ -4629,3 +4629,32 @@ fn mcp_server_refuses_a_symlinked_index_db() {
         assert_eq!(names, ["index.db"], "{shape}: files created outside");
     }
 }
+
+/// D#759, the MCP server's door: a hot `index.db-journal` beside an existing
+/// index. Server startup rolled it back into the index (its header sets the
+/// file's size: 0 pages here, which empties it) before reading anything.
+#[test]
+fn mcp_server_refuses_a_hot_journal_beside_the_index() {
+    let project = TempDir::new().unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    let cg = project.path().join(".code-graph");
+    fs::create_dir(&cg).unwrap();
+    let db = cg.join("index.db");
+    drop(Database::open(&db).unwrap());
+    let journal = cg.join("index.db-journal");
+    // Journal magic, then nRec 0, a nonce, 0 original pages, sector 512, page 4096.
+    let mut planted = vec![0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+    for field in [0u32, 0x1234_5678, 0, 512, 4096] {
+        planted.extend_from_slice(&field.to_be_bytes());
+    }
+    planted.resize(512, 0);
+    fs::write(&journal, &planted).unwrap();
+    let bytes = fs::read(&db).unwrap();
+
+    let err = McpServer::from_project_root(project.path())
+        .err()
+        .expect("a hot journal beside the index must be refused");
+    assert!(format!("{err:#}").contains("rollback journal"), "{err:#}");
+    assert!(fs::read(&db).unwrap() == bytes, "index.db changed");
+    assert!(fs::read(&journal).unwrap() == planted, "journal changed");
+}

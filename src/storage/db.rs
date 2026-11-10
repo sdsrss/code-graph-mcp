@@ -50,6 +50,66 @@ pub(crate) fn sqlite_file_name(path: &Path) -> std::path::PathBuf {
     }
 }
 
+/// Refuse to open the tool's own index over a file it did not put there: the
+/// file shapes of `utils::owned::reject_unowned_db` (a symlinked or
+/// non-regular `index.db`, `-wal`, `-shm` or `-journal`), and a regular
+/// `-journal` that SQLite would roll back (D#759). Every caller that opens
+/// `.code-graph/index.db` asks this first, so they refuse alike — and
+/// `health-check` can answer the refusal with its `refused` report.
+///
+/// SQLite rolls a hot journal back on the first read of every open, before any
+/// statement of the caller runs, and the journal's header decides the result:
+/// its recorded page count sets the database's size (a 512-byte file took an
+/// index to 281,474,976,645,120 bytes apparent, or to 0 bytes, emptying it from
+/// a read-only command, 0.190.1), and before SQLite 3.54 a path in its trailer
+/// named a file to delete. This tool writes a rollback journal only while
+/// creating a 0-page database, so a hot one beside an existing index is not
+/// its own. A `-wal` is not judged: the tool leaves one behind in normal use,
+/// and a crash leaves one SQLite must replay.
+pub(crate) fn reject_unowned_index(db_path: &Path) -> std::io::Result<()> {
+    crate::utils::owned::reject_unowned_db(db_path)?;
+    let mut journal = db_path.as_os_str().to_os_string();
+    journal.push("-journal");
+    let journal = Path::new(&journal);
+    if journal.is_file() && sqlite_would_roll_back(db_path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to open {}: {} is a rollback journal SQLite would replay into \
+                 the index, and code-graph-mcp keeps the index in WAL mode and leaves no \
+                 such journal (a repository can carry one) — remove it and re-run",
+                db_path.display(),
+                journal.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether SQLite would roll back the `-journal` beside `db_path` on the next
+/// open. SQLite answers through a read-only connection, which reports such a
+/// journal as `SQLITE_READONLY_ROLLBACK` and touches neither file. "A regular
+/// file is there" is not the same question: a journal whose first byte is zero
+/// is not hot, and neither is one a live writer holds RESERVED on — another
+/// process creating the index this moment, whose commit fails with
+/// `IOERR_DELETE_NOENT` if the journal goes. Anything else the probe meets
+/// (absent or unreadable database, BUSY past the timeout) answers `false` and
+/// is left for the real open to report.
+fn sqlite_would_roll_back(db_path: &Path) -> bool {
+    let Ok(probe) = Connection::open_with_flags(
+        sqlite_file_name(db_path),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return false;
+    };
+    let _ = probe.busy_timeout(std::time::Duration::from_secs(5));
+    matches!(
+        probe.query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0)),
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK
+    )
+}
+
 fn register_sqlite_vec() {
     VEC_INIT.call_once(|| {
         // SAFETY: sqlite3_vec_init has the exact C ABI signature expected by
@@ -119,7 +179,7 @@ impl Database {
         // Before SQLite sees the path: it follows a symlinked index.db to the
         // target, and a read-only open of a WAL database still writes its
         // -shm/-wal there (D#363; see `reject_unowned_db`).
-        crate::utils::owned::reject_unowned_db(path)?;
+        reject_unowned_index(path)?;
         Self::open_readonly_named(path)
     }
 
@@ -208,7 +268,7 @@ impl Database {
         // call follows links): a symlinked index.db is opened at its TARGET by
         // SQLite, and an indexer open then rewrites or creates a database
         // outside the project (D#363; see `reject_unowned_db`).
-        crate::utils::owned::reject_unowned_db(path)?;
+        reject_unowned_index(path)?;
         // Proactive sub-header size guard: any pre-existing main file smaller
         // than the 100-byte SQLite database header cannot be a valid database.
         // Without this, post-crash residue (0-byte main + stale .wal/.shm,
@@ -3429,5 +3489,122 @@ mod tests {
                 "{shape}"
             );
         }
+    }
+
+    /// A rollback journal SQLite calls hot (the journal magic first, so its
+    /// first byte is not zero) whose one header records `orig_pages` as the
+    /// database's size before the transaction, and no page records. Playing it
+    /// back truncates or extends the database to `orig_pages` x 4,096 bytes
+    /// (`pager_playback` -> `pager_truncate`) and writes nothing else.
+    fn size_setting_journal(orig_pages: u32) -> Vec<u8> {
+        const MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+        let mut journal = MAGIC.to_vec();
+        // nRec, checksum nonce, original page count, sector size, page size.
+        for field in [0u32, 0x1234_5678, orig_pages, 512, 4096] {
+            journal.extend_from_slice(&field.to_be_bytes());
+        }
+        journal.resize(512, 0);
+        journal
+    }
+
+    /// D#759: a `-journal` beside the index that the tool did not write. SQLite
+    /// rolls a hot journal back on the first read of every open, before any
+    /// statement of ours runs, so a 512-byte file sized the user's index to
+    /// whatever its header said: 281,474,976,645,120 bytes apparent from a
+    /// health-check (0.190.1, measured), or 0 bytes, which emptied the index
+    /// (103 nodes -> 0) from a READER. The tool keeps the index in WAL mode and
+    /// writes a rollback journal only while creating a 0-page database, so every
+    /// constructor that opens the tool's own index refuses one SQLite calls hot,
+    /// and leaves both files as they were.
+    #[test]
+    fn a_hot_journal_beside_the_index_is_refused_not_rolled_back() {
+        for (shape, orig_pages) in [("grow", 4096u32), ("empty", 0)] {
+            let dir = TempDir::new().unwrap();
+            let db = dir.path().join("index.db");
+            drop(Database::open(&db).unwrap());
+            let journal = dir.path().join("index.db-journal");
+            std::fs::write(&journal, size_setting_journal(orig_pages)).unwrap();
+            let before = std::fs::read(&db).unwrap();
+
+            // Control: the same pair handed to SQLite as it is. Proves this
+            // SQLite still plays the fixture back, so the refusals below are
+            // the guard and not a journal SQLite would have ignored anyway.
+            let control_dir = TempDir::new().unwrap();
+            let control = control_dir.path().join("index.db");
+            std::fs::copy(&db, &control).unwrap();
+            std::fs::copy(&journal, control_dir.path().join("index.db-journal")).unwrap();
+            let conn = Connection::open(&control).unwrap();
+            let _ = conn.query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0));
+            drop(conn);
+            assert_eq!(
+                std::fs::metadata(&control).unwrap().len(),
+                u64::from(orig_pages) * 4096,
+                "{shape}: control: SQLite must roll the fixture back"
+            );
+            assert_ne!(before.len() as u64, u64::from(orig_pages) * 4096);
+
+            type Open = fn(&Path) -> Result<Database>;
+            let opens: [(&str, Open); 3] = [
+                ("open", Database::open),
+                ("open_nondestructive", Database::open_nondestructive),
+                ("open_readonly", Database::open_readonly),
+            ];
+            for (name, open) in opens {
+                let msg = match open(&db) {
+                    Ok(_) => panic!("{shape}/{name}: a hot journal must be refused"),
+                    Err(e) => e.to_string(),
+                };
+                assert!(msg.contains("rollback journal"), "{shape}/{name}: {msg}");
+                assert!(
+                    msg.contains(&journal.display().to_string()),
+                    "{shape}/{name}: must name the journal: {msg}"
+                );
+                assert!(
+                    std::fs::read(&db).unwrap() == before,
+                    "{shape}/{name}: index.db changed"
+                );
+                assert!(
+                    std::fs::read(&journal).unwrap() == size_setting_journal(orig_pages),
+                    "{shape}/{name}: the journal is the user's to remove"
+                );
+            }
+        }
+    }
+
+    /// The two journals SQLite itself does not roll back stay accepted, so the
+    /// refusal above is SQLite's own "hot", not "a file is there": one whose
+    /// first byte is zero, and one a live writer holds (RESERVED lock) — the
+    /// journal of a process creating the index right now. Removing or refusing
+    /// that one would fail the writer's commit (`IOERR_DELETE_NOENT`) or a
+    /// reader that raced it.
+    #[test]
+    fn a_journal_sqlite_would_not_roll_back_is_accepted() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("index.db");
+        drop(Database::open(&db).unwrap());
+        std::fs::write(dir.path().join("index.db-journal"), [0u8; 512]).unwrap();
+        Database::open_nondestructive(&db).expect("a zero-headed journal is not hot");
+        Database::open_readonly(&db).expect("readonly, zero-headed journal");
+        Database::open(&db).expect("indexer, zero-headed journal");
+
+        // `synchronous = OFF` so the writer puts the magic in its journal at
+        // once: otherwise SQLite zeroes it until the journal is synced
+        // (`writeJournalHdr`), and by then the writer holds EXCLUSIVE and the
+        // probe would see BUSY instead of the RESERVED lock this pins.
+        let live = dir.path().join("live.db");
+        let writer = Connection::open(&live).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = DELETE; PRAGMA synchronous = OFF; CREATE TABLE t(v); \
+                 BEGIN IMMEDIATE; INSERT INTO t VALUES (randomblob(9000));",
+            )
+            .unwrap();
+        let live_journal = dir.path().join("live.db-journal");
+        assert!(
+            std::fs::read(&live_journal).is_ok_and(|j| j.first().is_some_and(|b| *b != 0)),
+            "precondition: the writer's journal is on disk and starts with its magic"
+        );
+        reject_unowned_index(&live).expect("a journal a live writer holds is not a planted one");
+        writer.execute_batch("ROLLBACK;").unwrap();
     }
 }

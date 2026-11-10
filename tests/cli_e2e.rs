@@ -13795,6 +13795,63 @@ fn test_cli_refuses_an_index_db_or_sidecar_that_is_not_a_regular_file() {
     );
 }
 
+/// D#759: a regular `index.db-journal` a repository carries, beside the user's
+/// own index. Every open rolled it back before reading: a 512-byte journal
+/// recording 0 pages emptied the index from `health-check` (103 nodes -> 0,
+/// 0.190.1). Every door that refuses a planted `index.db` refuses this one, and
+/// the index is still there for the user once the journal is gone.
+#[cfg(unix)]
+#[test]
+fn test_cli_refuses_a_hot_journal_beside_the_index() {
+    let project = setup_indexed_project();
+    let cg = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    let db = cg.join("index.db");
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(cg.join(format!("index.db{suffix}")));
+    }
+    let journal = cg.join("index.db-journal");
+    // Journal magic, then nRec 0, a nonce, 0 original pages, sector 512, page
+    // 4096: SQLite calls it hot and its playback truncates index.db to 0 bytes.
+    let mut bytes = vec![0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+    for field in [0u32, 0x1234_5678, 0, 512, 4096] {
+        bytes.extend_from_slice(&field.to_be_bytes());
+    }
+    bytes.resize(512, 0);
+    std::fs::write(&journal, &bytes).unwrap();
+    let before = std::fs::read(&db).unwrap();
+
+    let why = "rollback journal";
+    for args in [
+        &["show", "validateToken"][..],
+        &["callgraph", "validateToken"][..],
+        &["impact", "validateToken"][..],
+        &["search", "validateToken"][..],
+        &["health-check"][..],
+        &["incremental-index", "--no-embed"][..],
+    ] {
+        let (stdout, stderr, code) = run_cli(&project, args);
+        assert_ne!(code, 0, "{args:?} must refuse: {stdout}{stderr}");
+        assert!(
+            format!("{stdout}{stderr}").contains(why),
+            "{args:?} must name the reason: {stdout}{stderr}"
+        );
+    }
+    let (stdout, stderr, code) = run_cli(&project, &["grep", "validateToken"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stderr.contains(why), "{stderr}");
+    assert_health_json_refused(&project, why);
+    assert!(std::fs::read(&db).unwrap() == before, "index.db changed");
+    assert!(
+        std::fs::read(&journal).unwrap() == bytes,
+        "the journal is the user's to remove"
+    );
+
+    std::fs::remove_file(&journal).unwrap();
+    let (stdout, stderr, code) = run_cli(&project, &["show", "validateToken"]);
+    assert_eq!(code, 0, "the index survived: {stdout}{stderr}");
+    assert!(stdout.contains("validateToken"), "{stdout}");
+}
+
 /// E2E 2026-10-16 (CLI-user QA, P0): on leveldb every `affected` answered
 /// "0 test file(s) to re-run" — `util/coding_test.cc` among them — because
 /// `is_test_path` knows no C/C++ test file naming. The gtest cases in those
