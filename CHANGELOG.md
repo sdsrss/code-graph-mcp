@@ -107,10 +107,11 @@ marker still gets it). (D#346)
   507 bytes" (470 + 13 for `/.code-graph/` + 17 for `index.db.rebuild-` + 7
   PID digits): the number is that file's path, not `index.db`'s.
 - The GitHub Release pages of 0.143.0–0.163.0 (with 0.145.1) and 0.166.0,
-  23 pages, still tell readers to `cargo install code-graph-mcp --version
-  X`; no such crate exists on crates.io. This file's copies of those
-  entries, and 0.19.0's `cargo install code-graph-mcp@0.18.4`, now name the
-  git tag instead. The 0.134.0 and v0.18.4 entries still describe a
+  23 pages, told readers to `cargo install code-graph-mcp --version X`; no
+  such crate exists on crates.io. This file's copies of those entries, and
+  0.19.0's `cargo install code-graph-mcp@0.18.4`, now name the git tag
+  instead, and so do those 23 pages since 2026-11-10 (that one line
+  rewritten on each). The 0.134.0 and v0.18.4 entries still describe a
   `cargo install code-graph-mcp` build.
 
 ## 0.189.0
