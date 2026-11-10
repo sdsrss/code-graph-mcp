@@ -95,11 +95,13 @@ pub(crate) fn reject_unowned_index(db_path: &Path) -> std::io::Result<()> {
 /// nothing: its first header records 0 original pages, so playback truncates
 /// the database to 0 bytes and skips every page record past that size
 /// (`pager_playback` sets `dbSize` from the first header only), and the
-/// database is at most one page — no table, no index to lose. That is what a
-/// process killed while creating a new index leaves, and 0.190.1 recovered
-/// from it by rolling it back; refusing it left the project refused until the
-/// user found the file (0.191.0 pre-tag review F1). The same journal beside a
-/// database of two pages or more empties a real index and stays refused.
+/// database is at most one page of its own page size with no non-empty
+/// `-wal` beside it — no table, no index to lose. That is what a process
+/// killed while creating a new index leaves, and 0.190.1 recovered from it by
+/// rolling it back; refusing it left the project refused until the user found
+/// the file (0.191.0 pre-tag review F1). The same journal beside a database of
+/// two pages or more, or beside one page whose index is still in the WAL
+/// (review R2), empties a real index and stays refused.
 fn rolls_back_only_an_empty_database(db_path: &Path, journal: &Path) -> bool {
     use std::io::Read;
     let mut header = [0u8; 20];
@@ -107,6 +109,15 @@ fn rolls_back_only_an_empty_database(db_path: &Path, journal: &Path) -> bool {
         .and_then(|mut f| f.read_exact(&mut header))
         .map(|()| u32::from_be_bytes([header[16], header[17], header[18], header[19]]));
     if !matches!(recorded_pages, Ok(0)) {
+        return false;
+    }
+    // The database is the file AND its WAL: a first build killed before its
+    // first checkpoint leaves one page in the file and the whole index in the
+    // WAL, and SQLite deletes that WAL once the rollback has emptied the file
+    // (0.191.0 pre-tag review R2). A killed creation has no WAL yet.
+    let mut wal = db_path.as_os_str().to_os_string();
+    wal.push("-wal");
+    if std::fs::symlink_metadata(Path::new(&wal)).is_ok_and(|m| m.len() > 0) {
         return false;
     }
     let Ok(len) = std::fs::metadata(db_path).map(|m| m.len()) else {
@@ -3750,5 +3761,59 @@ mod tests {
             .to_string();
         assert!(msg.contains("rollback journal"), "{msg}");
         assert_eq!(std::fs::metadata(&db).unwrap().len(), 4096);
+
+        // One page in the file, the whole index in the WAL: what a first index
+        // build killed before its first checkpoint leaves (0.191.0 pre-tag
+        // review R2). Rolling a 0-page journal back truncates the file to 0 and
+        // SQLite then deletes the WAL beside the empty file, so the index goes.
+        let live_dir = TempDir::new().unwrap();
+        let live = live_dir.path().join("index.db");
+        let writer = Connection::open(&live).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0; \
+                 CREATE TABLE t(v); INSERT INTO t VALUES (randomblob(20000));",
+            )
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("index.db");
+        std::fs::copy(&live, &db).unwrap();
+        std::fs::copy(
+            live_dir.path().join("index.db-wal"),
+            dir.path().join("index.db-wal"),
+        )
+        .unwrap();
+        drop(writer);
+        assert!(
+            std::fs::metadata(&db).unwrap().len() <= 4096,
+            "precondition: the file alone is at most one page"
+        );
+        let control = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0));
+        assert!(
+            matches!(control, Ok(1)),
+            "precondition: the table lives in the WAL ({control:?})"
+        );
+        std::fs::write(dir.path().join("index.db-journal"), size_setting_journal(0)).unwrap();
+        let msg = reject_unowned_index(&db)
+            .expect_err("the index is in the WAL")
+            .to_string();
+        assert!(msg.contains("rollback journal"), "{msg}");
+
+        // A database of 1,024-byte pages: two pages, 2,048 bytes, hold a table.
+        // The limit is the database's own page size, not 4,096.
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("index.db");
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("PRAGMA page_size = 1024; CREATE TABLE t(v);")
+            .unwrap();
+        assert_eq!(std::fs::metadata(&db).unwrap().len(), 2048, "precondition");
+        std::fs::write(dir.path().join("index.db-journal"), size_setting_journal(0)).unwrap();
+        let msg = reject_unowned_index(&db)
+            .expect_err("two 1,024-byte pages hold a table")
+            .to_string();
+        assert!(msg.contains("rollback journal"), "{msg}");
     }
 }
