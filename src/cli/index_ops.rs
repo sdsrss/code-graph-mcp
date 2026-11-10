@@ -70,11 +70,35 @@ pub(crate) fn wrap_index_busy<T>(r: Result<T>) -> Result<T> {
     })
 }
 
+/// Which index an embedding pass writes into.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EmbedTarget {
+    /// The live `index.db`: its structure is already committed and queryable.
+    Live,
+    /// `rebuild-index`'s temp copy, renamed over `index.db` only after this
+    /// pass finishes.
+    Staged,
+}
+
+/// The line printed before a long embedding pass.
+fn embedding_banner(pending: i64, target: EmbedTarget) -> String {
+    match target {
+        EmbedTarget::Live => {
+            format!("Embedding {pending} nodes (structure is already queryable)...")
+        }
+        EmbedTarget::Staged => format!(
+            "Embedding {pending} nodes; the rebuilt index replaces the current one when this \
+             finishes (the current index keeps answering until then, and an interrupt \
+             discards the rebuild; `--no-embed` skips this step)..."
+        ),
+    }
+}
+
 /// Embed any nodes still missing vectors (synchronous, unlike the server's
 /// background thread). No-op without the `embed-model` feature or when the model
 /// can't load. Shared by the full / incremental / rebuild paths so embedding
 /// behaviour can't drift between them.
-pub(crate) fn embed_missing_nodes(db: &Database, quiet: bool) -> Result<()> {
+pub(crate) fn embed_missing_nodes(db: &Database, quiet: bool, target: EmbedTarget) -> Result<()> {
     if !db.vec_enabled() {
         return Ok(());
     }
@@ -95,7 +119,7 @@ pub(crate) fn embed_missing_nodes(db: &Database, quiet: bool) -> Result<()> {
         let pending = queries::count_unembedded_nodes(db.conn()).unwrap_or(0);
         let show_progress = !quiet && pending >= PROGRESS_MIN_NODES;
         if show_progress {
-            eprintln!("Embedding {pending} nodes (structure is already queryable)...");
+            eprintln!("{}", embedding_banner(pending, target));
         }
         let mut last_tick = std::time::Instant::now();
         // Skip nodes that fail to embed this run. This loop only stops on an empty
@@ -169,7 +193,7 @@ pub(crate) fn build_full_index_at(
     no_embed: bool,
 ) -> Result<crate::indexer::pipeline::IndexResult> {
     let (db, result) = index_full_at(db_path, project_root, quiet)?;
-    finish_embedding(&db, quiet, no_embed)?;
+    finish_embedding(&db, quiet, no_embed, EmbedTarget::Staged)?;
     Ok(result)
 }
 
@@ -245,7 +269,12 @@ pub(crate) fn emit_index_json(
 /// `--no-embed` skips it: the caller gets the fast structural index and the
 /// vectors backfill later (the MCP server's background embedder fills any node
 /// lacking a vector, resumably; or rerun without the flag to embed now).
-pub(crate) fn finish_embedding(db: &Database, quiet: bool, no_embed: bool) -> Result<()> {
+pub(crate) fn finish_embedding(
+    db: &Database,
+    quiet: bool,
+    no_embed: bool,
+    target: EmbedTarget,
+) -> Result<()> {
     if no_embed {
         if !quiet && db.vec_enabled() {
             let (embedded, embeddable) =
@@ -259,7 +288,7 @@ pub(crate) fn finish_embedding(db: &Database, quiet: bool, no_embed: bool) -> Re
         }
         return Ok(());
     }
-    embed_missing_nodes(db, quiet)
+    embed_missing_nodes(db, quiet, target)
 }
 
 /// Warn if another process holds the index lock. A running MCP server holds the
@@ -497,7 +526,7 @@ pub fn cmd_incremental_index_opts(
         // whose context was rewritten) can get the vector of its old text
         // (D#429).
         drop(build);
-        finish_embedding(&db, quiet, no_embed)?;
+        finish_embedding(&db, quiet, no_embed, EmbedTarget::Live)?;
         if json {
             emit_index_json("full", &result, started);
         }
@@ -529,7 +558,7 @@ pub fn cmd_incremental_index_opts(
 
     // As in the first-index branch above.
     drop(build);
-    finish_embedding(&db, quiet, no_embed)?;
+    finish_embedding(&db, quiet, no_embed, EmbedTarget::Live)?;
     if json {
         emit_index_json("incremental", &stats, started);
     }
@@ -676,4 +705,28 @@ pub fn cmd_rebuild_index(project_root: &Path, args: RebuildIndexArgs) -> Result<
         emit_index_json("rebuild", &result, started);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod embed_banner_tests {
+    use super::*;
+
+    /// `rebuild-index` builds into a temp file and swaps it in only after
+    /// embedding, so during that pass the live index is still the OLD one and
+    /// an interrupt discards the whole rebuild. Telling that user "structure is
+    /// already queryable" invited exactly that interrupt, which threw away a
+    /// 4-minute rebuild on flask (1,721 nodes to embed).
+    #[test]
+    fn staged_banner_says_the_current_index_answers_until_the_swap() {
+        let staged = embedding_banner(1721, EmbedTarget::Staged);
+        assert!(staged.starts_with("Embedding 1721 nodes"), "{staged}");
+        assert!(!staged.contains("already queryable"), "{staged}");
+        assert!(staged.contains("current index keeps answering"), "{staged}");
+        assert!(staged.contains("--no-embed"), "{staged}");
+        // The live pass keeps its line: there the structure IS committed.
+        assert_eq!(
+            embedding_banner(1721, EmbedTarget::Live),
+            "Embedding 1721 nodes (structure is already queryable)..."
+        );
+    }
 }
