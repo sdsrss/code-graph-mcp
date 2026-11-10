@@ -64,26 +64,70 @@ pub(crate) fn sqlite_file_name(path: &Path) -> std::path::PathBuf {
 /// a read-only command, 0.190.1), and before SQLite 3.54 a path in its trailer
 /// named a file to delete. This tool writes a rollback journal only while
 /// creating a 0-page database, so a hot one beside an existing index is not
-/// its own. A `-wal` is not judged: the tool leaves one behind in normal use,
-/// and a crash leaves one SQLite must replay.
+/// its own; the one a killed creation leaves is let through, see
+/// [`rolls_back_only_an_empty_database`]. A `-wal` is not judged: the tool
+/// leaves one behind in normal use, and a crash leaves one SQLite must replay.
 pub(crate) fn reject_unowned_index(db_path: &Path) -> std::io::Result<()> {
     crate::utils::owned::reject_unowned_db(db_path)?;
     let mut journal = db_path.as_os_str().to_os_string();
     journal.push("-journal");
     let journal = Path::new(&journal);
-    if journal.is_file() && sqlite_would_roll_back(db_path) {
+    if journal.is_file()
+        && sqlite_would_roll_back(db_path)
+        && !rolls_back_only_an_empty_database(db_path, journal)
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "refusing to open {}: {} is a rollback journal SQLite would replay into \
-                 the index, and code-graph-mcp keeps the index in WAL mode and leaves no \
-                 such journal (a repository can carry one) — remove it and re-run",
+                 the index; code-graph-mcp keeps the index in WAL mode and writes no such \
+                 journal beside an existing index (a repository can carry one) — remove \
+                 it and re-run",
                 db_path.display(),
                 journal.display()
             ),
         ));
     }
     Ok(())
+}
+
+/// Whether rolling `journal` back can only empty a database that holds
+/// nothing: its first header records 0 original pages, so playback truncates
+/// the database to 0 bytes and skips every page record past that size
+/// (`pager_playback` sets `dbSize` from the first header only), and the
+/// database is at most one page — no table, no index to lose. That is what a
+/// process killed while creating a new index leaves, and 0.190.1 recovered
+/// from it by rolling it back; refusing it left the project refused until the
+/// user found the file (0.191.0 pre-tag review F1). The same journal beside a
+/// database of two pages or more empties a real index and stays refused.
+fn rolls_back_only_an_empty_database(db_path: &Path, journal: &Path) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 20];
+    let recorded_pages = std::fs::File::open(journal)
+        .and_then(|mut f| f.read_exact(&mut header))
+        .map(|()| u32::from_be_bytes([header[16], header[17], header[18], header[19]]));
+    if !matches!(recorded_pages, Ok(0)) {
+        return false;
+    }
+    let Ok(len) = std::fs::metadata(db_path).map(|m| m.len()) else {
+        return false;
+    };
+    if len < SQLITE_HEADER_SIZE {
+        return true;
+    }
+    let mut db_header = [0u8; 18];
+    if std::fs::File::open(db_path)
+        .and_then(|mut f| f.read_exact(&mut db_header))
+        .is_err()
+    {
+        return false;
+    }
+    // The page size, big-endian at offset 16; 1 stands for 65,536.
+    let page_size = match u16::from_be_bytes([db_header[16], db_header[17]]) {
+        1 => 65_536,
+        n => u64::from(n),
+    };
+    page_size.is_power_of_two() && (512..=65_536).contains(&page_size) && len <= page_size
 }
 
 /// Whether SQLite would roll back the `-journal` beside `db_path` on the next
@@ -93,8 +137,11 @@ pub(crate) fn reject_unowned_index(db_path: &Path) -> std::io::Result<()> {
 /// is not hot, and neither is one a live writer holds RESERVED on — another
 /// process creating the index this moment, whose commit fails with
 /// `IOERR_DELETE_NOENT` if the journal goes. Anything else the probe meets
-/// (absent or unreadable database, BUSY past the timeout) answers `false` and
-/// is left for the real open to report.
+/// (absent or unreadable database, BUSY past rusqlite's 5 s busy timeout)
+/// answers `false`. For BUSY that is a gap, not a deferral: if the lock is
+/// released while the real open waits, the real open rolls the journal back
+/// (0.191.0 pre-tag review F2, a lock held 12 s). A planted file holds no
+/// lock; it takes another process holding the database that long.
 fn sqlite_would_roll_back(db_path: &Path) -> bool {
     let Ok(probe) = Connection::open_with_flags(
         sqlite_file_name(db_path),
@@ -3606,5 +3653,102 @@ mod tests {
         );
         reject_unowned_index(&live).expect("a journal a live writer holds is not a planted one");
         writer.execute_batch("ROLLBACK;").unwrap();
+
+        // No database beside the journal: SQLite deletes such a journal when
+        // the open creates the empty database (`hasHotJournal`, nPage == 0).
+        let alone = dir.path().join("alone.db");
+        std::fs::write(
+            dir.path().join("alone.db-journal"),
+            size_setting_journal(4096),
+        )
+        .unwrap();
+        reject_unowned_index(&alone).expect("a journal with no database beside it");
+    }
+
+    /// The tool's own crash residue (0.191.0 pre-tag review F1): a process
+    /// killed while it creates a new index leaves a database of at most one
+    /// page beside a journal recording 0 original pages. 0.190.1 rolled that
+    /// back to an empty database and carried on; refusing it left the project
+    /// refused until the user found the file. Playing back such a journal can
+    /// only truncate the database to 0 bytes (`pager_playback` sets `dbSize`
+    /// from the first header and skips every page record past it), so it is
+    /// accepted when the database holds at most one page: no tables, nothing
+    /// to lose. The same journal beside two pages is still refused.
+    #[test]
+    fn the_journal_of_an_interrupted_index_creation_is_rolled_back_as_before() {
+        type Make = fn(&Path);
+        let shapes: [(&str, Make, u64); 2] = [
+            (
+                "one page",
+                |db| {
+                    let c = Connection::open(db).unwrap();
+                    c.execute_batch("PRAGMA user_version = 7;").unwrap();
+                },
+                4096,
+            ),
+            (
+                "torn header",
+                |db| std::fs::write(db, [0x53u8; 50]).unwrap(),
+                50,
+            ),
+        ];
+        for (shape, make, len) in shapes {
+            for indexer in [true, false] {
+                let dir = TempDir::new().unwrap();
+                let db = dir.path().join("index.db");
+                make(&db);
+                assert_eq!(std::fs::metadata(&db).unwrap().len(), len, "precondition");
+                let journal = dir.path().join("index.db-journal");
+                std::fs::write(&journal, size_setting_journal(0)).unwrap();
+                reject_unowned_index(&db)
+                    .unwrap_or_else(|e| panic!("{shape}/indexer={indexer}: refused: {e}"));
+                if indexer {
+                    let opened = Database::open(&db)
+                        .unwrap_or_else(|e| panic!("{shape}: the indexer must recover: {e}"));
+                    opened
+                        .conn()
+                        .query_row("SELECT count(*) FROM nodes", [], |r| r.get::<_, i64>(0))
+                        .unwrap_or_else(|e| panic!("{shape}: a usable index: {e}"));
+                    drop(opened);
+                    assert!(!journal.exists(), "{shape}: the journal was rolled back");
+                }
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("index.db");
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch("CREATE TABLE t(v); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(c);
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().len(),
+            8192,
+            "precondition: two pages"
+        );
+        std::fs::write(dir.path().join("index.db-journal"), size_setting_journal(0)).unwrap();
+        let msg = reject_unowned_index(&db)
+            .expect_err("two pages hold a table")
+            .to_string();
+        assert!(msg.contains("rollback journal"), "{msg}");
+
+        // One page, but a journal that records a size: its playback grows the
+        // file (here to 16 MiB), which no interrupted creation writes.
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("index.db");
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 7;")
+            .unwrap();
+        std::fs::write(
+            dir.path().join("index.db-journal"),
+            size_setting_journal(4096),
+        )
+        .unwrap();
+        let msg = reject_unowned_index(&db)
+            .expect_err("a journal that grows the file")
+            .to_string();
+        assert!(msg.contains("rollback journal"), "{msg}");
+        assert_eq!(std::fs::metadata(&db).unwrap().len(), 4096);
     }
 }

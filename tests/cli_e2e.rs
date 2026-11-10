@@ -13448,7 +13448,6 @@ fn dir_snapshot(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec
 /// `health-check` in JSON answers a refusal with a report, not 0 bytes on
 /// stdout: doctor and the statusline parse stdout and route on `reason`, and an
 /// unparseable stdout read as "binary broken" and "offline" (D#358 review).
-#[cfg(unix)]
 fn assert_health_json_refused(project: &TempDir, why: &str) {
     for flag in [&["--format", "json"][..], &["--json"][..]] {
         let mut args = vec!["health-check"];
@@ -13800,7 +13799,6 @@ fn test_cli_refuses_an_index_db_or_sidecar_that_is_not_a_regular_file() {
 /// recording 0 pages emptied the index from `health-check` (103 nodes -> 0,
 /// 0.190.1). Every door that refuses a planted `index.db` refuses this one, and
 /// the index is still there for the user once the journal is gone.
-#[cfg(unix)]
 #[test]
 fn test_cli_refuses_a_hot_journal_beside_the_index() {
     let project = setup_indexed_project();

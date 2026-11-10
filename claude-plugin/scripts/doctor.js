@@ -1380,7 +1380,8 @@ function runRepairs(results, {
       // Guidance only, never `fixed++`: removing a link the user may have made
       // is theirs to do. The row stays unresolved until they have.
       // The row's detail is the binary's own message, which names the refused
-      // path: `.code-graph` itself (D#358) or its index.db / -wal / -shm (D#363).
+      // path: `.code-graph` itself (D#358), its index.db / -wal / -shm / -journal
+      // (D#363), or a rollback journal SQLite would replay into the index (D#759).
       case 'code-graph-dir-refused': {
         console.log(`\n  ${issue.detail || 'refusing to use .code-graph: a symlink or not a directory'}`);
         console.log('  doctor removes nothing here, since it may be yours: remove or replace it yourself, then re-run.');
