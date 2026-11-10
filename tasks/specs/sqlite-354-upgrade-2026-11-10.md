@@ -1,6 +1,6 @@
 # 2026-11-10 SQLite 安全升级（D#753）与旧 Release 页面（D#361 剩余）
 
-状态：进行中。
+状态：完成，已发版 0.190.1（2026-11-10）。
 
 ## 背景
 
@@ -53,3 +53,6 @@
   - L4（植入的日志仍会被回滚进索引，可把 `index.db` 撑到 8,589,934,592 字节表观大小）：我复现（两版都从 3,751,936 变为 8,589,934,592，Linux 上稀疏、实际 3,668 KiB）后写进 Not covered，记入待办。
   - N1（会话启动钩子不总跑 health-check）：说明不再点名具体钩子。N2（UTF-8 文案在其他读该节点的命令里也变；inspect 的变化只在原地回滚模式的原始文件）：改说明。N3：测试注释补上兜底暂存分支由哪两个测试拦。N4、N5：spec 行号和次数更正。N6：`build.sh` 收进 `tasks/sqlite-354-upgrade-2026-11-10/`，README 写明标准库依赖本机 Python 补丁版本。N7：说明改为"除版本号外"。
 - 停止线：两轮评审已到上限；第 2 轮修复只改说明、测试注释和 tasks 文件，二进制与 db7fa644 相同，不派第 3 轮，由我逐条复现后改。
+- 发版：tag v0.190.1 在 3470df79（CI 42816635653 7/7，Cargo Audit 通过）；Release 42818413497 10/10（25 分 27 秒）；Release 正文 = CHANGELOG 0.190.1 段（与线上逐字相同，只差末尾换行）；非草稿，14 个附件；npm `@sdsrs/code-graph` 0.190.1，六个包 `_npmUser` 都是 GitHub Actions（`trustedPublisher` github）；临时目录真实安装 added 2 packages，平台二进制 `--version` 0.190.1，内含 SQLite 源码 ID 2026-10-16 555e07ef（3.54.1）；用发布的二进制实跑：植入日志的 gin 项目 `health-check` 后项目外文件仍在；在 gin、flask、hono 上与源码构建的 1,132 次 CLI 输出逐字节相同。
+- 清理：/var/tmp/agent-tmp-sqlite-diff（818M）、两轮评审目录（30G、22G）、scratchpad 临时目录都已删除；`~/.cache/code-graph` 4 小时内只有插件自己的 update-state.json（12:40Z，早于本次命令且本次所有二进制运行都设了 CODE_GRAPH_NO_AUTO_UPDATE）；我的一次 `npm view` 留下的 npm 日志已删除。
+- 待办：D#753 关闭；新增 D#758（扇出测试没有下限）、D#759（植入的日志仍会被回滚进索引）。
