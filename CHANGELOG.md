@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.191.1
+
+**Upgrading: no index rebuild; upgrade soon.** `INDEX_VERSION` stays 139.
+The vendored sqlite-vec goes from 0.1.6 to 0.1.9, its latest stable release.
+An index built by 0.191.0 is read and written as before. Two corpora (this
+repository's `src/`, 145 files and 4,198 vectors, and
+`claude-plugin/scripts`, 78 files and 918 vectors) were indexed by 0.191.0,
+copied, and used by 0.191.0 and 0.191.1 side by side: `similar` and
+`callgraph` on 10 symbols, `health-check --json` and the MCP
+`semantic_code_search` on 8 queries answered byte for byte the same, before
+and after two rounds of edits and deletions (on `src/`, 21 files edited and
+9 deleted, then 20 and 9), and the node, edge, vector and allocated-slot
+counts matched after every round. Pinning back to 0.191.0 brings the
+crashes below back: `npm i -g @sdsrs/code-graph@0.191.0` (or, from source,
+`cargo install --locked --git https://github.com/sdsrss/code-graph-mcp --tag
+v0.191.0 --features embed-model`), then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### security: vector functions called from a planted trigger fail instead of crashing
+
+An index a repository supplies (a committed `.code-graph/index.db`) can
+carry SQL of its own, and a trigger in it runs whenever code-graph-mcp
+writes to the index. sqlite-vec 0.1.6, whose functions code-graph-mcp
+registers on every connection, crashed on two bad inputs instead of
+returning an error: `vec_distance_l2('[1,2]', 'x')` freed a stack address
+(a first vector sqlite-vec had to allocate, a second it could not read), and
+`vec_each('x')` closed its cursor through a NULL function pointer. Measured
+on 0.191.0 with a trigger `AFTER INSERT ON nodes` added to an index of 3
+files, and one new source file:
+
+- `incremental-index` ended with `double free or corruption (out)` (SIGABRT,
+  exit 134) for the first call and with SIGSEGV (exit 139) for the second.
+- The MCP server answered `initialize` and aborted on its first tool call
+  (`project_map`, sent 2 seconds in) without answering it.
+- `health-check`, which only reads, exited 0: a trigger runs on writes.
+
+Upstream fixed both in sqlite-vec 0.1.7 (commits 4ce1ef3c and 44e4438e).
+On 0.191.1 both calls fail as SQL errors, the way a trigger that raises an
+error itself fails: `incremental-index` exits 1 (`SQL logic error`), and the
+MCP server answers that tool call with an error and keeps running.
+
+sqlite-vec 0.1.7 also changed what a DELETE leaves behind: a 1,024-slot
+chunk whose every vector is deleted is now dropped with its slots, while a
+chunk with one live vector left keeps all of them, as before. No chunk
+emptied during the edits on the two corpora above, and the allocated slots
+matched 0.191.0 after every round (on `src/`: 5,120, 7,168, 8,192).
+
+### Not covered
+
+- This release removes the two crashes above; it does not make SQL stored in
+  a supplied index safe to run. A trigger can still make every write fail
+  (one that runs `RAISE(ABORT, …)` makes `incremental-index` exit 1), and
+  the index's contents are still used as they are (0.191.0, Not covered).
+  Which `.code-graph` to trust is not decided.
+- Whether the freed stack address could lead to more than a crash was not
+  analysed; glibc detected it and aborted in every run.
+
 ## 0.191.0
 
 **Upgrading: no index rebuild; upgrade soon.** `INDEX_VERSION` stays 139.
