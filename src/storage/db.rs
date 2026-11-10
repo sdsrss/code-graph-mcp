@@ -823,6 +823,13 @@ If you see this repeatedly, another code-graph server of a different version is 
         &self.conn
     }
 
+    /// For tests that install a trace: rusqlite's `trace_v2` takes
+    /// `&mut Connection` since 0.41.
+    #[cfg(test)]
+    pub(crate) fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
     /// Open a nestable [`UncheckedSavepoint`] on this connection.
     ///
     /// `name` MUST be a caller-controlled static SQL identifier (never user

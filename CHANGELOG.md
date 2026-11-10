@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.190.1
+
+**Upgrading: no index rebuild.** `INDEX_VERSION` stays 139. This release
+updates the SQLite built into the binary from 3.51.1 to 3.54.1 for a
+security advisory (rusqlite 0.38.0 → 0.41.1, libsqlite3-sys 0.36.0 →
+0.39.1, and what rusqlite 0.41 pulls in: hashlink 0.11.0 → 0.12.2, uuid
+1.22.0 → 1.29.2, hashbrown 0.17.1). No source outside the tests changed,
+and what the tool answers is unchanged on the corpora measured below. Pinning back to 0.190.0 brings the affected
+SQLite back: `npm i -g @sdsrs/code-graph@0.190.0` (or, from source,
+`cargo install --locked --git https://github.com/sdsrss/code-graph-mcp
+--tag v0.190.0 --features embed-model`), then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### security: SQLite 3.54.1 (RUSTSEC-2026-0459, CVE-2026-119375)
+
+Per the advisory, SQLite before 3.54.0 can return uninitialized page-cache
+memory as query results when a database is opened together with a `-wal`
+file whose page size differs from the database's; the attacker needs the
+victim to open a crafted pair of files. code-graph opens the `index.db` it
+finds under a project's `.code-graph/` (a regular file there is used as is;
+the index runs in WAL mode, so its `-wal` is read too), and `snapshot
+inspect` opens the file it is given. 0.190.0 and earlier bundle SQLite
+3.51.1, which is in the affected range.
+
+Measured, 0.190.0 against this release, both built from source with
+default features (FTS5 only), on eight corpora (flask, gin, gson, leveldb,
+express 4.21.2, hono v4.6.14, this repository at v0.190.0, and the Python
+3.14 standard library):
+
+- the index each builds is the same row for row, ids included, in every
+  table compared (`files` less its `indexed_at` time, `nodes`, `edges`,
+  `meta`, `pending_unresolved_calls`, `cpp_fields`, `js_export_entries`);
+  the standard library's has 114,900 edges.
+- 3,088 CLI runs (`callgraph`, `refs`, `impact`, `show`, `search`,
+  `overview`, `deps`, `map`, `dead-code`, `centrality`, `cycles`,
+  `surprising`, `tour`, `health-check`; text and `--json`) print the same
+  bytes and exit codes, except one `health-check --json` whose
+  `last_indexed_at` and `index_age` differ by the second between the two
+  indexing runs.
+- 2,060 MCP tool calls (`get_call_graph`, `find_references`,
+  `get_ast_node` with impact and references, `semantic_code_search`,
+  `ast_search`, `module_overview`, `project_map`) return the same bytes.
+
+### Not covered
+
+- Vector search was not part of that comparison (both arms were built
+  without `embed-model`); the full test suite passes with `embed-model`
+  (2451 passed, 0 failed, 7 ignored).
+- The comparison ran on Linux; macOS and Windows are covered by CI's test
+  runs only.
+
 ## 0.190.0
 
 **Upgrading: no index rebuild.** `INDEX_VERSION` stays 139. Two answers

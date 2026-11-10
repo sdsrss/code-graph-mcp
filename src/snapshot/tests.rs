@@ -1500,13 +1500,19 @@ fn stage_copy_takes_the_main_file_alone() {
 
 /// 0.181.0 pre-tag review R3 (D#646). Staging the `-journal` so that SQLite
 /// could roll it back (D#630) handed `inspect` a delete: `pager_playback` reads
-/// a super-journal path out of the journal (sqlite3.c:61755) and
-/// `pager_delsuper` deletes the file that path names (61912 -> 61542). The
-/// bytes at `<file>-journal` are nobody's promise — they are whatever sits
-/// beside the file the user named — so those bytes chose which file went. The
-/// journal is not staged any anymore; the control proves the fixture really
-/// does delete through this SQLite, so a green test is not a fixture that
-/// disarmed itself.
+/// a super-journal path out of the journal (`readSuperJournal`, sqlite3.c:61858
+/// in 3.54.1) and `pager_delsuper` deletes the file that path names (62004 ->
+/// 61542). The bytes at `<file>-journal` are nobody's promise — they are
+/// whatever sits beside the file the user named — so those bytes chose which
+/// file went. The journal is not staged any anymore; the control proves the
+/// fixture really does delete through this SQLite, so a green test is not a
+/// fixture that disarmed itself.
+///
+/// Since SQLite 3.54 the named file goes only if its name looks like a
+/// super-journal (`-mj` and nine hex digits, the third from last a `9`:
+/// `pagerIsSuperJrnlName`, 60257) and it lists the journal being rolled back,
+/// as SQLite spells that path (61601-61651). The victim below has both, so the
+/// control still fires; any other file a journal names is safe from 3.54 on.
 #[test]
 fn inspect_does_not_delete_a_file_a_journal_names() {
     for (header, write_version) in [("rollback", 1u8), ("wal", 2u8)] {
@@ -1521,9 +1527,17 @@ fn inspect_does_not_delete_a_file_a_journal_names() {
         }
         // Outside `dir`, so that the residue check below stays about the pair.
         let victim_dir = TempDir::new().unwrap();
-        let victim = victim_dir.path().join("victim");
-        let plant_victim = || std::fs::write(&victim, b"not a super-journal").unwrap();
-        plant_victim();
+        let victim = victim_dir.path().join("victim-mj0123459ab");
+        // The victim lists the journal SQLite would roll back, by the path
+        // SQLite builds: the database's, symlinks resolved (macOS reaches its
+        // temp dir through `/var` -> `/private/var`), plus `-journal`.
+        let plant_victim = |db_dir: &std::path::Path| {
+            let journal = db_dir.canonicalize().unwrap().join("snapshot.db-journal");
+            let mut listed = journal.to_str().unwrap().as_bytes().to_vec();
+            listed.push(0);
+            std::fs::write(&victim, listed).unwrap();
+        };
+        plant_victim(dir.path());
         let journal = dir.path().join("snapshot.db-journal");
         std::fs::write(&journal, hot_looking_journal(Some(&victim))).unwrap();
 
@@ -1537,6 +1551,7 @@ fn inspect_does_not_delete_a_file_a_journal_names() {
             let control = control_dir.path().join("snapshot.db");
             std::fs::copy(&raw, &control).unwrap();
             std::fs::copy(&journal, control_dir.path().join("snapshot.db-journal")).unwrap();
+            plant_victim(control_dir.path());
             let _ = Connection::open(&control)
                 .and_then(|c| c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)));
             let control_fired = !victim.exists();
@@ -1552,7 +1567,7 @@ fn inspect_does_not_delete_a_file_a_journal_names() {
                      assertion below proves nothing here"
                 );
             }
-            plant_victim();
+            plant_victim(dir.path());
         }
 
         let before = files_in(dir.path());

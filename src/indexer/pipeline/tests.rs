@@ -15758,18 +15758,24 @@ fn a_repeated_call_writes_its_fanout_once() {
     for (label, files) in table {
         let project = TempDir::new().unwrap();
         let db_dir = TempDir::new().unwrap();
-        let db = Database::open(&db_dir.path().join("index.db")).unwrap();
+        let mut db = Database::open(&db_dir.path().join("index.db")).unwrap();
         for (name, body) in &files {
             fs::write(project.path().join(name), body).unwrap();
         }
-        db.conn().trace_v2(
-            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
-            Some(count_edge_insert_runs),
-        );
+        db.conn_mut()
+            .trace_v2(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(count_edge_insert_runs),
+            )
+            .unwrap();
         EDGE_INSERT_RUNS.with(|c| c.set(0));
         run_full_index(&db, project.path(), None, None).unwrap();
-        db.conn()
-            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        db.conn_mut()
+            .trace_v2(
+                rusqlite::trace::TraceEventCodes::empty(),
+                None::<fn(rusqlite::trace::TraceEvent<'_>)>,
+            )
+            .unwrap();
         let runs = EDGE_INSERT_RUNS.with(|c| c.get());
         let count = |sql: &str| -> usize {
             let c: i64 = db.conn().query_row(sql, [], |r| r.get(0)).unwrap();
