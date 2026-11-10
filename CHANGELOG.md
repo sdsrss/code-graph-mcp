@@ -17,9 +17,22 @@ crashes below back: `npm i -g @sdsrs/code-graph@0.191.0` (or, from source,
 `cargo install --locked --git https://github.com/sdsrss/code-graph-mcp --tag
 v0.191.0 --features embed-model`), then delete
 `~/.cache/code-graph/bin/code-graph-mcp` and set
-`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. Then, in every
+project 0.191.1 indexed and from that project's own directory, run
+`code-graph-mcp rebuild-index --confirm`, with the MCP server stopped (it
+refuses while a Claude Code session holds the index lock, and run outside a
+project it indexes whatever tree it finds). If 0.191.1 dropped a chunk of
+vectors (see the DELETE paragraph below), 0.191.0's next
+`incremental-index` exits 1 with `Error opening vector blob at
+main.node_vectors_vector_chunks00.<n>`, and nothing says so beforehand.
+Measured on a 3-file project: 0.191.0 indexed 6 vectors in one chunk; the
+sources were deleted and 0.191.1's `incremental-index` dropped the chunk;
+one new file later 0.191.0 exited 1 with that error, while `health-check`
+printed `OK: 2 nodes` and `orphan vectors 0`; `rebuild-index --confirm`
+rebuilt the index (2 vectors, one chunk) and 0.191.0 indexed normally
+afterwards.
 
-### security: vector functions called from a planted trigger fail instead of crashing
+### security: `vec_distance_l2` and `vec_each` called from a planted trigger fail instead of crashing
 
 An index a repository supplies (a committed `.code-graph/index.db`) can
 carry SQL of its own, and a trigger in it runs whenever code-graph-mcp
@@ -33,14 +46,16 @@ files, and one new source file:
 
 - `incremental-index` ended with `double free or corruption (out)` (SIGABRT,
   exit 134) for the first call and with SIGSEGV (exit 139) for the second.
-- The MCP server answered `initialize` and aborted on its first tool call
-  (`project_map`, sent 2 seconds in) without answering it.
+- The MCP server answered `initialize`, started its background index update
+  and died 0.08 s in (SIGABRT for the first call, SIGSEGV for the second),
+  before the first tool call, sent 2 seconds in, reached it.
 - `health-check`, which only reads, exited 0: a trigger runs on writes.
 
 Upstream fixed both in sqlite-vec 0.1.7 (commits 4ce1ef3c and 44e4438e).
 On 0.191.1 both calls fail as SQL errors, the way a trigger that raises an
 error itself fails: `incremental-index` exits 1 (`SQL logic error`), and the
-MCP server answers that tool call with an error and keeps running.
+MCP server logs the failed background update, answers `project_map` with an
+error and keeps running.
 
 sqlite-vec 0.1.7 also changed what a DELETE leaves behind: a 1,024-slot
 chunk whose every vector is deleted is now dropped with its slots, while a
@@ -55,6 +70,16 @@ matched 0.191.0 after every round (on `src/`: 5,120, 7,168, 8,192).
   (one that runs `RAISE(ABORT, …)` makes `incremental-index` exit 1), and
   the index's contents are still used as they are (0.191.0, Not covered).
   Which `.code-graph` to trust is not decided.
+- A planted trigger can still crash code-graph-mcp through a vec0 table the
+  index carries. sqlite-vec 0.1.9, like 0.1.6, checks some of its internal
+  tables with `assert`, which ends the process: a trigger querying a vec0
+  table whose internal tables were edited aborted `incremental-index` and
+  the MCP server (0.08 s after start) on 0.191.0 and 0.191.1 alike. Another
+  read path uses a length stored in those tables without checking it (found
+  by reading the code; a pre-release review saw it read past a buffer under
+  AddressSanitizer). The asserts stay compiled in: without them the first
+  path goes on to read past a heap buffer instead of stopping (also found by
+  reading the code).
 - Whether the freed stack address could lead to more than a crash was not
   analysed; glibc detected it and aborted in every run.
 
