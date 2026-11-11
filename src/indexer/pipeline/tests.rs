@@ -18145,3 +18145,57 @@ fn a_rust_call_on_an_untyped_receiver_binds_the_method_a_deletion_leaves() {
     assert_eq!(call_edges_with_confidence(&db), Vec::<String>::new());
     assert_eq!(pending_set(&db), Vec::<String>::new());
 }
+
+// A Rust call through a project path (`crate::a::f()`, `super::a::f()`,
+// `crate::a::A::new()`) written before the item exists binds it once a later
+// run adds it to that file, as a rebuild does. It was dropped like a foreign
+// crate's path, not buffered, so the edge appeared only after a rebuild. A
+// foreign crate's path is still dropped, with no row. Not covered: a module
+// FILE created after the call (`mod a;` is no node, and the parser strips the
+// `crate::` that would say the path is the project's).
+#[test]
+fn a_rust_path_call_written_before_its_item_binds_when_the_item_appears() {
+    let lib = "pub mod a;\npub mod b;\npub mod c;\n";
+    let a0 = "pub struct A;\n";
+    let a1 = "pub struct A;\nimpl A {\n    pub fn new() -> A { A }\n}\npub fn f() {}\n";
+    let b = "pub fn f() {}\npub fn new() {}\n";
+    let callers = [
+        "pub fn call() { crate::a::f() }\n",
+        "pub fn call() { super::a::f() }\n",
+        "pub fn call() -> crate::a::A { crate::a::A::new() }\n",
+    ];
+    for c in callers {
+        let before = [
+            ("src/lib.rs", lib),
+            ("src/a.rs", a0),
+            ("src/b.rs", b),
+            ("src/c.rs", c),
+        ];
+        assert_incremental_matches_rebuild(&before, &[("src/a.rs", Some(a1))]);
+    }
+    // A binary naming its own package's library by the crate's name, the
+    // module a directory.
+    let before = [
+        (
+            "Cargo.toml",
+            "[package]\nname = \"my_crate\"\nversion = \"0.1.0\"\n",
+        ),
+        ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+        ("src/a/mod.rs", a0),
+        ("src/b.rs", b),
+        ("src/main.rs", "fn main() { my_crate::a::f() }\n"),
+    ];
+    assert_incremental_matches_rebuild(&before, &[("src/a/mod.rs", Some(a1))]);
+    // A foreign crate's path, one through a module name the project also
+    // has, and a std module's through a glob: no row.
+    let foreign = "pub fn call() -> String { serde_json::to_string(&1).unwrap() }\n\
+                   pub fn sql() { rusqlite::types::to_sql() }\n\
+                   pub fn err() -> io::Error { io::Error::new() }\n";
+    let (_p, _d, db) = fresh_index_of(&[
+        ("src/lib.rs", "pub mod c;\npub mod io;\npub mod types;\n"),
+        ("src/c.rs", foreign),
+        ("src/io.rs", "pub fn read() {}\n"),
+        ("src/types.rs", "pub fn read() {}\n"),
+    ]);
+    assert_eq!(pending_set(&db), Vec::<String>::new());
+}

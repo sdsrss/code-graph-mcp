@@ -5114,8 +5114,27 @@ fn resolve_deferred_relations(
                             call_meta,
                             false,
                         )?;
+                    } else if handled
+                        && d.language == "rust"
+                        && super::resolve::rust_path_names_project_file(
+                            &segments,
+                            all_file_paths,
+                            crate_roots,
+                        )
+                    {
+                        // A project file's item that is not there yet: buffered,
+                        // so the run that adds it binds it as a rebuild does.
+                        for &src_id in &source_ids {
+                            crate::storage::queries::insert_pending_unresolved_call(
+                                db.conn(),
+                                src_id,
+                                &d.target_name,
+                                &d.language,
+                                call_meta,
+                            )?;
+                        }
                     }
-                    // empty → drop: external crate path, as at batch time.
+                    // else empty → drop: a foreign crate's path, as at batch time.
                 }
                 _ => {
                     handled = false; // bare call → default chain below

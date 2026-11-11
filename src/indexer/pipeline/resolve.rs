@@ -673,13 +673,32 @@ pub(super) fn resolve_pending_calls_touching(
                         db,
                         crate_roots,
                     )?,
-                    UseAnchor::None => path_filter_candidates(
-                        &segments,
-                        &candidates,
-                        &node_id_to_path,
-                        db,
-                        crate_roots,
-                    )?,
+                    UseAnchor::None => {
+                        let ids = path_filter_candidates(
+                            &segments,
+                            &candidates,
+                            &node_id_to_path,
+                            db,
+                            crate_roots,
+                        )?;
+                        if ids.is_empty() && row.source_language == "rust" {
+                            if all_file_paths.is_none() {
+                                all_file_paths = Some(
+                                    db.conn()
+                                        .prepare("SELECT path FROM files")?
+                                        .query_map([], |r| r.get::<_, String>(0))?
+                                        .collect::<rusqlite::Result<_>>()?,
+                                );
+                            }
+                            let files = all_file_paths.as_ref().expect("loaded above");
+                            // Stays buffered, as the deferred pass buffers it:
+                            // only the item's arrival in that file answers it.
+                            if rust_path_names_project_file(&segments, files, crate_roots) {
+                                continue;
+                            }
+                        }
+                        ids
+                    }
                 }
             }
             // Member call: the same free-function exclusion as Phase 2. With
@@ -3313,6 +3332,41 @@ const RUST_STD_MODULES: &[&str] = &[
 /// as a contiguous chain. Split out of [`path_filter_candidates`] so the
 /// qualifier can be tried twice: once as written, once with an own-crate root
 /// removed.
+/// Whether a path call's first module (`a` of `a::f()` or `a::A::new()`)
+/// names a Rust file or directory of this project. Its item, missing
+/// now, is one a later run may add, so the call is buffered rather than
+/// dropped like a foreign crate's path. A path opening with a std module name
+/// stays a foreign one, as [`filter_by_segment_chain`] reads it.
+pub(super) fn rust_path_names_project_file(
+    segments: &[String],
+    all_file_paths: &HashSet<String>,
+    crate_roots: &RustCrates,
+) -> bool {
+    let segs = match segments.split_first() {
+        Some((first, rest)) if !rest.is_empty() && crate_roots.contains(first.as_str()) => rest,
+        _ => segments,
+    };
+    let Some(first) = segs.first() else {
+        return false;
+    };
+    if RUST_STD_MODULES.contains(&first.as_str())
+        || matches!(first.as_str(), "std" | "core" | "alloc")
+    {
+        return false;
+    }
+    // The first segment, not a later one alone: `rusqlite::types::Value`
+    // names no project module even where the project has a `types.rs`. A
+    // directory `a/` or a file `a.rs`, as `filter_by_segment_chain` reads it.
+    let (dir, lead, file) = (
+        format!("/{first}/"),
+        format!("{first}/"),
+        format!("/{first}.rs"),
+    );
+    all_file_paths.iter().any(|p| {
+        p.ends_with(".rs") && (p.contains(&dir) || p.starts_with(&lead) || p.ends_with(&file))
+    })
+}
+
 fn filter_by_segment_chain(
     segments: &[String],
     candidates: &[i64],
