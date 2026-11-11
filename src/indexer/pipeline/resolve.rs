@@ -2354,6 +2354,9 @@ pub(super) fn bind_module_attr_calls(
 /// - an edge is pruned only when the caller's file imports the SAME NAME bound
 ///   to a DIFFERENT node AND does not import this target.
 ///
+/// Also, while the import table stands, the field calls
+/// [`FIELD_CALL_PRUNE_PREDICATE`] rules out.
+///
 /// Returns the number of edges removed.
 pub(super) fn prune_import_contradicted_call_edges(
     db: &Database,
@@ -2401,38 +2404,68 @@ pub(super) fn prune_import_contradicted_call_edges(
                     AND i2.tid = e.target_id
                     AND i2.attr IS NULL
               )";
-    let sql = if scope.is_global() {
-        format!(
-            "DELETE FROM edges WHERE id IN (
+    let mut removed = 0;
+    for predicate in [PRUNE_PREDICATE, FIELD_CALL_PRUNE_PREDICATE] {
+        let sql = if scope.is_global() {
+            format!(
+                "DELETE FROM edges WHERE id IN (
             SELECT e.id FROM edges e
             JOIN nodes sn ON sn.id = e.source_id
             JOIN nodes tn ON tn.id = e.target_id
-            {PRUNE_PREDICATE}
+            {predicate}
         )"
-        )
-    } else {
-        format!(
-            "DELETE FROM edges WHERE id IN (
+            )
+        } else {
+            format!(
+                "DELETE FROM edges WHERE id IN (
             SELECT e.id
             FROM cg_scope_files s
             CROSS JOIN nodes sn ON sn.file_id = s.fid
             CROSS JOIN edges e ON e.source_id = sn.id
             CROSS JOIN nodes tn ON tn.id = e.target_id
-            {PRUNE_PREDICATE}
+            {predicate}
             UNION
             SELECT e.id
             FROM cg_scope_files s
             CROSS JOIN nodes tn ON tn.file_id = s.fid
             CROSS JOIN edges e ON e.target_id = tn.id
             CROSS JOIN nodes sn ON sn.id = e.source_id
-            {PRUNE_PREDICATE}
+            {predicate}
         )"
-        )
-    };
-    let removed = conn.execute(&sql, rusqlite::params![REL_CALLS])?;
+            )
+        };
+        removed += conn.execute(&sql, rusqlite::params![REL_CALLS])?;
+    }
     drop_imports_temp(conn)?;
     Ok(removed)
 }
+
+/// A Python call on a field of `self` / `cls` (`self.url_defaults.update()`,
+/// D10B `{"ur":"attr"}`) bound to a free function in a file the caller's file
+/// imports nothing from (D#789). The field holds an object, whose method no
+/// free function is, unless it holds a module: `self._os = os` /
+/// `self._module.simplefilter()` / a class's `parser = posixpath`. Every such
+/// module the Python standard library stores on a field is its own file or one
+/// it imports, and those binds stay (8 of them above the default floor). Over
+/// flask, nltk and the standard library this drops 1,071 edges: the 9 above
+/// the default floor all wrong on reading each, and 42 of the rest sampled, all
+/// wrong (flask: the tutorial's `def update` for `self.url_defaults.update()`).
+/// The resolver's choice is narrowed, not its pool: the call binds nothing new.
+///
+/// Reads what 2d-prune reads — the caller file's import edges, the target node
+/// — so the same two scope arms bound it.
+const FIELD_CALL_PRUNE_PREDICATE: &str = "
+            WHERE e.relation = ?1
+              AND json_extract(e.metadata, '$.ur') = 'attr'
+              AND tn.file_id <> sn.file_id
+              AND tn.type = 'function'
+              AND (tn.qualified_name IS NULL OR tn.qualified_name NOT LIKE '%.%')
+              AND NOT EXISTS (
+                  SELECT 1 FROM cg_imports i
+                  JOIN nodes inode ON inode.id = i.tid
+                  WHERE i.fid = sn.file_id
+                    AND inode.file_id = tn.file_id
+              )";
 
 /// Phase 2e: assign `edges.confidence` for cross-file `calls`/`references` edges
 /// in one set-based pass, run after all edges exist (post Phase-2 + pending sweep

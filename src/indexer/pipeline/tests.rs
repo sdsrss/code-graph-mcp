@@ -14114,6 +14114,99 @@ fn a_python_untyped_receiver_same_file_bind_is_labelled_by_its_name_count() {
     );
 }
 
+// D#789 (converge round 3): `self.url_defaults.update(...)` is a call on one of
+// the instance's fields, which holds an object: no free function answers it
+// unless the field holds a module, and a module a file stores on a field is
+// the file itself or one it imports. Resolved as a bare call, it bound the
+// tutorial's `def update(id)` in a file flask never imports (flask
+// sansio/blueprints.py:85, `inferred`).
+#[test]
+fn a_call_on_a_field_of_self_binds_no_free_function_of_an_unimported_file() {
+    let files: &[(&str, &str)] = &[
+        ("pkg/__init__.py", ""),
+        ("pkg/blog.py", "def update(id):\n    return id\n"),
+        ("pkg/util.py", "def fsencode(name):\n    return name\n"),
+        (
+            "pkg/remote.py",
+            "class Remote:\n    def transmit(self, value):\n        return value\n",
+        ),
+        (
+            "pkg/bp.py",
+            "from . import util\n\n\ndef finish(x):\n    return x\n\n\nclass State:\n    \
+             _util = util\n\n    def __init__(self):\n        self.url_defaults = dict()\n        \
+             self.url_defaults.update({})\n        self.hooks.finish(1)\n        \
+             self._util.fsencode('a')\n        self.remote.transmit(1)\n\n    def show(self):\n        \
+             return self.view.render(1)\n\n\nclass View:\n    def render(self, value):\n        \
+             return value\n",
+        ),
+        // Scripts share one global scope: a bare call needs no import.
+        ("web/a.js", "function helper() { return 1; }\n"),
+        ("web/b.js", "function main() { return helper(); }\n"),
+    ];
+    let (project, _d, db) = fresh_index_of(files);
+    let callees_of = |db: &Database, caller: &str| -> Vec<String> {
+        let mut v: Vec<String> = graph_projection_with_confidence(db)
+            .into_iter()
+            .filter(|(a, r, _, _)| a == caller && r == REL_CALLS)
+            .map(|(_, _, b, _)| b)
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        callees_of(&db, "pkg/bp.py:__init__"),
+        [
+            "pkg/bp.py:finish",
+            "pkg/remote.py:transmit",
+            "pkg/util.py:fsencode"
+        ],
+        "blog.py is imported by nothing in bp.py; its own file and util.py may be \
+         the module, and a method is a method"
+    );
+    assert_eq!(
+        callees_of(&db, "web/b.js:main"),
+        ["web/a.js:helper"],
+        "only a call on a field of `self` is ruled out this way"
+    );
+    assert_eq!(
+        callees_of(&db, "pkg/bp.py:show"),
+        ["pkg/bp.py:render"],
+        "a method of the name stays reachable"
+    );
+
+    // The pass is scoped on an edit: the callee's file re-binds the call
+    // through the requeue, the caller's file re-resolves it, and each run
+    // equals a rebuild.
+    let mut now: Vec<(&str, String)> = files.iter().map(|(p, s)| (*p, s.to_string())).collect();
+    let edits = [
+        (
+            "pkg/util.py",
+            "def fsencode(name):\n    return name + 'x'\n".to_string(),
+        ),
+        (
+            "pkg/bp.py",
+            files[4].1.replace("from . import util\n", "util = None\n"),
+        ),
+    ];
+    for (path, text) in edits {
+        fs::write(project.path().join(path), &text).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        now.iter_mut().find(|(p, _)| *p == path).unwrap().1 = text;
+        let owned: Vec<(&str, &str)> = now.iter().map(|(p, s)| (*p, s.as_str())).collect();
+        let (_p2, _d2, control) = fresh_index_of(&owned);
+        assert_eq!(
+            graph_projection_with_confidence(&db),
+            graph_projection_with_confidence(&control),
+            "after editing {path}: incremental must equal a rebuild"
+        );
+    }
+    assert_eq!(
+        callees_of(&db, "pkg/bp.py:__init__"),
+        ["pkg/bp.py:finish", "pkg/remote.py:transmit"],
+        "with the import gone, util.py is a file bp.py never imports"
+    );
+}
+
 // B9 (2026-09-29 usage evaluation): a member call on a Node built-in module
 // (`path.resolve(p)`, `fs.renameSync(a, b)`) runs Node's code, yet it bound a
 // project function or method of that name elsewhere (express: a test's
