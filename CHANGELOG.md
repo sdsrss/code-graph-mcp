@@ -6,8 +6,9 @@
 because the stored graph changes for unchanged source: route edges; Python,
 Go and JavaScript/TypeScript call edges; Python references; and functions
 nested in a method, which were named as members of the class (below). A
-full index of this repository's Rust `src/` has the same edges as before;
-Rust changes only what incremental runs bind. The MCP
+full index of this repository's Rust `src/` has the same edges as before and
+renames one node, a function nested in a method; the other Rust changes are
+in what incremental runs bind (below). The MCP
 server rebuilds the index when it starts. From the command line, a query
 answers from the old index with "This index was built by an older code-graph
 (index v139, this binary v140): answers come from it until it is rebuilt —
@@ -83,8 +84,11 @@ A call through an imported package was recorded as a bare name and bound by
 name, so `errors.New`, `validator.New` and the like reached gin's own `New`,
 `io.Copy` its `Copy` method, `http.Dir` its `Dir`, `rand.Read` a test's
 `Read`. The call now keeps the import path and binds in the directory that
-path names under the project's `go.mod`; a standard-library path binds
-nothing. On gin, 46 such edges above the default floor are gone, 31 of them
+path names under the project's `go.mod`. From a file under a `go.mod` the
+index reads (in the project root or up to three directories below it), a
+path no such module names whose first element has no dot, the standard
+library's form, binds nothing; a file under none binds these calls by name,
+as before. On gin, 46 such edges above the default floor are gone, 31 of them
 into `New`, and 27 calls through a project package (`bytesconv.`,
 `binding.Default`, `gin.Default`) that were `ambiguous` because another
 definition shares the name are `inferred`.
@@ -174,13 +178,15 @@ src/flask/ctx.py first, with 21 callers, all of them `ambiguous` (app.py's
 
 ### fix: `deps` and `dependency_graph` follow `callgraph`'s confidence floor
 
-gin's internal/bytesconv/bytesconv_1.20.go calls only functions of
-`unsafe`, yet `deps` listed 30 files it depends on, reached through
-`ambiguous` by-name matches. Both surfaces now walk `extracted` and
+Both surfaces walked every call edge, including the `ambiguous` by-name
+guesses `callgraph` and `impact` hide. They now walk `extracted` and
 `inferred` edges only and say how many files only `ambiguous` edges reach:
-`depends_on` 30 → 0 and `depended_by` 48 → 29, with
-`ambiguous_only_hidden: 13` in JSON and a note in the text and the MCP
-summary.
+on gin, `deps internal/bytesconv/bytesconv_1.20.go` lists 29 files depending
+on it and leaves out 13, `ambiguous_only_hidden: 13` in JSON (with the
+default `--direction both` and with `incoming`), and a note in the text and
+the MCP summary. 0.191.1 listed 48 files depending on it and 30 it depends
+on, the latter all through its 6 `ambiguous` calls, which the Go fix above
+removes: it now depends on none.
 
 ### fix: `semantic_code_search` keeps the exact-name match
 
@@ -224,17 +230,41 @@ skips the step. An interrupt left `index.db` unchanged on both versions.
 
 ### Cost
 
-A full index of the standard library takes 3% to 4% more CPU, measured
+A full index of the standard library takes 3% to 5% more CPU, measured
 against 0.191.1 built from source with the same toolchain and features:
-medians of two sets of 5 interleaved runs, 6.048 → 6.236 s and 5.857 →
-6.067 s. A one-file edit there (configparser.py) measured 0.321 → 0.321 s
-and 0.311 → 0.317 s.
+medians of two sets of 5 interleaved runs, 5.904 → 6.163 s (+4.4%) and
+5.909 → 6.166 s (+4.3%); other sets measured +3.1%, +3.6%, +4.9% and
++5.3%. A one-file edit there (configparser.py) measured 0.305 → 0.314 s
+and 0.298 → 0.303 s. A full index of gin measured 0.390 → 0.409 s and
+0.398 → 0.402 s.
 
 ### Not covered
 
-- One right edge is lost: the standard library's unittest/signals.py
+- Right edges are lost too: the standard library's unittest/signals.py
   `self.default_handler()` calls a nested function stored on `self`, which
-  is now a function, not a method.
+  is now a function, not a method; hono's `jwt` middleware bound its
+  `Jwt.verify(...)` to `export const verify = Jwt.verify` in its own file,
+  an alias of what the call runs, and now binds nothing.
+- A Python name in a list, tuple or set literal that the file imports from
+  a module outside the project binds a project definition of the same name,
+  as it already did as a call argument (`isinstance(x, Timeout)`): the
+  standard library's io.py, which takes its I/O classes `from _io import
+  (...)`, now has 7 references into _pyio.py.
+- A Go `go.mod` more than three directories below the project root is not
+  read. Under no other module, its files bind by name as before; under one
+  the index reads (a `go.mod` in the root), a call through the deep
+  module's own packages binds nothing. And when two `go.mod` files declare
+  the same module path, an import of it binds the packages of whichever the
+  directory listing gives last.
+- A Flask `methods=` given as a name (`methods=VERBS`) is stored as GET only.
+- A route whose handler is imported from another file (Express
+  `app.get('/user', getUser)` with `getUser` from ./ctrl) is written on
+  every function of that name, as before: a `getUser` in a file app.js
+  never imports gets the route too, on itself.
+- An interrupted `rebuild-index` leaves its staging file
+  `index.db.rebuild-<pid>` and its `-wal` / `-shm` beside the index (49 MB
+  on the standard library) until the next `rebuild-index` removes them, as
+  0.191.1 did.
 - 5 of the 51 relabelled standard-library calls were right: json.decoder's
   two `scan_once` (`from json import scanner` binds no submodule yet),
   os.walk's `islink`, importlib's `spec_from_file_location`,
