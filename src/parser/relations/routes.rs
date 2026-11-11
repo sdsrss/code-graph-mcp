@@ -395,7 +395,9 @@ pub(super) fn extract_python_route(
         relation: REL_ROUTES_TO.into(),
         metadata: Some(metadata),
         source_language: String::new(),
-        source_line: None,
+        // The decorated `def` itself: a test file nests one `def index()` per
+        // test, and the line is what tells the resolver which one this is.
+        source_line: Some(func.start_position().row as u32 + 1),
         call_at: None,
     })
 }

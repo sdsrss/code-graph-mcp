@@ -1734,6 +1734,44 @@ fn test_same_named_functions_in_one_file_keep_their_own_calls() {
     );
 }
 
+/// (handler start line, handler is its own target, route path) of every
+/// `routes_to` edge.
+fn route_edges(db: &Database) -> Vec<(i64, bool, String)> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT ns.start_line, e.source_id = e.target_id, json_extract(e.metadata, '$.path') \
+             FROM edges e JOIN nodes ns ON ns.id = e.source_id \
+             WHERE e.relation = 'routes_to' ORDER BY 1, 3, 2",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+/// A Flask test file registers the same nested `def index()` under dozens of
+/// `@app.route` decorators (flask tests/test_basic.py: 81). The route's handler
+/// was matched by name, so every route bound every same-named handler to every
+/// other: 6,480 `routes_to` edges for 81 routes. A route is its handler's
+/// self-edge, one per registration.
+#[test]
+fn test_same_named_route_handlers_in_one_file_each_get_their_own_route() {
+    let py = "def test_one(app):\n    @app.route('/one')\n    def index():\n        return 'a'\n\n\
+              def test_two(app):\n    @app.route('/two')\n    def index():\n        return 'b'\n\n\
+              def test_three(app):\n    @app.route('/three')\n    def index():\n        return 'c'\n";
+    let (_p, _d, db) = fresh_index_of(&[("test_app.py", py)]);
+    assert_eq!(
+        route_edges(&db),
+        vec![
+            (2, true, "/one".to_string()),
+            (7, true, "/two".to_string()),
+            (12, true, "/three".to_string()),
+        ]
+    );
+}
+
 /// D#86: a member call on an object can only run a method. Bound by bare name it
 /// reached free functions: `words.push(x)` a nested `const push`, `JSON.stringify`
 /// a project `function stringify`, `s.clear()` a free `clear()`, `ctx.get()` a

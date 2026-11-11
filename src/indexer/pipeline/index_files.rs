@@ -875,7 +875,7 @@ struct WrittenFanouts {
     seen: HashSet<Fanout>,
 }
 
-/// `(sources, targets, relation, metadata, allow_self)` of one write.
+/// `(sources, targets, relation, metadata, self_edge)` of one write.
 type Fanout = (Vec<i64>, Vec<i64>, String, Option<String>, bool);
 
 impl WrittenFanouts {
@@ -896,7 +896,7 @@ impl WrittenFanouts {
         targets: &[i64],
         relation: &str,
         metadata: Option<&str>,
-        allow_self: bool,
+        self_edge: bool,
     ) -> bool {
         if sources.len() * targets.len() < 2 {
             return true;
@@ -906,7 +906,7 @@ impl WrittenFanouts {
             targets.to_vec(),
             relation.to_string(),
             metadata.map(str::to_string),
-            allow_self,
+            self_edge,
         ))
     }
 }
@@ -917,12 +917,15 @@ impl WrittenFanouts {
 /// own copy of the double loop — twelve of them, which is exactly the shape
 /// where a later fix lands in one copy and not the other eleven.
 ///
-/// `allow_self` exists for `routes_to` alone: a route's handler IS its target,
+/// `self_edge` exists for `routes_to` alone: a route's handler IS its target,
 /// and that self-edge is what carries the method/path metadata that trace and
-/// impact read. Every other branch drops self-edges. It is a parameter rather
-/// than a `relation == REL_ROUTES_TO` test inside because only the fallthrough
-/// branch ever sees a `routes_to` relation — deciding it here would silently
-/// widen the other eleven if that ever stopped being true.
+/// impact read. Such a write keeps only the self-pairs; every other one drops
+/// them. Keeping the cross pairs too bound each of a file's same-named
+/// handlers to every other one's route (flask tests/test_basic.py: 81 nested
+/// `def index()` routes, 6,480 edges). It is a parameter rather than a
+/// `relation == REL_ROUTES_TO` test inside because only the fallthrough
+/// branches ever see a `routes_to` relation — deciding it here would silently
+/// change the other eleven if that ever stopped being true.
 ///
 /// Returns the number of rows actually created; `insert_edge_cached` dedups,
 /// so a repeat of an existing edge counts zero.
@@ -966,9 +969,9 @@ fn insert_relation_edges(
     targets: &[i64],
     relation: &str,
     metadata: Option<&str>,
-    allow_self: bool,
+    self_edge: bool,
 ) -> Result<usize> {
-    if !written.first(sources, targets, relation, metadata, allow_self) {
+    if !written.first(sources, targets, relation, metadata, self_edge) {
         return Ok(0);
     }
     // A `P.X()` call's synthetic import (D#518) is no edge of the graph a user
@@ -977,7 +980,7 @@ fn insert_relation_edges(
     let mut created = 0usize;
     for &src_id in sources {
         for &tgt_id in targets {
-            if (src_id != tgt_id || allow_self)
+            if (src_id == tgt_id) == self_edge
                 && insert_edge_cached(db.conn(), src_id, tgt_id, relation, metadata)?
             {
                 created += counted;
@@ -5143,7 +5146,7 @@ fn resolve_deferred_relations(
             // Cross-file pool: batch-time exclusion is BY SOURCE FILE (local_ids),
             // not by source node ids — mirror that (a routes_to self-target from
             // another file must stay in the pool; insert_relation_edges handles
-            // self-pairs via allow_self).
+            // self-pairs via `self_edge`).
             let cross_file: Vec<i64> = all
                 .iter()
                 .copied()
@@ -5216,7 +5219,7 @@ fn resolve_deferred_relations(
             .collect();
         // Batch-time exclusion is BY SOURCE FILE, not by source node ids — a
         // routes_to whose target IS its (cross-file) source must stay in the
-        // pool; insert_relation_edges handles self-pairs via allow_self.
+        // pool; insert_relation_edges handles self-pairs via `self_edge`.
         let cross_file: Vec<i64> = all_target_ids
             .iter()
             .copied()
