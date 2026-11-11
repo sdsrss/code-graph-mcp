@@ -18199,3 +18199,78 @@ fn a_rust_path_call_written_before_its_item_binds_when_the_item_appears() {
     ]);
     assert_eq!(pending_set(&db), Vec::<String>::new());
 }
+
+// A Python module path two import roots both spell (`aaa/check.py` and
+// `zzz/check.py` are each `check`) binds the same files whichever batch each
+// lands in. The batch pass bound whichever of them it could already see, so a
+// full index past BATCH_SIZE tied `from check import run` to `aaa/check.py`
+// alone, and the next edit of the importer to both.
+#[test]
+fn a_python_module_two_roots_spell_binds_the_same_files_across_a_batch_boundary() {
+    fn write_tree(root: &std::path::Path, filler: usize) {
+        for dir in ["aaa", "mmm", "zzz"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("aaa/check.py"), "def run():\n    return 1\n").unwrap();
+        fs::write(root.join("zzz/check.py"), "def run():\n    return 2\n").unwrap();
+        fs::write(
+            root.join("aaa/main.py"),
+            "from check import run\n\n\ndef go():\n    return run()\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("aaa/use.py"),
+            "import check\n\n\ndef use():\n    return check.run()\n",
+        )
+        .unwrap();
+        // Sorted order puts aaa/* and mmm/* in batch 1, zzz/* in batch 2.
+        for i in 0..filler {
+            fs::write(root.join(format!("mmm/f{i:04}.js")), "// filler\n").unwrap();
+        }
+    }
+    let meaningful = ["aaa/check.py", "zzz/check.py", "aaa/main.py", "aaa/use.py"];
+    let edges_of = |db: &Database| -> Vec<(String, String, String, String, Option<String>)> {
+        graph_projection(db)
+            .1
+            .into_iter()
+            .filter(|(sp, _, _, tgt, _)| {
+                meaningful.contains(&sp.as_str())
+                    && meaningful.iter().any(|m| tgt.starts_with(&format!("{m}:")))
+            })
+            .collect()
+    };
+    let control_dir = TempDir::new().unwrap();
+    let control_db_dir = TempDir::new().unwrap();
+    write_tree(control_dir.path(), 0);
+    let control = Database::open(&control_db_dir.path().join("index.db")).unwrap();
+    run_full_index(&control, control_dir.path(), None, None).unwrap();
+    let expected = edges_of(&control);
+    // Not vacuous: the file the batch boundary hid is among the control's.
+    for (path, src, rel) in [
+        ("aaa/main.py", "<module>", "imports"),
+        ("aaa/use.py", "<module>", "imports"),
+        ("aaa/use.py", "use", "calls"),
+    ] {
+        assert!(
+            expected.iter().any(|(p, s, r, t, _)| p == path
+                && s == src
+                && r == rel
+                && t == "zzz/check.py:run"),
+            "control lacks {path} {src} {rel} zzz/check.py:run: {expected:#?}"
+        );
+    }
+
+    let multi_dir = TempDir::new().unwrap();
+    let multi_db_dir = TempDir::new().unwrap();
+    write_tree(multi_dir.path(), super::index_files::BATCH_SIZE);
+    let multi = Database::open(&multi_db_dir.path().join("index.db")).unwrap();
+    run_full_index(&multi, multi_dir.path(), None, None).unwrap();
+    assert_eq!(edges_of(&multi), expected, "a full index past BATCH_SIZE");
+    fs::write(
+        multi_dir.path().join("aaa/main.py"),
+        "from check import run\n\n\ndef go():\n    return run()\n# edited\n",
+    )
+    .unwrap();
+    run_incremental_index(&multi, multi_dir.path(), None, None).unwrap();
+    assert_eq!(edges_of(&multi), expected, "after an edit of the importer");
+}

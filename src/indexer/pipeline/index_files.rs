@@ -2105,6 +2105,26 @@ fn resolve_batch_relations(
                     if let Some(module_files) =
                         project_module_files_from(python_module, &pf.rel_path, python_module_map)
                     {
+                        // A path two import roots both spell (`aaa/check.py`
+                        // and `zzz/check.py` are each `check`) names every one
+                        // of its files. One a later batch holds is not visible
+                        // yet, and binding the ones that are made the answer
+                        // depend on where the batch boundary fell: a full index
+                        // bound one `check.py`, the next edit of the importer
+                        // both. Wait for the post-loop pass, which sees all.
+                        if module_files.len() > 1
+                            && module_files.iter().any(|f| {
+                                module_node_of(&name_to_ids, &node_id_to_path, f).is_empty()
+                            })
+                        {
+                            deferred.push(DeferredRelation::of(
+                                &source_ids,
+                                rel,
+                                &pf.rel_path,
+                                &pf.language,
+                            ));
+                            continue;
+                        }
                         // Internal module — try constrained resolution
                         let found = resolve_python_module_targets(
                             &module_files,
