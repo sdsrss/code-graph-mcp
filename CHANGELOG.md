@@ -1,5 +1,270 @@
 # Changelog
 
+## Unreleased
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 139 → 140
+because the stored graph changes for unchanged source: route edges; Python,
+Go and JavaScript/TypeScript call edges; Python references; and functions
+nested in a method, which were named as members of the class (below). A
+full index of this repository's Rust `src/` has the same edges as before;
+Rust changes only what incremental runs bind. The MCP
+server rebuilds the index when it starts. From the command line, a query
+answers from the old index with "This index was built by an older code-graph
+(index v139, this binary v140): answers come from it until it is rebuilt —
+run: code-graph-mcp reindex", and the first `incremental-index` prints
+"Index version mismatch (stored v139 ≠ binary v140): clearing + rebuilding".
+0.191.1 answers queries from an index this version wrote but will not write
+to it: its `incremental-index` exits 1 and says to delete
+`.code-graph/index.db*` first. To pin the binary back:
+`npm i -g @sdsrs/code-graph@0.191.1` (or, from source, `cargo install
+--locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.191.1
+--features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The
+plugin's scripts are unchanged.
+
+Answers change for scripts and MCP clients: `deps --json` and MCP
+`dependency_graph` can list fewer files, with `ambiguous_only_hidden`
+counting the ones left out; `refs`
+and `find_references` on a Rust type add `calls` rows carrying `via`; a
+read-only second MCP server can add a `freshness` object; `trace`, `map` /
+`report` / `project_map` hot functions and `semantic_code_search` answer
+differently (below).
+
+Measured on four projects, each indexed by 0.191.1 and by this version from
+identical copies, edges compared by relation, caller and callee:
+
+- flask (d086db85, 109 files): route edges 8,435 → 285; call pairs
+  1,989 → 1,964 (25 removed, 4 of them above the default `inferred` floor,
+  none added); references 649 → 659; 6 import edges replaced by 4.
+- gin (75ccf94d, 101 files): call pairs 4,278 → 4,034 (244 removed, 46
+  above the floor, none added); 27 relabelled `ambiguous` → `inferred`.
+- hono (4.6.14, 366 files): call pairs 3,437 → 3,435 (2 removed, both above
+  the floor); route pairs 569 → 563.
+- the Python 3.14 standard library (570 files): call pairs 101,422 →
+  100,382 (1,245 removed, 11 above the floor; 205 added, all `ambiguous`),
+  51 relabelled `inferred` → `ambiguous`; references 5,556 → 5,732; import
+  pairs 5,030 → 5,029.
+
+### fix: a route edge connects its handler only to itself
+
+A route edge names its handler as both ends, and both ends were matched by
+name. Flask tests that each nest their own `def index()` under
+`@app.route("/")` therefore got each route written onto every same-named
+handler and between each pair of them: flask's tests/test_basic.py held
+6,585 route edges from 109 handlers, and `trace "GET /"` printed 2,299
+route blocks (619,563 bytes). A route edge is now written only from a
+handler to itself: `trace "GET /"` prints 124 blocks (14,458 bytes).
+
+### fix: Flask `methods=` given as a tuple, list or set answers each method
+
+`methods=("GET", "POST")`, the form Flask's tutorial uses, was read as no
+list and stored as the default GET, and a list kept only its first method.
+On flask's tutorial, `trace "POST /register"` found no route and
+`/<int:id>/delete`, declared `methods=("POST",)`, was stored as GET. Each
+listed method is now a route of its own: `trace /register` prints `GET` and
+`POST`, the delete route `POST` only. A literal method name inside a path
+(`/get-methods`) is not read as a method.
+
+### fix: `trace` prints each call under its caller and follows each handler by itself
+
+The text output listed a handler's calls breadth-first and indented each by
+its depth, so every depth-2 call landed under the last depth-1 call: on
+flask, `trace /register` printed `_render` and `update_template_context`
+under `flash`, which calls neither. They now print under `render_template`.
+And the chain was traversed by handler name and file, so two handlers of one
+name in one file each got both chains: with `index` calling `helper_a` and a
+second `index` calling `helper_b`, `trace "GET /"` (text and `--json`) and
+MCP `get_call_graph` with `route_path` listed `helper_a` and `helper_b`
+under both. Each now lists its own.
+
+### fix: Go `pkg.F()` binds the package its import path names
+
+A call through an imported package was recorded as a bare name and bound by
+name, so `errors.New`, `validator.New` and the like reached gin's own `New`,
+`io.Copy` its `Copy` method, `http.Dir` its `Dir`, `rand.Read` a test's
+`Read`. The call now keeps the import path and binds in the directory that
+path names under the project's `go.mod`; a standard-library path binds
+nothing. On gin, 46 such edges above the default floor are gone, 31 of them
+into `New`, and 27 calls through a project package (`bytesconv.`,
+`binding.Default`, `gin.Default`) that were `ambiguous` because another
+definition shares the name are `inferred`.
+
+### fix: Python `self.x.f()` binds no free function of a file its caller never imports
+
+`self.url_defaults.update(...)` in flask's `Blueprint.__init__` bound the
+tutorial's `def update` in examples/tutorial/flaskr/blog.py (`inferred`).
+Such a call no longer binds a top-level function of another file the
+caller's file has no import edge into; `callgraph update --file
+examples/tutorial/flaskr/blog.py` lists no caller.
+
+### fix: a JavaScript/TypeScript call on an imported value binds no definition of its own file
+
+In hono's src/utils/jwt/jwt.ts, `utf8Decoder.decode(part)` with
+`utf8Decoder` imported bound the file's own `decode` (`extracted`). A call
+on an imported value no longer binds a definition of its own file;
+`callgraph decode --file src/utils/jwt/jwt.ts` no longer lists
+`decodeJwtPart`.
+
+### fix: Python names in a list, tuple or set literal are references
+
+`default_tags = [TagDict, PassDict, ...]` is the only mention of flask's
+eight JSON tag classes, and `dead-code` listed all eight. An element of a
+list, tuple or set literal is now a reference when the file defines or
+imports the name (a method's name only in a class body). flask's references
+grow by 10, the standard library's by 176; `dead-code` on flask goes from 19
+candidates to 12 (one new candidate, below).
+
+### fix: a function defined in a method's body is no method of the class
+
+Python, JavaScript, TypeScript and Rust named a function nested in a method
+`Blue.register`, as a member of the class (Python stored it as a method), so
+`b.register()` elsewhere bound it in Python, JavaScript and TypeScript, and
+flask's Blueprint showed four `decorator` methods that do not exist. It is
+now a plain function `register`: flask has 41 fewer methods, the standard
+library 163. A TypeScript arrow bound to a `const` in a method also
+had its calls credited to a same-named getter (`const res = () => leaf()`
+in a class with `get res()`); they now belong to the arrow.
+
+### fix: Python `from m import x` binds no function nested in another file's function
+
+The standard library's `from codecs import lookup` in tokenize.py bound the
+two `lookup`s nested inside functions of shutil.py; it now binds the
+`<external>` placeholder (codecs.py takes `lookup` from the C module
+`_codecs`), and `refs` on either `lookup` no longer lists tokenize.py. A
+nested function its own module exposes (`fsencode, fsdecode = _fscodec()` in
+os.py) still binds.
+
+### change: a Python call on a parameter or local value is `ambiguous` into a file its caller never imports
+
+A bare call `f(...)` whose name the caller's scope binds to a value (a
+parameter, an assignment, a `for`, `with ... as`, `except ... as` or `:=`
+target, also from an enclosing function) runs what the caller was handed,
+yet it bound same-named functions elsewhere: configparser's `_get(self,
+section, conv, ...)` bound annotationlib's nested `conv`. Such a bind into a
+file the caller's file imports nothing from is now `ambiguous`, hidden by
+default (`callgraph _get --file configparser.py` says "1 direct ambiguous
+by-name edge(s) hidden"). A parameter whose default is the name itself
+(`f=f`) is not such a value, and a bind into a `conftest.py` in the
+caller's directory or one above keeps its label. On the standard library,
+51 edges were relabelled, 46 of them wrong on reading; the 5 right ones are
+in Not covered.
+
+### fix: incremental runs bind as a rebuild does
+
+Three shapes needed a rebuild to get the edge a rebuild gives:
+
+- Rust `x.run()` on a receiver of unknown type, with `run` defined on two
+  types: deleting one of the two files left the call unbound until a
+  rebuild bound the survivor. It now binds on the incremental run.
+- Rust `crate::a::f()` written before `a.rs` defines `f`: the call was
+  dropped like a foreign crate's path, so adding `f` later bound nothing
+  until a rebuild. It now binds when `f` appears.
+- Python `from check import run` where two import roots each hold a
+  `check.py`: a full index past 500 files bound only the file an earlier
+  batch held, and the next edit of the importer bound both. The full index
+  now binds both.
+
+### fix: `map`, `report` and `project_map` hot functions skip `ambiguous` callers
+
+Hot functions counted every incoming call, including the `ambiguous` by-name
+guesses `callgraph` and `impact` hide. flask listed `setdefault` in
+src/flask/ctx.py first, with 21 callers, all of them `ambiguous` (app.py's
+`options.setdefault(...)` among them); gin listed testdata's `String` 4th
+(144 callers, all `ambiguous`). Both are gone from the list.
+
+### fix: `deps` and `dependency_graph` follow `callgraph`'s confidence floor
+
+gin's internal/bytesconv/bytesconv_1.20.go calls only functions of
+`unsafe`, yet `deps` listed 30 files it depends on, reached through
+`ambiguous` by-name matches. Both surfaces now walk `extracted` and
+`inferred` edges only and say how many files only `ambiguous` edges reach:
+`depends_on` 30 → 0 and `depended_by` 48 → 29, with
+`ambiguous_only_hidden: 13` in JSON and a note in the text and the MCP
+summary.
+
+### fix: `semantic_code_search` keeps the exact-name match
+
+The fused search pool was cut before the exact-name rerank could lift a
+match the vector channel ranked low. On flask, `send_file` was missing at
+`top_k` 1 to 10 and `get_flashed_messages` at `top_k` 1 to 5; both now rank
+first.
+
+### change: `refs` and `find_references` on a Rust type list `Type::method()` calls
+
+`SessionMetrics::new()` binds the method `new`, so `refs SessionMetrics` on
+this repository's `src/` answered 1 row. It now also lists each call written
+through the type's path, as a `calls` row carrying `via:
+["SessionMetrics::new"]`: 20 rows, 19 of them via. A call through `Self::`
+is not listed. MCP `type_definition_note` says which calls are listed.
+
+### fix: a read-only second MCP server says which result files changed
+
+A second `serve` on a project reads the index read-only and cannot re-index
+an edit; after a first-time index, the first server re-indexes only once its
+session makes a tool call. The second server then answered from the
+pre-edit index with no word of it: after a function moved down three lines,
+`ast_search` answered line 1 with no `freshness` key. It still answers line
+1, now with `freshness` (`stale_kept: 1`) and a note to read the changed
+file.
+
+### fix: `snapshot create --include-embeddings` writes vectors
+
+The flag created the vector table but indexed without the model, so the
+snapshot held no vectors while `snapshot inspect` said `includes_vec: true`
+(3 files, 8 nodes: 0 vectors). It now embeds (8 vectors); `includes_vec` is
+true only when the file holds vectors, and the CLI warns when it holds none.
+
+### fix: `rebuild-index` no longer says the structure is queryable while it embeds
+
+`rebuild-index` builds into a temporary file and replaces `index.db` only
+after embedding, yet printed "Embedding 1719 nodes (structure is already
+queryable)..." on flask. It now says the current index keeps answering until
+the swap, that an interrupt discards the rebuild, and that `--no-embed`
+skips the step. An interrupt left `index.db` unchanged on both versions.
+
+### Cost
+
+A full index of the standard library takes 3% to 4% more CPU, measured
+against 0.191.1 built from source with the same toolchain and features:
+medians of two sets of 5 interleaved runs, 6.048 → 6.236 s and 5.857 →
+6.067 s. A one-file edit there (configparser.py) measured 0.321 → 0.321 s
+and 0.311 → 0.317 s.
+
+### Not covered
+
+- One right edge is lost: the standard library's unittest/signals.py
+  `self.default_handler()` calls a nested function stored on `self`, which
+  is now a function, not a method.
+- 5 of the 51 relabelled standard-library calls were right: json.decoder's
+  two `scan_once` (`from json import scanner` binds no submodule yet),
+  os.walk's `islink`, importlib's `spec_from_file_location`,
+  wsgiref.validate's `start_response`. They are `ambiguous` now.
+- Removing wrong edges leaves definitions with no incoming edge: on flask,
+  122 definitions lost their last one (118 route handlers whose incoming
+  edges were other handlers' routes, 9 of them also `ambiguous` calls;
+  examples/celery's `add`, whose real use `tasks.add.delay()` is an
+  attribute access the index does not record, and now shows in
+  `dead-code`). On the standard library 14 lost their last edge and 88
+  gained one.
+- `from flask.globals import app_ctx` (3 importers) moved from a nested
+  `app_ctx` in tests/test_blueprints.py to the `app_ctx` fixture in
+  tests/conftest.py; the module's `app_ctx` is a variable no definition
+  answers, so both are wrong.
+- A Python call on a local value that binds a file the caller does import,
+  or its own file, keeps its label; some of those are wrong (pickle's
+  `reduce = getattr(obj, "__reduce_ex__")` binding functools.reduce).
+- A Rust module file created after a `crate::a::f()` call still needs a
+  rebuild; `crate::m::T::f()` with `f` in an `impl T` outside m.rs does not
+  bind, while `T::f()` after `use crate::m::T` does.
+- Functions nested in methods are still stored as members in C#, Dart, PHP,
+  Kotlin and Swift.
+- `refs` on a class in another language lists no call written through its
+  name (`Foo.create()` in Python, `Foo::create()` in C++), and the CLI
+  `refs` prints no note about that.
+- A route chain's JSON nodes carry no `parent_id`.
+- The second MCP server's data stays stale until the first server's watcher
+  runs.
+
 ## 0.191.1
 
 **Upgrading: no index rebuild; upgrade soon.** `INDEX_VERSION` stays 139.
