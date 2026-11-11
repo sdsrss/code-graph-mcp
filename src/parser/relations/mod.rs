@@ -660,7 +660,11 @@ fn walk_for_relations(
                         ),
                         None => (None, name),
                     };
-                    match own_cls.as_deref().or(current_class) {
+                    // A function in a function's body is no member of the
+                    // class around it: its node carries no class either.
+                    let enclosing = current_class
+                        .filter(|_| !super::treesitter::enclosed_by_function(&node, language));
+                    match own_cls.as_deref().or(enclosing) {
                         Some(cls) => format!("{}.{}", cls, method),
                         None => method,
                     }
@@ -682,7 +686,10 @@ fn walk_for_relations(
                         .and_then(|p| p.child_by_field_name("name"))
                         .map(|n| {
                             let name = node_text(&n, source).to_string();
-                            match current_class {
+                            let enclosing = current_class.filter(|_| {
+                                !super::treesitter::enclosed_by_function(&node, language)
+                            });
+                            match enclosing {
                                 Some(cls) => format!("{}.{}", cls, name),
                                 None => name,
                             }

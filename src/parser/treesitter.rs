@@ -121,6 +121,28 @@ pub(crate) fn lexical_scope(def: &tree_sitter::Node, language: &str) -> Option<L
     Some(LexicalScope::File)
 }
 
+/// A definition whose first container going up is a function of
+/// [`lexical_scope_kinds`] (not a class, impl, trait or object literal) is
+/// local to that function: no member of a class further out. Its node and the
+/// scope its relations name both drop the class, so the two agree. False for
+/// every language `lexical_scope_kinds` does not cover.
+pub(crate) fn enclosed_by_function(def: &tree_sitter::Node, language: &str) -> bool {
+    let Some((functions, members)) = lexical_scope_kinds(language) else {
+        return false;
+    };
+    let mut cur = def.parent();
+    while let Some(n) = cur {
+        if functions.contains(&n.kind()) {
+            return true;
+        }
+        if members.contains(&n.kind()) {
+            return false;
+        }
+        cur = n.parent();
+    }
+    false
+}
+
 /// A block scope of JS/TS or Rust that is not the body of a function kind of
 /// [`lexical_scope_kinds`] (a function's own body is its function's scope).
 /// Nor is a TS `namespace` / `declare module` / `declare global` body one: a
@@ -966,8 +988,8 @@ fn extract_nodes(
     match kind {
         // Functions: shared across TS/JS/Go (function_declaration), Python/C/C++ (function_definition)
         "function_declaration" | "function" => {
-            if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class)
-            {
+            let owner = parent_class.filter(|_| !enclosed_by_function(&node, language));
+            if let Some(mut parsed) = extract_function_node(&node, source, "function", owner) {
                 parsed.is_test = node_is_test;
                 parsed.lexical_scope = lexical_scope(&node, language);
                 if matches!(config.name, "javascript" | "typescript" | "tsx") {
@@ -1053,13 +1075,15 @@ fn extract_nodes(
                 if python_overload_stub(&node, source) {
                     return;
                 }
-                // Python and others: name is in "name" field
-                let nt = if parent_class.is_some() {
+                // Python and others: name is in "name" field. A `def` in a
+                // method's body is that method's local, no member of the class.
+                let owner = parent_class.filter(|_| !enclosed_by_function(&node, language));
+                let nt = if owner.is_some() {
                     "method"
                 } else {
                     "function"
                 };
-                if let Some(mut parsed) = extract_function_node(&node, source, nt, parent_class) {
+                if let Some(mut parsed) = extract_function_node(&node, source, nt, owner) {
                     parsed.is_test = node_is_test;
                     parsed.lexical_scope = lexical_scope(&node, language);
                     results.push(parsed);
@@ -1067,9 +1091,9 @@ fn extract_nodes(
             }
         }
         "function_item" => {
-            // Rust functions
-            if let Some(mut parsed) = extract_function_node(&node, source, "function", parent_class)
-            {
+            // Rust functions; a `fn` in a function's body is no associated fn.
+            let owner = parent_class.filter(|_| !enclosed_by_function(&node, language));
+            if let Some(mut parsed) = extract_function_node(&node, source, "function", owner) {
                 parsed.is_test = node_is_test;
                 parsed.lexical_scope = lexical_scope(&node, language);
                 results.push(parsed);
@@ -3785,6 +3809,93 @@ function Container() {
             names.contains(&"Container"),
             "TSX function with complex JSX should be parsed, got: {:?}",
             names
+        );
+    }
+
+    // A named function defined in a method's body is local to that method, no
+    // member of the class: flask's `def register_template_filter(state)` inside
+    // `Blueprint.add_app_template_filter` was a method
+    // `Blueprint.register_template_filter`, which `bp.register_template_filter()`
+    // then bound. A class defined in a method keeps its own methods. Ruby is no
+    // such case: a `def` run inside a method defines a method on the class.
+    #[test]
+    fn test_a_function_nested_in_a_method_is_no_member_of_the_class() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "python",
+                "method",
+                "class Blue:\n    def add(self, f):\n        def register(state):\n            pass\n",
+            ),
+            (
+                "typescript",
+                "method",
+                "class Blue {\n  add(f: any) {\n    function register(state: any) {}\n  }\n}\n",
+            ),
+            (
+                "javascript",
+                "method",
+                "class Blue {\n  add(f) {\n    function register(state) {}\n  }\n}\n",
+            ),
+            (
+                "rust",
+                "function",
+                "struct Blue;\nimpl Blue {\n    fn add(&self) {\n        fn register(x: u32) -> u32 { x }\n    }\n}\n",
+            ),
+        ];
+        for (lang, method_type, code) in cases {
+            let nodes = parse_code(code, lang).unwrap();
+            let got: Vec<_> = nodes
+                .iter()
+                .map(|n| {
+                    (
+                        n.name.as_str(),
+                        n.node_type.as_str(),
+                        n.qualified_name.as_deref(),
+                    )
+                })
+                .collect();
+            assert!(
+                got.contains(&("add", *method_type, Some("Blue.add"))),
+                "{lang}: {got:?}"
+            );
+            assert!(
+                got.contains(&("register", "function", Some("register"))),
+                "{lang}: {got:?}"
+            );
+        }
+
+        let code = "class Blue:\n    def add(self):\n        async def fetch():\n            pass\n        \
+                    class Local:\n            def m(self):\n                def inner():\n                    pass\n";
+        let nodes = parse_code(code, "python").unwrap();
+        let got: Vec<_> = nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.name.as_str(),
+                    n.node_type.as_str(),
+                    n.qualified_name.as_deref(),
+                )
+            })
+            .collect();
+        for want in [
+            ("fetch", "function", Some("fetch")),
+            ("m", "method", Some("Local.m")),
+            ("inner", "function", Some("inner")),
+        ] {
+            assert!(got.contains(&want), "{want:?}: {got:?}");
+        }
+
+        let code = "class Blue\n  def add\n    def register(x)\n      x\n    end\n  end\nend\n";
+        let nodes = parse_code(code, "ruby").unwrap();
+        assert!(
+            nodes.iter().any(|n| n.name == "register"
+                && n.node_type == "method"
+                && n.qualified_name.as_deref() == Some("Blue.register")),
+            "ruby: {:?}",
+            nodes
+                .iter()
+                .map(|n| (&n.name, &n.qualified_name))
+                .collect::<Vec<_>>()
         );
     }
 

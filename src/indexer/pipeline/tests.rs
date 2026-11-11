@@ -14263,6 +14263,66 @@ fn a_js_call_on_an_imported_value_binds_no_definition_of_its_own_file() {
     );
 }
 
+// A function defined in a method's body is no member of the class: a call on
+// an instance of the class (`b.register(1)`) binds nothing, while the method
+// that defines it still reaches it by name and its own calls keep it as their
+// caller. A TS arrow bound to a `const` in a method is the same scope: its
+// calls used to name `Blue.arrow`, a node no extractor writes, and were lost.
+#[test]
+fn a_function_nested_in_a_method_is_no_member_of_the_class() {
+    let files: &[(&str, &str)] = &[
+        (
+            "a.py",
+            "def helper():\n    pass\n\nclass Blue:\n    def add(self, f):\n        \
+             def register(state):\n            helper()\n            self.other()\n        \
+             register(1)\n\n    def other(self):\n        pass\n\n\
+             def use(b: Blue):\n    b.register(1)\n",
+        ),
+        (
+            "b.ts",
+            "function helper() {}\nclass Blue {\n  add(f: any) {\n    \
+             function register(state: any) { helper(); this.other(); }\n    \
+             const arrow = (s: any) => { helper(); this.other(); };\n    \
+             register(1);\n    arrow(2);\n  }\n  other() {}\n}\n\
+             function use(b: Blue) { b.register(1); }\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let rows = graph_projection_with_confidence(&db);
+    let callees_of = |caller: &str| -> Vec<String> {
+        let mut v: Vec<String> = rows
+            .iter()
+            .filter(|(a, r, _, _)| a == caller && r == REL_CALLS)
+            .map(|(_, _, b, _)| b.clone())
+            .collect();
+        v.sort();
+        v
+    };
+    for f in ["a.py", "b.ts"] {
+        assert_eq!(
+            callees_of(&format!("{f}:use")),
+            Vec::<String>::new(),
+            "{f}: {rows:#?}"
+        );
+        assert_eq!(
+            callees_of(&format!("{f}:register")),
+            [format!("{f}:helper"), format!("{f}:other")],
+            "{f}: {rows:#?}"
+        );
+    }
+    assert_eq!(callees_of("a.py:add"), ["a.py:register"], "{rows:#?}");
+    assert_eq!(
+        callees_of("b.ts:add"),
+        ["b.ts:arrow", "b.ts:register"],
+        "{rows:#?}"
+    );
+    assert_eq!(
+        callees_of("b.ts:arrow"),
+        ["b.ts:helper", "b.ts:other"],
+        "{rows:#?}"
+    );
+}
+
 // B9 (2026-09-29 usage evaluation): a member call on a Node built-in module
 // (`path.resolve(p)`, `fs.renameSync(a, b)`) runs Node's code, yet it bound a
 // project function or method of that name elsewhere (express: a test's
