@@ -21,7 +21,13 @@ use std::path::Path;
 /// When `out` ends in `.db.zst`, the result is zstd-compressed (level 9, to
 /// match the producer workflow template). For any other extension the raw
 /// SQLite file is written, and the caller is responsible for compression.
-pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
+///
+/// `include_vec` embeds while indexing, as a full `incremental-index` does.
+/// Returns whether the snapshot holds vectors: none without the embedding
+/// model (a build without `embed-model`, or model files that do not load),
+/// and the snapshot's `includes_vec` says so rather than claim the empty table
+/// it used to ship.
+pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<bool> {
     use crate::indexer::pipeline::run_full_index;
     use crate::storage::db::Database;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,6 +37,7 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
     let tmp = tempfile::tempdir().context("create tempdir for snapshot build")?;
     let staging_db = tmp.path().join("staging.db");
 
+    let has_vec;
     {
         let db = if include_vec {
             Database::open_with_vec(&staging_db)?
@@ -38,12 +45,21 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
             Database::open(&staging_db)?
         };
 
-        run_full_index(&db, root, None, None)?;
+        let model = if include_vec {
+            crate::embedding::model::EmbeddingModel::load()?
+        } else {
+            None
+        };
+        run_full_index(&db, root, model.as_ref(), None)?;
 
         let conn = db.conn();
+        has_vec = include_vec
+            && conn.query_row("SELECT COUNT(*) FROM node_vectors_rowids", [], |r| {
+                r.get::<_, i64>(0)
+            })? > 0;
 
-        // Drop vec table when caller doesn't want it (defensive IF EXISTS).
-        if !include_vec {
+        // Drop vec table when it holds nothing to ship (defensive IF EXISTS).
+        if !has_vec {
             conn.execute_batch("DROP TABLE IF EXISTS node_vectors;")?;
         }
         // Never ship the content-hash embedding_cache: it is a LOCAL reuse cache (rebuilt on
@@ -85,7 +101,7 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
         meta::write_meta(
             conn,
             meta::META_SNAPSHOT_INCLUDES_VEC,
-            if include_vec { "true" } else { "false" },
+            if has_vec { "true" } else { "false" },
         )?;
 
         // Merge WAL back into main file so VACUUM INTO produces a single
@@ -130,7 +146,7 @@ pub fn create(root: &Path, out: &Path, include_vec: bool) -> Result<()> {
             .with_context(|| format!("write checksum sidecar {sidecar}"))?;
     }
 
-    Ok(())
+    Ok(has_vec)
 }
 
 /// First four bytes of a zstd frame. `snapshot create` writes exactly one

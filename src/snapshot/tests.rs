@@ -1884,3 +1884,26 @@ fn install_clears_a_stranded_destination_wal() {
         "install left the destination's stale -shm in place"
     );
 }
+
+// `--include-embeddings` wrote `includes_vec: true` over an empty vector
+// table: the snapshot's index ran without the embedding model, so nothing was
+// embedded. It now embeds when the model loads, and the metadata says what the
+// file holds either way.
+#[test]
+fn includes_vec_says_whether_the_snapshot_holds_vectors() {
+    let fixture = init_git_fixture();
+    let out_db = fixture.path().join("snapshot.db");
+    crate::snapshot::create(fixture.path(), &out_db, true).unwrap();
+    let meta = crate::snapshot::inspect(&out_db).unwrap();
+    let conn =
+        rusqlite::Connection::open_with_flags(&out_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let vectors: i64 = conn
+        .query_row("SELECT COUNT(*) FROM node_vectors_rowids", [], |r| r.get(0))
+        .unwrap_or(0);
+    assert_eq!(meta.includes_vec, vectors > 0, "{vectors} vectors");
+    let model = crate::embedding::model::EmbeddingModel::load()
+        .unwrap()
+        .is_some();
+    assert_eq!(meta.includes_vec, model, "{vectors} vectors");
+}

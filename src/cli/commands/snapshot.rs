@@ -78,7 +78,13 @@ pub fn cmd_snapshot_create(project_root: &Path, args: SnapshotCreateArgs) -> Res
         }
     }
 
-    crate::snapshot::create(&root, out_path, include)?;
+    let with_vectors = crate::snapshot::create(&root, out_path, include)?;
+    if include && !with_vectors {
+        eprintln!(
+            "warning: --include-embeddings: the snapshot holds no vectors (the embedding \
+             model could not be loaded, or nothing was indexed), so includes_vec is false"
+        );
+    }
     if !quiet {
         eprintln!("snapshot created: {}", out);
         if out.ends_with(".db.zst") {
