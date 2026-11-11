@@ -87,7 +87,10 @@ name, so `errors.New`, `validator.New` and the like reached gin's own `New`,
 path names under the project's `go.mod`. From a file under a `go.mod` the
 index reads (in the project root or up to three directories below it), a
 path no such module names whose first element has no dot, the standard
-library's form, binds nothing; a file under none binds these calls by name,
+library's form, binds nothing, unless the name is also bound or assigned
+through anywhere in the calling function or a function around it (a
+parameter, `errors := ...`, `http.DefaultClient = nil`). Such a call, and
+every such call in a file under no `go.mod` the index reads, binds by name
 as before. On gin, 46 such edges above the default floor are gone, 31 of them
 into `New`, and 27 calls through a project package (`bytesconv.`,
 `binding.Default`, `gin.Default`) that were `ambiguous` because another
@@ -185,8 +188,8 @@ on gin, `deps internal/bytesconv/bytesconv_1.20.go` lists 29 files depending
 on it and leaves out 13, `ambiguous_only_hidden: 13` in JSON (with the
 default `--direction both` and with `incoming`), and a note in the text and
 the MCP summary. 0.191.1 listed 48 files depending on it and 30 it depends
-on, the latter all through its 6 `ambiguous` calls, which the Go fix above
-removes: it now depends on none.
+on, the latter all through the 6 `ambiguous` edges of its `unsafe.String(...)`
+call, which the Go fix above removes: it now depends on none.
 
 ### fix: `semantic_code_search` keeps the exact-name match
 
@@ -230,11 +233,11 @@ skips the step. An interrupt left `index.db` unchanged on both versions.
 
 ### Cost
 
-A full index of the standard library takes 3% to 5% more CPU, measured
-against 0.191.1 built from source with the same toolchain and features:
-medians of two sets of 5 interleaved runs, 5.904 → 6.163 s (+4.4%) and
-5.909 → 6.166 s (+4.3%); other sets measured +3.1%, +3.6%, +4.9% and
-+5.3%. A one-file edit there (configparser.py) measured 0.305 → 0.314 s
+A full index of the standard library takes 3.1% to 5.3% more CPU over
+eight sets of 5 interleaved runs, measured against 0.191.1 built from
+source with the same toolchain and features; on a quiet machine the
+medians were 5.904 → 6.163 s (+4.4%) and 5.909 → 6.166 s (+4.3%). A
+one-file edit there (configparser.py) measured 0.305 → 0.314 s
 and 0.298 → 0.303 s. A full index of gin measured 0.390 → 0.409 s and
 0.398 → 0.402 s.
 
@@ -249,13 +252,28 @@ and 0.298 → 0.303 s. A full index of gin measured 0.390 → 0.409 s and
   a module outside the project binds a project definition of the same name,
   as it already did as a call argument (`isinstance(x, Timeout)`): the
   standard library's io.py, which takes its I/O classes `from _io import
-  (...)`, now has 7 references into _pyio.py.
+  (...)`, now has 8 references into _pyio.py, 7 of them new.
 - A Go `go.mod` more than three directories below the project root is not
   read. Under no other module, its files bind by name as before; under one
   the index reads (a `go.mod` in the root), a call through the deep
   module's own packages binds nothing. And when two `go.mod` files declare
   the same module path, an import of it binds the packages of whichever the
   directory listing gives last.
+- A Go file under no `go.mod` the index reads gets none of the Go fix: gin
+  opened at its binding/ directory keeps the 44 `inferred` call pairs into
+  `SliceValidationError.Error` it had in 0.191.1, most through testify's
+  `assert.Error(...)`.
+- Adding or removing a `go.mod` re-reads no Go file: an unedited file keeps
+  what the previous run bound until it is edited or the index is rebuilt.
+  After `go mod init`, `errors.New` kept an `inferred` edge to the
+  project's only `New`.
+- A Go named result is not taken for a local: in `func mk() (log *Logger)`,
+  `log.Printf(...)` is taken for package log's and binds nothing, where
+  0.191.1 bound `Logger.Printf`.
+- Indexing the Go standard library's own source (`module std`, 7,125 Go
+  files) drops calls between its packages, whose imports (`fmt`) read as
+  the standard library outside the project: 15,122 call pairs above the
+  floor are gone and 2,281 appear.
 - A Flask `methods=` given as a name (`methods=VERBS`) is stored as GET only.
 - A route whose handler is imported from another file (Express
   `app.get('/user', getUser)` with `getUser` from ./ctrl) is written on
