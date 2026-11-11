@@ -1919,9 +1919,10 @@ fn resolve_batch_relations(
                     pf.language
                 );
             }
-            // A Go `pkg.F()` call in a file under no go.mod the walk found has
-            // no module to tell its packages from the standard library's
-            // (D#789): it stays the bare call it was before, bound by name.
+            // A Go `pkg.F()` call in a file under no go.mod the walk found
+            // stays the bare call it was before D#789, bound by name: with no
+            // module, a path without a dot cannot be told from the standard
+            // library's, and a dotted one is bound by name as well.
             let unmoduled;
             let rel = if pf.language == "go"
                 && super::resolve::go_package_call_path(rel.metadata.as_deref()).is_some()

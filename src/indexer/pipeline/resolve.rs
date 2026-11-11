@@ -2801,7 +2801,9 @@ pub(super) enum GoPackageDir {
     Module(String),
     /// Under no module the walk found, and dotted (`github.com/…`, `k8s.io/…`):
     /// a directory whose path ends with the import path (a vendored, staged or
-    /// GOPATH copy). Without any `go.mod`, also one the import path ends with.
+    /// GOPATH copy). Without any `go.mod`, also one the import path ends with:
+    /// only a call buffered while a go.mod existed gets here, since a file
+    /// under no module keeps its calls bare (`resolve_batch_relations`).
     Tail(String),
     /// A path whose first element has no dot, under no module: the standard
     /// library, which defines no project function.

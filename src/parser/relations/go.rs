@@ -464,11 +464,14 @@ pub(super) fn go_package_call(
     Some(path)
 }
 
-/// Every name Go function `f` binds: its parameters and receiver, and each
-/// `:=` / `var` / `range` / `=` target, type switch alias and select-case
-/// received value anywhere in its body. A func literal sees its enclosing
-/// functions' names, so [`go_package_call`] asks each of them. Collecting a
-/// name bound in another block than the call's only keeps the call by name.
+/// The names Go function `f` binds, as [`go_package_call`] counts them: its
+/// parameters and receiver (not its named results), and each `:=` / `var` /
+/// `range` / `=` target, type switch alias and select-case received value
+/// anywhere in its body, nested func literals included; an `=` left side
+/// gives every identifier in it, `pkg` of `pkg.V = x` too. A func literal
+/// sees its enclosing functions' names, so [`go_package_call`] asks each of
+/// them. A name collected from another block than the call's, or from
+/// `pkg.V = x`, leaves the call bare: bound by name, as before D#789.
 fn go_function_bound_names(
     f: &tree_sitter::Node,
     source: &str,
