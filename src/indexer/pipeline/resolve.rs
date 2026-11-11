@@ -694,13 +694,11 @@ pub(super) fn resolve_pending_calls_touching(
                 }
                 pool
             }
-            // A Rust `x.f()` whose receiver type narrowed the pool (D#112): the
-            // deferred pass's unique-method rule over that pool, which a later
-            // run can widen by more than one method at once.
-            Some(CalleeMeta::Receiver(_) | CalleeMeta::Chain)
-                if row.source_language == "rust"
-                    && rust_receiver(row.metadata.as_deref(), crate_roots).is_some() =>
-            {
+            // A Rust `x.f()`: the deferred pass's unique-method rule over the
+            // pool its receiver's type narrowed (D#112), or over every method of
+            // the name when the type is unknown. A later run can widen the pool
+            // by more than one method at once, or a deletion narrow it to one.
+            Some(CalleeMeta::Receiver(_) | CalleeMeta::Chain) if row.source_language == "rust" => {
                 let methods = method_candidates(&candidates, db)?;
                 let local: Vec<i64> = methods
                     .iter()

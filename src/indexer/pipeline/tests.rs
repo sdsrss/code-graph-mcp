@@ -18098,3 +18098,50 @@ fn a_bare_call_through_a_renamed_binding_follows_its_import_when_the_binding_mov
         );
     }
 }
+
+// A Rust `x.run()` whose receiver's type is unknown binds the one method of
+// that name, and nothing while there are several. Deleting all but one used to
+// leave the call with no edge until a rebuild: the ambiguous call was dropped,
+// not buffered, so nothing re-read it when the count fell to one.
+#[test]
+fn a_rust_call_on_an_untyped_receiver_binds_the_method_a_deletion_leaves() {
+    let lib = "pub mod a;\npub mod b;\npub mod c;\n";
+    let a = "pub struct A;\nimpl A {\n    pub fn run(&self) -> u32 { 1 }\n}\n";
+    let b = "pub struct B;\nimpl B {\n    pub fn run(&self) -> u32 { 2 }\n}\n";
+    let callers = [
+        "pub fn call<T: Run>(x: T) -> u32 { x.run() }\npub trait Run { fn run(&self) -> u32; }\n",
+        "use crate::a::A;\npub fn call() -> u32 { let x = A; x.run() }\n",
+    ];
+    for c in callers {
+        for gone in ["src/a.rs", "src/b.rs"] {
+            let before = [
+                ("src/lib.rs", lib),
+                ("src/a.rs", a),
+                ("src/b.rs", b),
+                ("src/c.rs", c),
+            ];
+            assert_incremental_matches_rebuild(&before, &[(gone, None)]);
+        }
+        // Two methods left: still none, and still buffered.
+        let lib3 = "pub mod a;\npub mod b;\npub mod c;\npub mod d;\n";
+        let d = "pub struct D;\nimpl D {\n    pub fn run(&self) -> u32 { 4 }\n}\n";
+        let before = [
+            ("src/lib.rs", lib3),
+            ("src/a.rs", a),
+            ("src/b.rs", b),
+            ("src/c.rs", c),
+            ("src/d.rs", d),
+        ];
+        assert_incremental_matches_rebuild(&before, &[("src/b.rs", None)]);
+        let (_p, _d, db) = fresh_index_of(&before);
+        assert_eq!(call_edges_with_confidence(&db), Vec::<String>::new());
+        assert_eq!(pending_set(&db).len(), 1, "{:?}", pending_set(&db));
+    }
+    // Several methods in the caller's own file: final, nothing to buffer.
+    let own = "pub struct P;\npub struct Q;\nimpl P {\n    pub fn run(&self) -> u32 { 1 }\n}\n\
+               impl Q {\n    pub fn run(&self) -> u32 { 2 }\n}\n\
+               pub fn call<T: Run>(x: T) -> u32 { x.run() }\npub trait Run { fn run(&self) -> u32; }\n";
+    let (_p, _d, db) = fresh_index_of(&[("src/lib.rs", own)]);
+    assert_eq!(call_edges_with_confidence(&db), Vec::<String>::new());
+    assert_eq!(pending_set(&db), Vec::<String>::new());
+}

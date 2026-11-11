@@ -4871,12 +4871,13 @@ fn resolve_deferred_relations(
                                 )?;
                             }
                             None
-                        } else if d.language == "rust"
-                            && super::resolve::rust_receiver(call_meta, crate_roots).is_some()
-                        {
+                        } else if d.language == "rust" {
                             // A typed receiver's call is decided by its type's own
-                            // method, which a later run may add: buffer it, as a
-                            // rebuild would then bind it (D#112).
+                            // method, which a later run may add (D#112); an untyped
+                            // one by there being one method of the name, which a
+                            // deletion may leave. Buffer it, as a rebuild would
+                            // then bind it. (Several same-file methods drop at
+                            // batch time and never reach this pass.)
                             for &src_id in &source_ids {
                                 crate::storage::queries::insert_pending_unresolved_call(
                                     db.conn(),
