@@ -936,9 +936,13 @@ fn extract_python_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     .then(|| super::member::MEMBER_META.to_string())
             })
             .or_else(|| super::member::python_module_call_meta(node, source))
-            .or_else(|| super::member::python_untyped_receiver_meta(node, source));
-        // `h()`, not `x.h()`: picks among same-file definitions by scope (D#714).
-        let call_at = (metadata.is_none()
+            .or_else(|| super::member::python_untyped_receiver_meta(node, source))
+            .or_else(|| super::python::python_local_value_call_meta(node));
+        // `h()`, not `x.h()`: picks among same-file definitions by scope (D#714),
+        // a local value's name too, whose same-file binds stay as they were.
+        let call_at = (metadata
+            .as_deref()
+            .is_none_or(|m| m == crate::domain::CALL_META_LOCAL_VALUE)
             && node
                 .child_by_field_name("function")
                 .is_some_and(|f| f.kind() == "identifier"))

@@ -5956,6 +5956,120 @@ fn test_python_names_in_a_list_tuple_or_set_literal_emit_references() {
 }
 
 #[test]
+fn test_python_call_on_a_value_its_scope_binds_is_marked_local() {
+    // D#789: `conv(x)` on a parameter `conv` runs what the caller passed. Bound
+    // by name, it took `annotationlib`'s nested `conv` on the standard library
+    // (configparser `_get`). Each callee below is named for its case.
+    let src = "import json\n\n\n\
+        def module_fn(x):\n    return x\n\n\n\
+        def alias_same(x):\n    return x\n\n\n\
+        def params(a, cb_param, *star_args, opt_none=None, **kw_args):\n    \
+            cb_param(a)\n    star_args(a)\n    opt_none(a)\n    kw_args(a)\n    module_fn(a)\n\n\n\
+        def aliases(x, alias_same=alias_same, dumps=json.dumps, other_default=module_fn):\n    \
+            alias_same(x)\n    dumps(x)\n    other_default(x)\n\n\n\
+        def assigns(d, E):\n    \
+            assigned = d.get\n    assigned(1)\n    \
+            for looped in d:\n        looped()\n    \
+            with d as withed:\n        withed()\n    \
+            try:\n        pass\n    except E as excepted:\n        excepted()\n    \
+            if (walrused := d):\n        walrused()\n    \
+            first, (second, unpacked) = d\n    unpacked()\n    \
+            d.stored_attr = 1\n    stored_attr()\n    \
+            augmented += 1\n    augmented()\n\n\n\
+        def defs():\n    \
+            def nested_def():\n        pass\n    nested_def()\n    \
+            class NestedClass:\n        pass\n    NestedClass()\n    \
+            from json import loads as local_import\n    local_import(1)\n    \
+            imported_twice = None\n    import imported_twice\n    imported_twice()\n\n\n\
+        def scoping(captured):\n    \
+            def inner():\n        captured()\n    \
+            lam = lambda lambda_param: lambda_param()\n    \
+            lam2 = lambda lam_default=lam_default(): lam_default\n    \
+            [comp_var() for comp_var in captured]\n    \
+            [shadow for shadow in shadow()]\n    \
+            return [y for y in iterable_call()]\n\n\n\
+        def through_class(cb_class):\n    \
+            class Inner:\n        def m(self):\n            return cb_class()\n\n\n\
+        def leaks():\n    \
+            def inner5():\n        leaked = 1\n    leaked()\n\n\n\
+        def declares_outer():\n    \
+            shadowed_global = 1\n\n    \
+            def inner4():\n        global shadowed_global\n        shadowed_global()\n\n\n\
+        def declared():\n    \
+            global global_name\n    global_name = 1\n    global_name()\n\n\n\
+        def outer():\n    \
+            closed = 1\n\n    \
+            def inner2():\n        nonlocal closed\n        closed = 2\n        closed()\n\n\n\
+        def defaulted(z=default_call(), made=made()):\n    return z\n\n\n\
+        class C:\n    \
+            class_attr = module_fn\n\n    \
+            def m(self):\n        return class_attr()\n";
+    let rels = extract_relations(src, "python").unwrap();
+    let meta = |callee: &str| -> Option<String> {
+        let found: Vec<(&str, Option<&str>)> = rels
+            .iter()
+            .filter(|r| r.relation == REL_CALLS && r.target_name == callee)
+            .map(|r| (r.source_name.as_str(), r.metadata.as_deref()))
+            .collect();
+        assert_eq!(found.len(), 1, "one call to {callee}: {found:?}");
+        found[0].1.map(str::to_string)
+    };
+    let local = Some(crate::domain::CALL_META_LOCAL_VALUE.to_string());
+    for callee in [
+        "cb_param",
+        "star_args",
+        "opt_none",
+        "kw_args",
+        "other_default",
+        "assigned",
+        "looped",
+        "withed",
+        "excepted",
+        "walrused",
+        "unpacked",
+        "augmented",
+        "captured",
+        "lambda_param",
+        "comp_var",
+        "closed",
+        "cb_class",
+    ] {
+        assert_eq!(meta(callee), local, "{callee} names a value of its scope");
+    }
+    for callee in [
+        "module_fn",
+        "alias_same",
+        "dumps",
+        "stored_attr",
+        "nested_def",
+        "NestedClass",
+        "local_import",
+        "imported_twice",
+        "iterable_call",
+        "global_name",
+        "default_call",
+        "made",
+        "lam_default",
+        "shadow",
+        "leaked",
+        "shadowed_global",
+        "class_attr",
+    ] {
+        assert_eq!(meta(callee), None, "{callee} names no local value");
+    }
+    // A local value keeps the call's position, so a same-file bind still
+    // picks among the file's definitions by scope (D#714).
+    let assigned = rels
+        .iter()
+        .find(|r| r.target_name == "assigned" && r.relation == REL_CALLS)
+        .unwrap();
+    assert!(
+        assigned.call_at.is_some(),
+        "a local value's call keeps call_at"
+    );
+}
+
+#[test]
 fn test_python_annotated_class_attr_emits_references() {
     // `class Service:\n    cache: Cache` — annotated class attribute → reference
     // to `Cache`.

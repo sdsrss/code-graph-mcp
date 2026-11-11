@@ -44,11 +44,27 @@ struct PyDefined {
 thread_local! {
     /// Per file: reset by [`reset_python_file`].
     static PY_DEFINED: std::cell::RefCell<PyDefined> = std::cell::RefCell::new(PyDefined::default());
+    /// Per file, keyed by `function_definition` node id: what each function's
+    /// own scope binds ([`function_bindings`]). Reset by [`reset_python_file`],
+    /// since node ids are only unique within one tree.
+    /// Per file: [`local_value_calls`], filled by [`reset_python_file`].
+    static PY_LOCAL_VALUE_CALLS: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+    static PY_FN_BINDINGS: std::cell::RefCell<
+        std::collections::HashMap<usize, std::rc::Rc<std::collections::HashMap<String, PyBinding>>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Collect the file's `def` / `class` names. MUST run once per file before its
 /// walk.
 pub(super) fn reset_python_file(root: tree_sitter::Node, source: &str, family: &str) {
+    PY_FN_BINDINGS.with(|b| b.borrow_mut().clear());
+    let local_calls = if family == "python" {
+        local_value_calls(root, source)
+    } else {
+        std::collections::HashSet::new()
+    };
+    PY_LOCAL_VALUE_CALLS.with(|c| *c.borrow_mut() = local_calls);
     PY_DEFINED.with(|d| {
         let mut defined = d.borrow_mut();
         defined.free.clear();
@@ -88,6 +104,340 @@ pub(super) fn reset_python_file(root: tree_sitter::Node, source: &str, family: &
             }
         }
     });
+}
+
+/// How a function's own scope binds a name, as Python's symbol table ranks
+/// the ways (`global` / `nonlocal` first, then a parameter, then an import or
+/// a nested `def` / `class`, then any other binding).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PyBinding {
+    /// A value only a run of the code knows: a parameter, or the target of an
+    /// assignment, `for`, `with … as`, `except … as` or `:=`.
+    Value,
+    /// A name that keeps naming a definition: an import, a nested `def` /
+    /// `class`, or a parameter whose default is the name itself (`f=f`,
+    /// `heappush=heapq.heappush`).
+    Definition,
+    Global,
+    Nonlocal,
+}
+
+/// `{"ur":"local"}` (`crate::domain::CALL_KEY_UNTYPED_RECEIVER`) for a bare
+/// call `f(...)` whose name the caller's own scope, or an enclosing
+/// function's, binds to a value ([`PyBinding::Value`]): `conv(x)` on a
+/// parameter `conv` runs whatever the caller passed, not a `def conv` that
+/// happens to share the name in another file. [`reset_python_file`] decided
+/// it for every call of the file ([`local_value_calls`]).
+pub(super) fn python_local_value_call_meta(call: tree_sitter::Node) -> Option<String> {
+    PY_LOCAL_VALUE_CALLS
+        .with(|c| c.borrow().contains(&call.id()))
+        .then(|| crate::domain::CALL_META_LOCAL_VALUE.to_string())
+}
+
+/// The bare calls of the file on a local value, by node id. Python's scope
+/// chain for a call: a lambda's parameters and a comprehension's `for`
+/// targets bind in their body (not in the first clause's iterable, which runs
+/// outside), a function's bindings in its body (not in its defaults or
+/// annotations), a class body binds nothing its methods see, `global` sends a
+/// name to module level and `nonlocal` to the enclosing function.
+///
+/// One sweep collects every scope as a byte range and every bare call, then
+/// the calls in source order meet the ranges open at them, innermost on top,
+/// as `treesitter::mark_python_class_body_calls` does. Asking each call's
+/// ancestors instead costs the depth squared per call (`Node::parent`
+/// descends from the root): `test_python_class_body_marking_stays_linear`
+/// timed out at 60 s.
+fn local_value_calls(root: tree_sitter::Node, source: &str) -> std::collections::HashSet<usize> {
+    enum Binder<'t> {
+        /// Bindings computed on first use ([`function_bindings`]).
+        Function(tree_sitter::Node<'t>),
+        Names(std::rc::Rc<std::collections::HashMap<String, PyBinding>>),
+    }
+    let mut scopes: Vec<(usize, usize, Binder)> = Vec::new();
+    let mut calls: Vec<(usize, usize, &str)> = Vec::new();
+    // Every node passes this match: kind ids, not kind strings.
+    let language = root.language();
+    let id = |kind: &str| language.id_for_node_kind(kind, true);
+    let wanted = [
+        id("call"),
+        id("function_definition"),
+        id("lambda"),
+        id("list_comprehension"),
+        id("set_comprehension"),
+        id("dictionary_comprehension"),
+        id("generator_expression"),
+    ];
+    let mut cursor = root.walk();
+    'walk: loop {
+        let n = cursor.node();
+        let kind = if wanted.contains(&n.kind_id()) {
+            n.kind()
+        } else {
+            ""
+        };
+        match kind {
+            "call" => {
+                if let Some(f) = n
+                    .child_by_field_name("function")
+                    .filter(|f| f.kind() == "identifier")
+                {
+                    calls.push((n.start_byte(), n.id(), node_text(&f, source)));
+                }
+            }
+            "function_definition" => {
+                if let Some(body) = n.child_by_field_name("body") {
+                    scopes.push((body.start_byte(), body.end_byte(), Binder::Function(n)));
+                }
+            }
+            "lambda" => {
+                if let Some(body) = n.child_by_field_name("body") {
+                    let params = n
+                        .child_by_field_name("parameters")
+                        .map(|p| parameter_bindings(p, source))
+                        .unwrap_or_default();
+                    let range = (body.start_byte(), body.end_byte());
+                    scopes.push((range.0, range.1, Binder::Names(std::rc::Rc::new(params))));
+                }
+            }
+            "list_comprehension"
+            | "set_comprehension"
+            | "dictionary_comprehension"
+            | "generator_expression" => {
+                let mut names = std::collections::HashMap::new();
+                let mut first_iterable = None;
+                let mut c = n.walk();
+                for clause in n
+                    .named_children(&mut c)
+                    .filter(|c| c.kind() == "for_in_clause")
+                {
+                    if first_iterable.is_none() {
+                        first_iterable = clause.child_by_field_name("right");
+                    }
+                    if let Some(left) = clause.child_by_field_name("left") {
+                        let mut bound = Vec::new();
+                        pattern_names(left, source, &mut bound);
+                        names.extend(bound.into_iter().map(|n| (n, PyBinding::Value)));
+                    }
+                }
+                let names = std::rc::Rc::new(names);
+                // Around the first iterable: before it and after it.
+                let (gap_start, gap_end) = first_iterable
+                    .map_or((n.end_byte(), n.end_byte()), |r| {
+                        (r.start_byte(), r.end_byte())
+                    });
+                scopes.push((n.start_byte(), gap_start, Binder::Names(names.clone())));
+                scopes.push((gap_end, n.end_byte(), Binder::Names(names)));
+            }
+            _ => {}
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    scopes.sort_unstable_by_key(|&(start, end, _)| (start, std::cmp::Reverse(end)));
+    calls.sort_unstable_by_key(|&(at, _, _)| at);
+    let mut out = std::collections::HashSet::new();
+    let mut open: Vec<&(usize, usize, Binder)> = Vec::new();
+    let mut next = scopes.iter().peekable();
+    for (at, id, name) in calls {
+        open.extend(std::iter::from_fn(|| {
+            next.next_if(|&&(start, _, _)| start <= at)
+        }));
+        open.retain(|&&(_, end, _)| end > at);
+        for (_, _, binder) in open.iter().rev() {
+            let binding = match binder {
+                Binder::Function(f) => function_bindings(*f, source).get(name).copied(),
+                Binder::Names(names) => names.get(name).copied(),
+            };
+            match binding {
+                Some(PyBinding::Value) => {
+                    out.insert(id);
+                    break;
+                }
+                Some(PyBinding::Definition | PyBinding::Global) => break,
+                Some(PyBinding::Nonlocal) | None => {}
+            }
+        }
+    }
+    out
+}
+
+/// What `function`'s own scope binds, computed once per function.
+fn function_bindings(
+    function: tree_sitter::Node,
+    source: &str,
+) -> std::rc::Rc<std::collections::HashMap<String, PyBinding>> {
+    if let Some(hit) = PY_FN_BINDINGS.with(|b| b.borrow().get(&function.id()).cloned()) {
+        return hit;
+    }
+    let mut declared = std::collections::HashMap::new();
+    let mut definitions = std::collections::HashSet::new();
+    let mut values = std::collections::HashSet::new();
+    if let Some(body) = function.child_by_field_name("body") {
+        collect_scope_bindings(
+            body,
+            source,
+            &mut declared,
+            &mut definitions,
+            &mut values,
+            0,
+        );
+    }
+    let params = function
+        .child_by_field_name("parameters")
+        .map(|p| parameter_bindings(p, source))
+        .unwrap_or_default();
+    let mut out: std::collections::HashMap<String, PyBinding> =
+        values.into_iter().map(|n| (n, PyBinding::Value)).collect();
+    out.extend(definitions.into_iter().map(|n| (n, PyBinding::Definition)));
+    out.extend(params);
+    out.extend(declared);
+    let out = std::rc::Rc::new(out);
+    PY_FN_BINDINGS.with(|b| b.borrow_mut().insert(function.id(), out.clone()));
+    out
+}
+
+/// A function's or lambda's parameter names: [`PyBinding::Definition`] when
+/// the default is the name itself or an attribute ending in it, so the call
+/// runs what the name names (`def f(x, len=len)`, `heappush=heapq.heappush`).
+fn parameter_bindings(
+    parameters: tree_sitter::Node,
+    source: &str,
+) -> std::collections::HashMap<String, PyBinding> {
+    let mut out = std::collections::HashMap::new();
+    for i in 0..parameters.named_child_count() {
+        let Some(p) = parameters.named_child(i) else {
+            continue;
+        };
+        let (name, default) = match p.kind() {
+            "default_parameter" | "typed_default_parameter" => (
+                p.child_by_field_name("name"),
+                p.child_by_field_name("value"),
+            ),
+            // `x: T` keeps its name as the first named child (`*a: T` too).
+            "typed_parameter" => (p.named_child(0), None),
+            _ => (Some(p), None),
+        };
+        let Some(name) = name else { continue };
+        let mut names = Vec::new();
+        pattern_names(name, source, &mut names);
+        for n in names {
+            let alias = default.is_some_and(|d| {
+                let spelled = match d.kind() {
+                    "identifier" => Some(d),
+                    "attribute" => d.child_by_field_name("attribute"),
+                    _ => None,
+                };
+                spelled.is_some_and(|s| node_text(&s, source) == n)
+            });
+            let binding = if alias {
+                PyBinding::Definition
+            } else {
+                PyBinding::Value
+            };
+            out.insert(n, binding);
+        }
+    }
+    out
+}
+
+/// The names a binding target binds: `a`, `a, b`, `(a, [b, *c])`, `**kw` —
+/// not `self.x` or `a[i]`, which store into an object.
+fn pattern_names(node: tree_sitter::Node, source: &str, out: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" => out.push(node_text(&node, source).to_string()),
+        "pattern_list"
+        | "tuple_pattern"
+        | "list_pattern"
+        | "list_splat_pattern"
+        | "dictionary_splat_pattern"
+        | "as_pattern_target" => {
+            for i in 0..node.named_child_count() {
+                if let Some(c) = node.named_child(i) {
+                    pattern_names(c, source, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk a function body for what its own scope binds, not entering a nested
+/// function, class, lambda or comprehension (each a scope of its own; a
+/// nested `def` / `class` binds its name here).
+fn collect_scope_bindings(
+    node: tree_sitter::Node,
+    source: &str,
+    declared: &mut std::collections::HashMap<String, PyBinding>,
+    definitions: &mut std::collections::HashSet<String>,
+    values: &mut std::collections::HashSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_SUBTREE_DEPTH {
+        return;
+    }
+    let targets = |field: &str, values: &mut std::collections::HashSet<String>| {
+        if let Some(t) = node.child_by_field_name(field) {
+            let mut names = Vec::new();
+            pattern_names(t, source, &mut names);
+            values.extend(names);
+        }
+    };
+    match node.kind() {
+        "function_definition" | "class_definition" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                definitions.insert(node_text(&name, source).to_string());
+            }
+            return;
+        }
+        "lambda"
+        | "list_comprehension"
+        | "set_comprehension"
+        | "dictionary_comprehension"
+        | "generator_expression" => return,
+        "global_statement" | "nonlocal_statement" => {
+            let binding = if node.kind() == "global_statement" {
+                PyBinding::Global
+            } else {
+                PyBinding::Nonlocal
+            };
+            for i in 0..node.named_child_count() {
+                if let Some(c) = node.named_child(i).filter(|c| c.kind() == "identifier") {
+                    declared.insert(node_text(&c, source).to_string(), binding);
+                }
+            }
+            return;
+        }
+        "import_statement" | "import_from_statement" => {
+            let mut cursor = node.walk();
+            for name in node.children_by_field_name("name", &mut cursor) {
+                let bound = match name.kind() {
+                    "aliased_import" => name.child_by_field_name("alias"),
+                    // `import a.b` binds `a`.
+                    "dotted_name" => name.named_child(0),
+                    _ => None,
+                };
+                if let Some(b) = bound {
+                    definitions.insert(node_text(&b, source).to_string());
+                }
+            }
+            return;
+        }
+        "assignment" | "augmented_assignment" | "for_statement" => targets("left", values),
+        "named_expression" => targets("name", values),
+        // `with C as x`, `except C as e` and `case D() as c` all parse so.
+        "as_pattern" => targets("alias", values),
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for c in node.named_children(&mut cursor) {
+        collect_scope_bindings(c, source, declared, definitions, values, depth + 1);
+    }
 }
 
 /// Whether `node` sits in a class body with no function in between.

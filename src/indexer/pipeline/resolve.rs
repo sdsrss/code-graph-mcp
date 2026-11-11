@@ -2552,6 +2552,40 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                        OR json_extract(e.metadata, '$.ur') IS NOT NULL)
                   AND tgt.name IN ({py_builtin_names}))"
     );
+    // A bare Python call on a value the caller's scope binds (`conv(x)` on a
+    // parameter, `p = d.get(k); p(...)`: `CALL_META_LOCAL_VALUE`, D#789), bound
+    // by name into a file the caller's file imports nothing from: the value is
+    // whatever the caller was handed, so the namesake is a guess. On the
+    // standard library 51 such binds were `inferred`: on reading each, 46
+    // wrong (`_warn=warnings.warn` bound `site._warn` ten times, `conv` bound
+    // `annotationlib`'s nested `conv`) and 5 right (`json.decoder` handed the
+    // scanner's own `scan_once`, which `from json import scanner` does not yet
+    // bind as an import). `ambiguous`, not deleted: a dispatcher such as
+    // `encodings.search_function` (`getregentry = mod.getregentry`) is the only
+    // caller each codec's `getregentry` has, and deleting its 120 edges made
+    // them dead-code candidates. Kept: a bind into a file the caller imports
+    // from (`unittest`'s `getattr(result, 'startTestRun')` binding
+    // `result.py`, 17 of 22 right); one into a `conftest.py` whose directory
+    // holds the caller, which is how pytest hands a test its fixtures (flask's
+    // six `purge_module("…")` calls on tests/conftest.py's factory fixture);
+    // and every same-file bind, which `conf_where` keeps from reaching here.
+    // `conftest.py` is 11 bytes: what precedes it is the directory (empty at
+    // the root), a prefix of every path pytest shows it to.
+    let py_local_value_call = "(e.relation = ?1
+                  AND json_extract(e.metadata, '$.ur') = 'local'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM cg_imports i
+                      JOIN nodes inode ON inode.id = i.tid
+                      WHERE i.fid = src.file_id
+                        AND inode.file_id = tgt.file_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM files sf
+                      WHERE sf.id = src.file_id
+                        AND (tf.path = 'conftest.py' OR tf.path LIKE '%/conftest.py')
+                        AND substr(sf.path, 1, length(tf.path) - 11)
+                            = substr(tf.path, 1, length(tf.path) - 11)
+                  ))";
     // The classification itself — one expression, spent by every driver below.
     // `nc` is the same-name/same-language count; `e`, `src`, `tgt` are the edge
     // and its two endpoints. Kept as one string because a scoped copy that
@@ -2562,6 +2596,7 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
         "CASE
                  WHEN {TS_TYPE_CALL} THEN ?3
                  WHEN {py_builtin_call} THEN ?3
+                 WHEN {py_local_value_call} THEN ?3
                  WHEN nc.cnt > 1
                       -- ... UNLESS the caller's file explicitly imports THIS exact
                       -- target. An import binds the bare name to one node, so the
@@ -2623,7 +2658,9 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
     // own method by name. Measured by the oracle on flask + networkx: of 33
     // `self.x.f()` binds 14 right (6 of 24 where the name has another
     // definition), of 28 relative-import binds 4 credited and none right on
-    // reading the code. A local receiver (`q` member) stays out: 63 of 80 right.
+    // reading the code. A local receiver (`q` member) stays out: 63 of 80 right,
+    // and so does a bare call on a local value (`ur` `local`): its same-file
+    // binds are the file's own closures and `save = self.save` aliases.
     //
     // A same-file TypeScript call into a type is the third same-file class
     // (`TS_TYPE_CALL` above).
@@ -2636,7 +2673,7 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                         AND (json_extract(e.metadata, '$.rt') IS NULL
                              OR json_extract(e.metadata, '$.amb') IS NOT NULL))
                     OR (tf.language = 'python'
-                        AND json_extract(e.metadata, '$.ur') IS NOT NULL)
+                        AND json_extract(e.metadata, '$.ur') IN ('attr', 'rel'))
                     OR {TS_TYPE_CALL})"
     );
     // Which edges to reconsider. The scoped form is three arms — the caller

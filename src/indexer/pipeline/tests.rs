@@ -14207,6 +14207,132 @@ fn a_call_on_a_field_of_self_binds_no_free_function_of_an_unimported_file() {
     );
 }
 
+// D#789 (converge round 6): a bare call on a value the caller's scope binds
+// runs what the caller was handed. Bound by name into a file the caller never
+// imports, it took a namesake: configparser `_get(self, section, conv, ...)`'s
+// `conv(...)` bound annotationlib's nested `conv`, and `_warn=warnings.warn`
+// bound site.py's `_warn` ten times (standard library, `inferred`). The bind
+// stays, as `ambiguous`: a dispatcher's call is sometimes its target's only
+// caller.
+#[test]
+fn a_python_call_on_a_local_value_is_ambiguous_into_a_file_its_caller_never_imports() {
+    let files: &[(&str, &str)] = &[
+        ("pkg/__init__.py", ""),
+        (
+            "pkg/annot.py",
+            "def conv(x):\n    return x\n\n\ndef fetched(x):\n    return x\n",
+        ),
+        ("pkg/scanner.py", "def scan_once(s):\n    return s\n"),
+        (
+            "pkg/decoder.py",
+            "from . import scanner\n\n\n\
+             def handle(conv, value):\n    return conv(value)\n\n\n\
+             def fmt(d, k):\n    fetched = d.get(k)\n    return fetched(k)\n\n\n\
+             def decode(s, scan_once):\n    return scan_once(s)\n\n\n\
+             def make():\n    def closure(x):\n        return x\n    return run(closure)\n\n\n\
+             def run(closure):\n    return closure(1)\n\n\n\
+             def plain(value):\n    return conv(value)\n",
+        ),
+        // pytest hands a test the fixtures of every conftest.py above it.
+        (
+            "tests/conftest.py",
+            "def make_thing(request):\n    return request\n",
+        ),
+        (
+            "other/conftest.py",
+            "def stray_fixture(request):\n    return request\n",
+        ),
+        (
+            "tests/unit/test_x.py",
+            "def test_a(make_thing):\n    make_thing(1)\n\n\n\
+             def test_b(stray_fixture):\n    stray_fixture(1)\n",
+        ),
+    ];
+    let (project, _d, db) = fresh_index_of(files);
+    let calls_of = |db: &Database, caller: &str| -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = graph_projection_with_confidence(db)
+            .into_iter()
+            .filter(|(a, r, _, _)| a == caller && r == REL_CALLS)
+            .map(|(_, _, b, c)| (b, c))
+            .collect();
+        v.sort();
+        v
+    };
+    let one = |target: &str, conf: &str| vec![(target.to_string(), conf.to_string())];
+    let expect = |db: &Database, annot_imported: bool| {
+        let guess = if annot_imported {
+            "inferred"
+        } else {
+            "ambiguous"
+        };
+        assert_eq!(
+            calls_of(db, "pkg/decoder.py:handle"),
+            one("pkg/annot.py:conv", guess),
+            "a parameter"
+        );
+        assert_eq!(
+            calls_of(db, "pkg/decoder.py:fmt"),
+            one("pkg/annot.py:fetched", guess),
+            "an assignment"
+        );
+        assert_eq!(
+            calls_of(db, "pkg/decoder.py:decode"),
+            one("pkg/scanner.py:scan_once", "inferred"),
+            "a file the caller imports keeps the label"
+        );
+        assert_eq!(
+            calls_of(db, "pkg/decoder.py:run"),
+            one("pkg/decoder.py:closure", "extracted"),
+            "a same-file bind keeps its label"
+        );
+        assert_eq!(
+            calls_of(db, "pkg/decoder.py:plain"),
+            one("pkg/annot.py:conv", "inferred"),
+            "a name no scope of the caller binds is labelled as before"
+        );
+        assert_eq!(
+            calls_of(db, "tests/unit/test_x.py:test_a"),
+            one("tests/conftest.py:make_thing", "inferred"),
+            "a fixture of a conftest.py above the test"
+        );
+        assert_eq!(
+            calls_of(db, "tests/unit/test_x.py:test_b"),
+            one("other/conftest.py:stray_fixture", "ambiguous"),
+            "pytest shows other/conftest.py to nothing under tests/"
+        );
+    };
+    expect(&db, false);
+
+    // Scoped on an edit of either side, each run equal to a rebuild; an import
+    // of annot.py makes the binds `inferred` again.
+    let mut now: Vec<(&str, String)> = files.iter().map(|(p, s)| (*p, s.to_string())).collect();
+    let edits = [
+        (
+            "pkg/annot.py",
+            "def conv(x):\n    return x + 1\n\n\ndef fetched(x):\n    return x\n".to_string(),
+        ),
+        (
+            "pkg/decoder.py",
+            files[3]
+                .1
+                .replace("from . import scanner\n", "from . import annot, scanner\n"),
+        ),
+    ];
+    for (path, text) in edits {
+        fs::write(project.path().join(path), &text).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        now.iter_mut().find(|(p, _)| *p == path).unwrap().1 = text;
+        let owned: Vec<(&str, &str)> = now.iter().map(|(p, s)| (*p, s.as_str())).collect();
+        let (_p2, _d2, control) = fresh_index_of(&owned);
+        assert_eq!(
+            graph_projection_with_confidence(&db),
+            graph_projection_with_confidence(&control),
+            "after editing {path}: incremental must equal a rebuild"
+        );
+    }
+    expect(&db, true);
+}
+
 // D#789 (converge round 3): in hono's jwt.ts, `utf8Decoder.decode(part)` with
 // `import { utf8Decoder } from './utf8'` bound the file's own `export const
 // decode` at `extracted`. A call on an imported value runs a member of another
