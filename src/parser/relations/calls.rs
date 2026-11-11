@@ -560,6 +560,28 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                     }
                     some => some,
                 };
+                // `v.f()` on an imported value runs a member of another module's
+                // value, never a definition of this file (D#789).
+                let metadata = match (metadata, &qualifier) {
+                    (Some(m), helpers::CalleeQualifier::Receiver(recv))
+                        if serialize_callee_qualifier(&qualifier).as_deref() == Some(&m)
+                            && super::member::js_import_bound_receiver(
+                                node,
+                                source,
+                                ctx.config.name,
+                            ) =>
+                    {
+                        Some(
+                            serde_json::json!({
+                                "q": "recv",
+                                "v": recv,
+                                crate::domain::CALL_KEY_IMPORTED_RECEIVER: 1,
+                            })
+                            .to_string(),
+                        )
+                    }
+                    (m, _) => m,
+                };
                 // A bare call by its own name (no import, package, `use` path or
                 // receiver) picks among same-file definitions by scope (D#714).
                 let call_at = (metadata.is_none()

@@ -4213,15 +4213,20 @@ pub(super) fn is_package_bound(metadata: Option<&str>) -> bool {
 /// A `P.X()` call (`"attr"`, D#518) is left to `bind_module_attr_calls`, which
 /// re-points the call's by-name edges at what the module's `X` is and prunes
 /// the rest: without an edge to start from it binds nothing.
+///
+/// Likewise a JS/TS `x.f()` on an imported value (`"ir"`, D#789,
+/// `crate::domain::CALL_KEY_IMPORTED_RECEIVER`).
 pub(super) fn module_call_skips_own_file(metadata: Option<&str>) -> bool {
     // Every same-file bind of every language asks: parse only module calls.
     metadata
-        .filter(|m| m.contains(r#""q":"module""#))
+        .filter(|m| m.contains(r#""q":"module""#) || m.contains(r#""ir":"#))
         .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-        .is_some_and(|meta| {
-            meta.get("q").and_then(|q| q.as_str()) == Some("module")
-                && meta.get("loc").is_none()
-                && meta.get("attr").is_none()
+        .is_some_and(|meta| match meta.get("q").and_then(|q| q.as_str()) {
+            Some("module") => meta.get("loc").is_none() && meta.get("attr").is_none(),
+            Some("recv") => meta
+                .get(crate::domain::CALL_KEY_IMPORTED_RECEIVER)
+                .is_some(),
+            _ => false,
         })
 }
 

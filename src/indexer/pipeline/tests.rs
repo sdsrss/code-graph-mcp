@@ -14207,6 +14207,62 @@ fn a_call_on_a_field_of_self_binds_no_free_function_of_an_unimported_file() {
     );
 }
 
+// D#789 (converge round 3): in hono's jwt.ts, `utf8Decoder.decode(part)` with
+// `import { utf8Decoder } from './utf8'` bound the file's own `export const
+// decode` at `extracted`. A call on an imported value runs a member of another
+// module's value, never a definition of the caller's file; it was not marked
+// a member call (an imported name may be a namespace), so the same-file tier
+// took it. A local of the same name that shadows the import is a value of the
+// file and keeps its bind.
+#[test]
+fn a_js_call_on_an_imported_value_binds_no_definition_of_its_own_file() {
+    let files: &[(&str, &str)] = &[
+        (
+            "src/utf8.ts",
+            "export const utf8Decoder = new TextDecoder()\n",
+        ),
+        (
+            "src/jwt.ts",
+            "import { utf8Decoder } from './utf8'\nimport codec from './codec'\n\n\
+             export const decode = (token: string) => token\n\n\
+             export function decodePart(part: string) {\n  return utf8Decoder.decode(part)\n}\n\n\
+             export function viaDefault(part: string) {\n  return codec.decode(part)\n}\n\n\
+             export function shadowed(part: string) {\n  const utf8Decoder = { decode }\n  \
+             return utf8Decoder.decode(part)\n}\n",
+        ),
+        (
+            "src/codec.ts",
+            "export default { encode(v: string) { return v } }\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let rows = graph_projection_with_confidence(&db);
+    let callees_of = |caller: &str| -> Vec<String> {
+        let mut v: Vec<String> = rows
+            .iter()
+            .filter(|(a, r, _, _)| a == caller && r == REL_CALLS)
+            .map(|(_, _, b, _)| b.clone())
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        callees_of("src/jwt.ts:decodePart"),
+        Vec::<String>::new(),
+        "a named import's member: {rows:#?}"
+    );
+    assert_eq!(
+        callees_of("src/jwt.ts:viaDefault"),
+        Vec::<String>::new(),
+        "a default import's member: {rows:#?}"
+    );
+    assert_eq!(
+        callees_of("src/jwt.ts:shadowed"),
+        ["src/jwt.ts:decode"],
+        "the local shadows the import: {rows:#?}"
+    );
+}
+
 // B9 (2026-09-29 usage evaluation): a member call on a Node built-in module
 // (`path.resolve(p)`, `fs.renameSync(a, b)`) runs Node's code, yet it bound a
 // project function or method of that name elsewhere (express: a test's

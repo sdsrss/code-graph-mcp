@@ -817,7 +817,8 @@ fn test_member_call_on_an_object_is_marked_member() {
     for t in ["own", "base", "fromX", "bare"] {
         assert_eq!(meta_of(&js, t), None, "{t} must resolve as before: {js:?}");
     }
-    // An import-bound receiver keeps the qualifier its module binding needs.
+    // An import-bound receiver keeps the qualifier its module binding needs,
+    // and says no definition of its own file answers it (D#789).
     for (t, recv) in [
         ("fromM", "m"),
         ("fromNs", "ns"),
@@ -825,7 +826,7 @@ fn test_member_call_on_an_object_is_marked_member() {
         ("fromAlias", "alias"),
         ("fromA", "a"),
     ] {
-        let want = format!(r#"{{"q":"recv","v":"{recv}"}}"#);
+        let want = format!(r#"{{"ir":1,"q":"recv","v":"{recv}"}}"#);
         assert_eq!(meta_of(&js, t), Some(want.as_str()), "{t}: {js:?}");
     }
 
@@ -1572,6 +1573,34 @@ fn test_python_import_of_a_name_from_several_modules_is_counted() {
         meta("W", ".d").as_deref(),
         Some(r#"{"python_module":".d"}"#)
     );
+}
+
+#[test]
+fn test_js_call_on_an_imported_value_is_marked() {
+    // D#789: `utf8Decoder.decode()` through `import { utf8Decoder }` runs a
+    // member of another module's value, never a definition of this file.
+    let js = call_meta(
+        "import { utf8Decoder } from './utf8'\nimport codec from './codec'\n\
+         import * as ns from './ns'\nconst req = require('./req')\n\
+         function f(p) {\n  utf8Decoder.decode(p)\n  codec.encode(p)\n  ns.parse(p)\n  \
+         req.send(p)\n}\nfunction g(codec) {\n  codec.render(1)\n  \
+         const ns = { walk() {} }\n  ns.walk()\n  utf8Decoder.inner.deep()\n}\n",
+        "javascript",
+    );
+    for (t, recv) in [
+        ("decode", "utf8Decoder"),
+        ("encode", "codec"),
+        ("parse", "ns"),
+        ("send", "req"),
+    ] {
+        let want = format!(r#"{{"ir":1,"q":"recv","v":"{recv}"}}"#);
+        assert_eq!(meta_of(&js, t), Some(want.as_str()), "{t}: {js:?}");
+    }
+    // A parameter or local shadows the import; a chained receiver is no
+    // `Receiver` at all.
+    assert_eq!(meta_of(&js, "render"), Some(r#"{"q":"recv","v":"codec"}"#));
+    assert_eq!(meta_of(&js, "walk"), Some(r#"{"q":"recv","v":"ns"}"#));
+    assert_eq!(meta_of(&js, "deep"), None, "{js:?}");
 }
 
 #[test]
@@ -4853,7 +4882,8 @@ fn test_js_simple_receiver_call_emits_recv_metadata() {
     // metadata=None — the guard the previous test_non_rust_callee_metadata_
     // unchanged enforced, preserved here for the non-receiver shapes. The
     // receiver is an import binding here; one that is not (`obj.qux()`) is a
-    // member call on an object (`relations/member.rs`, D#86).
+    // member call on an object (`relations/member.rs`, D#86). An import binding
+    // also carries `ir` (D#789): its own file defines nothing it can reach.
     let code = "const foo = require('./x');\nfunction caller() { foo.bar(); baz(); obj.qux(); }";
     let relations = extract_relations(code, "javascript").unwrap();
     let bar = relations
@@ -4862,7 +4892,7 @@ fn test_js_simple_receiver_call_emits_recv_metadata() {
         .expect("missing call bar");
     assert_eq!(
         bar.metadata.as_deref(),
-        Some(r#"{"q":"recv","v":"foo"}"#),
+        Some(r#"{"ir":1,"q":"recv","v":"foo"}"#),
         "foo.bar() must emit a Receiver qualifier for require-namespace resolution"
     );
     let baz = relations
@@ -4975,7 +5005,11 @@ fn test_js_renamed_import_call_shapes() {
             "namespace import keeps its receiver",
             "javascript",
             "import * as ns from './x';\nfunction go() { ns.load(); }",
-            vec![("go", "load", Some(r#"{"q":"recv","v":"ns"}"#.to_string()))],
+            vec![(
+                "go",
+                "load",
+                Some(r#"{"ir":1,"q":"recv","v":"ns"}"#.to_string()),
+            )],
         ),
         (
             "F5: a sibling function's own m()",

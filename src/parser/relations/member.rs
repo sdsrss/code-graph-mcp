@@ -630,6 +630,44 @@ pub(super) fn js_package_bound_call(
     js_package_binding(call, node_text(&function, source), source)
 }
 
+/// Whether a JS/TS `x.f()` call's receiver is, at the call, one of the file's
+/// import bindings (`import { x }`, `import x`, `import * as x`, `const x =
+/// require()`): the nearest binding of `x` is the program's, and the program
+/// binds it by import. Such a call runs a member of another module's value,
+/// never a definition of the caller's own file (D#789: hono's
+/// `utf8Decoder.decode()` bound its file's `decode`). A parameter or local of
+/// that name shadows the import.
+pub(super) fn js_import_bound_receiver(
+    call: tree_sitter::Node,
+    source: &str,
+    family: &str,
+) -> bool {
+    if !matches!(family, "javascript" | "typescript" | "tsx") {
+        return false;
+    }
+    let Some(object) = super::helpers::call_function(&call)
+        .filter(|f| f.kind() == "member_expression")
+        .and_then(|f| f.child_by_field_name("object"))
+        .filter(|o| o.kind() == "identifier")
+    else {
+        return false;
+    };
+    let name = node_text(&object, source);
+    // A prefilter: a receiver the file does not import is a member call
+    // (`is_member_call`), which never reaches here with a `Receiver`.
+    if !IMPORT_BOUND.with(|b| b.borrow().contains_key(name)) {
+        return false;
+    }
+    let mut child = call;
+    while let Some(scope) = child.parent() {
+        if binding_in(scope, child, name, source).is_some() {
+            return scope.kind() == "program";
+        }
+        child = scope;
+    }
+    false
+}
+
 /// The package `name` stands for at `from`: its nearest binding is the file's
 /// own `var send = require('send')` / `import send from 'send'`, or a member of
 /// one (`var resolve = path.resolve`). None when a parameter or local shadows
