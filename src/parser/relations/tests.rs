@@ -5910,6 +5910,52 @@ fn test_python_param_and_return_annotation_emit_references() {
 }
 
 #[test]
+fn test_python_names_in_a_list_tuple_or_set_literal_emit_references() {
+    // D#789: flask's `TaggedJSONSerializer.default_tags = [TagDict, PassDict,
+    // ...]` is the only mention of eight tag classes, and `dead-code` listed all
+    // eight. A list, tuple or set literal holds values; an assignment target is
+    // a `*_pattern` node in tree-sitter-python, never one of these. Only a name
+    // the file defines or imports is recorded: a builtin (`str`) or a
+    // module-level variable bound by name took another file's symbol.
+    let src = "from .tags import TagUUID, TagBytes\n\n\nclass TagDict:\n    pass\n\n\n\
+               class PassDict:\n    pass\n\n\nclass TagTuple:\n    pass\n\n\n\
+               class TagError(Exception):\n    pass\n\n\nverbs = ['a']\n\n\n\
+               class S:\n    default_tags = [TagDict, PassDict]\n    kinds = (TagTuple,)\n\n\n\
+               def f(x):\n    try:\n        return {TagUUID}\n    except (KeyError, TagError):\n        \
+               return isinstance(x, (TagBytes, str, bytes))\n\n\nparts = (verbs,)\n\
+               [first, second] = pair\n\n\nclass Opt:\n    def _check_type(self):\n        \
+               pass\n\n    def list(self):\n        return [(n, value) for n, value in self.x]\n\n    \
+               def value(self):\n        return isinstance(self, (list, tuple))\n\n    \
+               CHECKS = [_check_type]\n";
+    let rels = extract_relations(src, "python").unwrap();
+    let refs: Vec<&str> = rels
+        .iter()
+        .filter(|r| r.relation == REL_REFERENCES)
+        .map(|r| r.target_name.as_str())
+        .collect();
+    for name in [
+        "TagDict",
+        "PassDict",
+        "TagTuple",
+        "TagUUID",
+        "TagError",
+        "TagBytes",
+        "_check_type",
+    ] {
+        assert!(
+            refs.contains(&name),
+            "{name} must be referenced; got: {refs:?}"
+        );
+    }
+    // `list` and `value` are methods of the file, named outside a class body.
+    for name in [
+        "KeyError", "str", "bytes", "verbs", "first", "second", "list", "value",
+    ] {
+        assert!(!refs.contains(&name), "{name} must not be; got: {refs:?}");
+    }
+}
+
+#[test]
 fn test_python_annotated_class_attr_emits_references() {
     // `class Service:\n    cache: Cache` — annotated class attribute → reference
     // to `Cache`.

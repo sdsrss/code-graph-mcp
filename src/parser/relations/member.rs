@@ -66,6 +66,11 @@ thread_local! {
     static PY_ATTR_IMPORTS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Whether the current file binds `name` by an import (see [`IMPORT_BOUND`]).
+pub(super) fn is_import_bound(name: &str) -> bool {
+    IMPORT_BOUND.with(|b| b.borrow().contains_key(name))
+}
+
 /// Collect the file's import-bound names. MUST run once per file before its walk.
 /// `rel_path`: the file's project-relative path, `None` when no file is behind
 /// the source ([`py_local_imports`]).

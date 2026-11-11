@@ -30,6 +30,79 @@ use super::helpers::MAX_SUBTREE_DEPTH;
 use super::ParsedRelation;
 use crate::domain::{PYTHON_TYPE_REFERENCE_NOISE, REL_REFERENCES};
 
+/// The current Python file's `def` / `class` names ([`reset_python_file`]).
+#[derive(Default)]
+struct PyDefined {
+    /// Every class, and every `def` outside a class body (module level, or
+    /// nested in a function): what a bare name may reach anywhere.
+    free: std::collections::HashSet<String>,
+    /// `def`s directly in a class body: a bare name reaches one only from
+    /// that body.
+    methods: std::collections::HashSet<String>,
+}
+
+thread_local! {
+    /// Per file: reset by [`reset_python_file`].
+    static PY_DEFINED: std::cell::RefCell<PyDefined> = std::cell::RefCell::new(PyDefined::default());
+}
+
+/// Collect the file's `def` / `class` names. MUST run once per file before its
+/// walk.
+pub(super) fn reset_python_file(root: tree_sitter::Node, source: &str, family: &str) {
+    PY_DEFINED.with(|d| {
+        let mut defined = d.borrow_mut();
+        defined.free.clear();
+        defined.methods.clear();
+        if family != "python" {
+            return;
+        }
+        let mut cursor = root.walk();
+        'walk: loop {
+            let node = cursor.node();
+            if let Some(name) = matches!(node.kind(), "function_definition" | "class_definition")
+                .then(|| node.child_by_field_name("name"))
+                .flatten()
+            {
+                let name = node_text(&name, source).to_string();
+                if node.kind() == "function_definition" && in_class_body(node) {
+                    defined.methods.insert(name);
+                } else {
+                    defined.free.insert(name);
+                }
+            }
+            // A `def` / `class` is a statement: no expression holds one.
+            let kind = node.kind();
+            let statements = kind == "module"
+                || kind == "block"
+                || kind == "decorated_definition"
+                || kind.ends_with("_definition")
+                || kind.ends_with("_clause")
+                || (kind.ends_with("_statement") && kind != "expression_statement");
+            if statements && cursor.goto_first_child() {
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    break 'walk;
+                }
+            }
+        }
+    });
+}
+
+/// Whether `node` sits in a class body with no function in between.
+fn in_class_body(node: tree_sitter::Node) -> bool {
+    let mut at = node.parent();
+    while let Some(n) = at {
+        match n.kind() {
+            "class_definition" => return true,
+            "function_definition" | "lambda" => return false,
+            _ => at = n.parent(),
+        }
+    }
+    false
+}
+
 /// True if `node` is the type NAME of an annotation, i.e. it sits in a position
 /// that tree-sitter-python wraps in a `type` node. The gate walks up a small,
 /// bounded chain of *type-structural* ancestors (`type`, `generic_type`,
@@ -168,6 +241,21 @@ pub(super) fn extract_python_value_reference(
         // decorator spelled as a call (`@app.route("/")`) is a call edge already.
         "decorator" => true,
         "pair" => parent.child_by_field_name("value").map(|v| v.id()) == Some(node.id()),
+        // An element of a list, tuple or set literal (`default_tags = [TagDict,
+        // ...]`, `except (A, B)`, D#789), when the file defines or imports the
+        // name: a builtin (`(str, bytes)`) or a module-level variable is no
+        // project symbol, and bound by name it took one of another file. A
+        // method's name counts only in a class body (`CHECK_METHODS =
+        // [_check_action]`): elsewhere `(list, tuple)` is the builtin, not a
+        // method `list`. An assignment or loop target is a `*_pattern` node,
+        // never one of these.
+        "list" | "tuple" | "set" => {
+            let name = node_text(node, source);
+            PY_DEFINED.with(|d| {
+                let d = d.borrow();
+                d.free.contains(name) || (d.methods.contains(name) && in_class_body(*node))
+            }) || super::member::is_import_bound(name)
+        }
         // Phase 3b: tuple return (`return f, g`) / tuple RHS (`a, b = f, g`) wrap the
         // values in an `expression_list` under the return / assignment-right.
         "expression_list" => match parent.parent() {
