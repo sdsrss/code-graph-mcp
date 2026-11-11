@@ -245,9 +245,10 @@ impl McpServer {
         if super::helpers::should_skip_indexing(args).unwrap_or(true) {
             return value;
         }
-        // Secondaries hold a read-only DB; nothing to refresh with.
+        // Secondaries hold a read-only DB; nothing to refresh with, so they say
+        // what they cannot refresh instead.
         if !self.is_primary() {
-            return value;
+            return self.disclose_stale_result_files(value);
         }
         // An index a newer binary built is not ours to write either. Say so rather
         // than attempt the refresh: `index_files` would refuse it, and the failure
@@ -454,6 +455,74 @@ impl McpServer {
         }
         value
     }
+    /// A secondary's answer from files that changed on disk since they were
+    /// indexed, with a `freshness` note saying so. It holds the index
+    /// read-only, and the primary re-indexes an edit only once its watcher
+    /// runs, which in an idle session may be never: the answer came back with
+    /// no word that it predates the edit. Checked as the primary checks, the
+    /// first [`RESULT_REFRESH_SCAN_CAP`] paths read-only, the rest counted as
+    /// unchecked; nothing is written.
+    fn disclose_stale_result_files(&self, value: serde_json::Value) -> serde_json::Value {
+        let Some(root) = self.project_root.as_deref() else {
+            return value;
+        };
+        let mut paths = Vec::new();
+        collect_result_paths(&value, &mut paths);
+        paths.sort_unstable();
+        paths.dedup();
+        let unchecked = paths.len().saturating_sub(RESULT_REFRESH_SCAN_CAP);
+        paths.truncate(RESULT_REFRESH_SCAN_CAP);
+        let stale = paths
+            .iter()
+            .filter(|p| {
+                !matches!(
+                    crate::indexer::pipeline::plan_file_refresh(
+                        &self.db,
+                        root,
+                        p,
+                        crate::indexer::pipeline::RefreshScope::IndexedOnly,
+                    ),
+                    Ok(crate::indexer::pipeline::FileRefresh::Fresh)
+                )
+            })
+            .count();
+        if stale == 0 && unchecked == 0 {
+            return value;
+        }
+        let mut note = String::new();
+        if stale > 0 {
+            note.push_str(&format!(
+                "{stale} file(s) in this result changed on disk since they were indexed, and \
+                 this server reads the index read-only (another code-graph session on this \
+                 project holds it), so it cannot re-index them. Their line numbers and \
+                 snippets may predate your last edit: read those files for their current \
+                 content."
+            ));
+        }
+        if unchecked > 0 {
+            if !note.is_empty() {
+                note.push(' ');
+            }
+            note.push_str(&format!(
+                "{unchecked} file(s) in this result were not checked against the disk (only \
+                 the first {RESULT_REFRESH_SCAN_CAP} are, per call)."
+            ));
+        }
+        let mut value = value;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "freshness".to_string(),
+                json!({
+                    "refreshed": 0,
+                    "stale_kept": stale,
+                    "unchecked": unchecked,
+                    "note": note,
+                }),
+            );
+        }
+        value
+    }
+
     /// Re-index result-set files whose on-disk hash no longer matches the index.
     ///
     /// The predicate, the budget policy and the batching all live in

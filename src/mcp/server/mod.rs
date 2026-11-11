@@ -3863,6 +3863,42 @@ function handleLogin(req: Request) {
         let _ = server.handle_message(&req).unwrap();
     }
 
+    /// A secondary holds the index read-only and never refreshes what its result
+    /// names, while the primary re-indexes edits only once its watcher runs —
+    /// which in an idle session may be never. The answer from an edited file
+    /// was returned with no word that it predates the edit.
+    #[test]
+    fn test_secondary_discloses_result_files_changed_on_disk() {
+        let project = TempDir::new().unwrap();
+        let file = project.path().join("a.rs");
+        std::fs::write(&file, "fn sec_fresh_target() {}\n").unwrap();
+        let primary = McpServer::new_test_with_project(project.path());
+        primary.ensure_indexed().unwrap();
+
+        let mut secondary = McpServer::new_test_with_project(project.path());
+        secondary.is_primary.store(false, Ordering::SeqCst);
+        secondary.timing.promotion_retry = std::time::Duration::from_secs(3600);
+        *lock_or_recover(&secondary.last_promotion_attempt, "last_promotion_attempt") =
+            std::time::Instant::now();
+        close_other_freshness_paths(&mut secondary);
+
+        // Untouched: nothing to disclose.
+        let (payload, line) = ast_search_first_line(&secondary, "sec_fresh_target");
+        assert_eq!(line, Some(1), "{payload}");
+        assert!(payload.get("freshness").is_none(), "{payload}");
+
+        std::fs::write(&file, "\n\n\nfn sec_fresh_target() {}\n").unwrap();
+        let (payload, line) = ast_search_first_line(&secondary, "sec_fresh_target");
+        assert_eq!(line, Some(1), "a secondary cannot refresh: {payload}");
+        assert_eq!(
+            payload["freshness"]["stale_kept"].as_u64(),
+            Some(1),
+            "{payload}"
+        );
+        let note = payload["freshness"]["note"].as_str().unwrap_or_default();
+        assert!(note.contains("read-only"), "{note}");
+    }
+
     #[test]
     fn test_secondary_not_found_includes_stale_hint() {
         // A read-only secondary instance never reindexes, so a "not found" may mean
