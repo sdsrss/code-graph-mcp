@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.192.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 139 → 140
 because the stored graph changes for unchanged source: route edges; Python,
