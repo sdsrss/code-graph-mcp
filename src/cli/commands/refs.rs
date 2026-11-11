@@ -533,7 +533,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         let items: Vec<serde_json::Value> = all_refs
             .iter()
             .map(|r| {
-                if compact {
+                let mut item = if compact {
                     serde_json::json!({
                         "name": r.name,
                         "file_path": r.file_path,
@@ -552,7 +552,11 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                         "relation": r.relation,
                         "confidence": r.confidence,
                     })
+                };
+                if !r.via.is_empty() {
+                    item["via"] = serde_json::json!(r.via);
                 }
+                item
             })
             .collect();
         // Group counts by relation, mirroring MCP find_references envelope
@@ -584,11 +588,16 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
         let mut stdout = std::io::stdout().lock();
         // Annotate only non-extracted edges so precise refs stay visually clean;
         // inferred/ambiguous are the ones worth scrutiny (by-name cross-file).
-        let tag = |c: &str| -> String {
-            if c == crate::domain::CONF_EXTRACTED {
+        let tag = |r: &queries::IncomingReference| -> String {
+            let via = if r.via.is_empty() {
                 String::new()
             } else {
-                format!(" ~{c}")
+                format!(" via {}", r.via.join(", "))
+            };
+            if r.confidence == crate::domain::CONF_EXTRACTED {
+                via
+            } else {
+                format!("{via} ~{}", r.confidence)
             }
         };
         if all_refs.is_empty() {
@@ -603,7 +612,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                         r.relation,
                         crate::domain::display_node_name(&r.name),
                         r.file_path,
-                        tag(&r.confidence)
+                        tag(r)
                     )?;
                 } else {
                     writeln!(
@@ -613,7 +622,7 @@ pub fn cmd_refs(project_root: &Path, args: RefsArgs) -> Result<()> {
                         crate::domain::display_node_name(&r.name),
                         r.file_path,
                         r.start_line,
-                        tag(&r.confidence)
+                        tag(r)
                     )?;
                 }
             }

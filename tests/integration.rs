@@ -4326,6 +4326,256 @@ fn test_find_references_type_note_survives_a_node_whose_file_row_is_gone() {
     );
 }
 
+/// A Rust project whose types are reached through their paths: `Meter::new()`
+/// in its own file, `metrics::Meter::new()` through a module import, `M::new()`
+/// through `use … as M`, `Meter::reset(m)` into an `impl Meter` that lives in
+/// another file, and a struct literal's caller that also calls `Meter::new()`,
+/// beside a `Self::new()`, a same-file `Gauge::new()` and two types named
+/// `Clock`, and a TypeScript interface named `Gauge`.
+fn setup_type_path_call_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    let files = [
+        (
+            "lib.rs",
+            "pub mod clock_a;\npub mod clock_b;\npub mod metrics;\npub mod ops;\npub mod server;\n",
+        ),
+        (
+            "metrics.rs",
+            "pub struct Meter {\n    pub n: i64,\n}\n\nimpl Meter {\n    pub fn new() -> Self {\n        Meter { n: 0 }\n    }\n\n    pub fn fresh() -> Self {\n        Self::new()\n    }\n}\n\npub struct Gauge;\n\nimpl Gauge {\n    pub fn new() -> Self {\n        Gauge\n    }\n}\n\npub fn local_user() -> i64 {\n    Meter::new().n\n}\n\npub fn gauge_user() -> Gauge {\n    Gauge::new()\n}\n\npub fn literal_user() -> Meter {\n    let _ = Meter::new();\n    Meter { n: 1 }\n}\n",
+        ),
+        (
+            "server.rs",
+            "use crate::metrics;\nuse crate::metrics::Meter as M;\n\npub fn build() -> metrics::Meter {\n    metrics::Meter::new()\n}\n\npub fn aliased() -> M {\n    M::new()\n}\n",
+        ),
+        (
+            "ops.rs",
+            "use crate::metrics::{Gauge, Meter};\n\nimpl Meter {\n    pub fn reset(&mut self) {}\n}\n\npub fn resetter(m: &mut Meter) {\n    Meter::reset(m)\n}\n\nimpl Gauge {\n    pub fn zero() -> i64 {\n        0\n    }\n}\n\npub fn zero_user() -> i64 {\n    Gauge::zero()\n}\n",
+        ),
+        (
+            "clock_a.rs",
+            "pub struct Clock;\n\nimpl Clock {\n    pub fn tick() -> i64 {\n        1\n    }\n}\n\npub fn a_user() -> i64 {\n    Clock::tick()\n}\n",
+        ),
+        (
+            "clock_b.rs",
+            "pub struct Clock;\n\nimpl Clock {\n    pub fn tick() -> i64 {\n        2\n    }\n}\n\npub fn b_user() -> i64 {\n    Clock::tick()\n}\n",
+        ),
+    ];
+    for (name, body) in files {
+        fs::write(src.join(name), body).unwrap();
+    }
+    // A TypeScript namesake of `Gauge`, whose `impl` in ops.rs is still Gauge's.
+    fs::create_dir_all(project.path().join("web")).unwrap();
+    fs::write(
+        project.path().join("web/gauge.ts"),
+        "export interface Gauge {\n  n: number;\n}\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    fs::create_dir_all(&db_dir).unwrap();
+    let db = Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+/// `name → via` for every row of a refs envelope that carries `via`.
+fn via_rows(envelope: &serde_json::Value) -> std::collections::BTreeMap<String, Vec<String>> {
+    envelope["references"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no references array: {envelope}"))
+        .iter()
+        .filter_map(|r| {
+            let via = r.get("via")?.as_array()?;
+            assert_eq!(
+                r["relation"], "calls",
+                "a row reached through a type path is a call: {r}"
+            );
+            Some((
+                r["name"].as_str().unwrap().to_string(),
+                via.iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect(),
+            ))
+        })
+        .collect()
+}
+
+/// D2 (converge round 6, 2026-11-11): `refs` on a Rust type lists the calls
+/// written through the type's path. `Meter::new()` binds the method `new`, so
+/// the edge never pointed at the type, and `refs SessionMetrics` on this
+/// repository listed 1 row while 19 functions call `SessionMetrics::new()`.
+/// `Self::new()` names no type, and `Gauge::new()` names another one.
+#[test]
+fn refs_on_a_rust_type_lists_the_calls_written_through_its_path() {
+    let project = setup_type_path_call_project();
+    // A path naming another type bound to `Meter.new`: no shape of the
+    // resolver was seen writing one, so the edge is planted to keep the
+    // last-segment check honest.
+    let index = project
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+    let planted = r#"{"n":0,"q":"path","v":"metrics::Gauge"}"#;
+    let plant_count = |db: &Database| -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE metadata = ?1",
+                [planted],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    {
+        let db = Database::open(&index).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO edges (source_id, target_id, relation, metadata)
+                 SELECT s.id, m.id, 'calls', ?1 FROM nodes s, nodes m
+                 WHERE s.name = 'gauge_user' AND m.qualified_name = 'Meter.new'",
+                [planted],
+            )
+            .unwrap();
+        assert_eq!(plant_count(&db), 1);
+    }
+    let cli = |args: &[&str]| -> (String, i32) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_code-graph-mcp"))
+            .current_dir(project.path())
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            out.status.code().unwrap_or(-1),
+        )
+    };
+    let cli_json = |args: &[&str]| -> serde_json::Value {
+        let (out, code) = cli(args);
+        assert_eq!(code, 0, "{args:?} failed: {out}");
+        serde_json::from_str(out.trim()).unwrap()
+    };
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    server
+        .handle_message(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#)
+        .unwrap();
+    let mcp = |mut args: serde_json::Value| -> serde_json::Value {
+        args["skip_indexing"] = serde_json::json!(true);
+        parse_tool_result(
+            &server
+                .handle_message(&tool_call_json("find_references", args))
+                .unwrap(),
+        )
+    };
+
+    let via = |name: &str, method: &str| (name.to_string(), vec![method.to_string()]);
+    let meter: std::collections::BTreeMap<_, _> = [
+        via("aliased", "Meter::new"),
+        via("build", "Meter::new"),
+        via("literal_user", "Meter::new"),
+        via("local_user", "Meter::new"),
+        via("resetter", "Meter::reset"),
+    ]
+    .into_iter()
+    .collect();
+    for (surface, envelope) in [
+        ("cli", cli_json(&["refs", "Meter", "--json"])),
+        (
+            "cli compact",
+            cli_json(&["refs", "Meter", "--json", "--compact"]),
+        ),
+        ("mcp", mcp(serde_json::json!({"symbol_name": "Meter"}))),
+        (
+            "mcp compact",
+            mcp(serde_json::json!({"symbol_name": "Meter", "compact": true})),
+        ),
+    ] {
+        assert_eq!(via_rows(&envelope), meter, "{surface}: {envelope}");
+        // `new`'s struct literal is an edge into the type itself.
+        let literal = envelope["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == "new" && r["relation"] == "calls" && r.get("via").is_none());
+        assert!(
+            literal,
+            "{surface}: the struct literal's own edge stays: {envelope}"
+        );
+    }
+    let note = mcp(serde_json::json!({"symbol_name": "Meter"}))["type_definition_note"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        note.contains("`via`"),
+        "the note must say these calls are listed now: {note}"
+    );
+
+    let (text, code) = cli(&["refs", "Meter"]);
+    assert_eq!(code, 0);
+    assert!(
+        text.contains("local_user (src/metrics.rs:23) via Meter::new"),
+        "{text}"
+    );
+    let relations: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix('[')?.split(']').next())
+        .collect();
+    let mut grouped = relations.clone();
+    grouped.dedup();
+    let mut distinct = grouped.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        grouped.len(),
+        distinct.len(),
+        "each relation's rows list together: {text}"
+    );
+    let references_only = cli_json(&["refs", "Meter", "--relation", "references", "--json"]);
+    assert!(via_rows(&references_only).is_empty(), "{references_only}");
+
+    // A TypeScript interface named `Gauge` does not make ops.rs's
+    // `impl Gauge` anyone else's.
+    let gauge: std::collections::BTreeMap<_, _> = [
+        via("gauge_user", "Gauge::new"),
+        via("zero_user", "Gauge::zero"),
+    ]
+    .into_iter()
+    .collect();
+    for (surface, envelope) in [
+        (
+            "cli",
+            cli_json(&["refs", "Gauge", "--file", "src/metrics.rs", "--json"]),
+        ),
+        (
+            "mcp",
+            mcp(serde_json::json!({"symbol_name": "Gauge", "file_path": "src/metrics.rs"})),
+        ),
+    ] {
+        assert_eq!(via_rows(&envelope), gauge, "{surface}: {envelope}");
+    }
+
+    // Two types named `Clock`: the selected one's callers only.
+    let clock: std::collections::BTreeMap<_, _> =
+        [via("a_user", "Clock::tick")].into_iter().collect();
+    for (surface, envelope) in [
+        (
+            "cli",
+            cli_json(&["refs", "Clock", "--file", "src/clock_a.rs", "--json"]),
+        ),
+        (
+            "mcp",
+            mcp(serde_json::json!({"symbol_name": "Clock", "file_path": "src/clock_a.rs"})),
+        ),
+    ] {
+        assert_eq!(via_rows(&envelope), clock, "{surface}: {envelope}");
+    }
+    assert_eq!(
+        plant_count(&Database::open(&index).unwrap()),
+        1,
+        "the planted edge must survive the queries, or its absence proves nothing"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // CORE-12 (audit 2026-09-07, P1): the delete channel never fed the dirty set.
 //

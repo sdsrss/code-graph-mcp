@@ -27,9 +27,9 @@ pub use edges::{
     age_and_evict_pending_unresolved_calls, count_pending_unresolved_calls, count_user_edges,
     delete_pending_unresolved_call, get_edge_source_names, get_edge_sources_with_files,
     get_edge_target_names, get_edge_target_names_batch, get_edge_targets_with_files,
-    get_edges_batch, get_edges_from, get_incoming_references, insert_edge, insert_edge_cached,
-    insert_pending_unresolved_call, list_pending_unresolved_calls, resolution_stats, EdgeInfo,
-    EdgeRecord, IncomingReference, PendingCallRow, ResolutionStats,
+    get_edges_batch, get_edges_from, get_incoming_references, get_type_path_calls, insert_edge,
+    insert_edge_cached, insert_pending_unresolved_call, list_pending_unresolved_calls,
+    resolution_stats, EdgeInfo, EdgeRecord, IncomingReference, PendingCallRow, ResolutionStats,
 };
 pub use embedding_cache::{
     cache_key, cache_put_embeddings, ensure_embedding_cache_valid, gc_embedding_cache,

@@ -1543,7 +1543,24 @@ pub fn rollup_incoming_references(
     let mut test_filtered = 0usize;
 
     for target_id in target_ids {
-        for r in queries::get_incoming_references(conn, *target_id, relation_filter)? {
+        let mut rows = queries::get_incoming_references(conn, *target_id, relation_filter)?;
+        // A Rust type's `Type::f()` callers are calls of the type (D2). Sorted
+        // in with the rows above by the key their query orders by, so a
+        // caller lists among the other `calls` rows.
+        if matches!(relation_filter, None | Some(crate::domain::REL_CALLS)) {
+            let via = queries::get_type_path_calls(conn, *target_id)?;
+            if !via.is_empty() {
+                rows.extend(via);
+                rows.sort_by(|a, b| {
+                    (&a.relation, &a.file_path, a.start_line).cmp(&(
+                        &b.relation,
+                        &b.file_path,
+                        b.start_line,
+                    ))
+                });
+            }
+        }
+        for r in rows {
             if skip_tests && crate::domain::is_test_node(r.is_test, &r.name, &r.file_path) {
                 test_filtered += 1;
                 continue;
@@ -1563,6 +1580,11 @@ pub fn rollup_incoming_references(
                         < crate::domain::confidence_rank(&refs[idx].confidence)
                     {
                         refs[idx].confidence = r.confidence;
+                    }
+                    for v in r.via {
+                        if !refs[idx].via.contains(&v) {
+                            refs[idx].via.push(v);
+                        }
                     }
                 }
                 None => {

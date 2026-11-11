@@ -361,7 +361,7 @@ impl McpServer {
         let all_refs: Vec<serde_json::Value> = rows
             .iter()
             .map(|r| {
-                if compact {
+                let mut item = if compact {
                     json!({
                         "name": r.name,
                         "file_path": r.file_path,
@@ -380,7 +380,11 @@ impl McpServer {
                         "confidence": r.confidence,
                         "node_id": r.node_id,
                     })
+                };
+                if !r.via.is_empty() {
+                    item["via"] = json!(r.via);
                 }
+                item
             })
             .collect();
 
@@ -400,9 +404,10 @@ impl McpServer {
 
         // Type-definition warning: for structs/enums/traits/types/interfaces/classes,
         // the edge index only captures explicit call/import/inherit/implement edges.
-        // Field access, type annotations, and method-qualified calls (e.g. `Type::method()`
-        // which binds to the method node, not the type) will not appear here. Tell the
-        // caller so rename audits get broader coverage via a second query.
+        // A method-qualified call binds the method node, not the type; the rollup
+        // adds them back for a Rust type's path (`Type::method()`, D2), and no
+        // other spelling. Tell the caller so rename audits get broader coverage
+        // via a second query.
         let type_kinds = ["struct", "enum", "trait", "type", "interface", "class"];
         // One batched query, not one per target id (SURF-07, audit 2026-09-05):
         // the fuzzy-resolve branch above can put many ids in `target_ids`, and
@@ -468,10 +473,13 @@ impl McpServer {
             if let Some(obj) = out.as_object_mut() {
                 obj.insert("type_definition_note".to_string(), json!(
                     "Symbol is a type definition (struct/enum/trait/class). References list \
-                     captures explicit imports/inherits/implements and struct-literal instantiation, \
-                     but NOT method-qualified calls (e.g. `Type::method()`), field access, or type \
-                     annotations. For a rename audit, also query find_references on each method of \
-                     this type (see module_overview for method list) and grep for the bare name."
+                     captures explicit imports/inherits/implements and struct-literal instantiation. \
+                     Calls written through a Rust type's path (`Type::method()`) are listed as \
+                     `calls` rows carrying `via`; one written through `Self::` or another \
+                     language's class name (`Type.method()`) is not added. Field access and type \
+                     annotations may be missing. For a rename audit, also query find_references on \
+                     each method of this type (see module_overview for method list) and grep for \
+                     the bare name."
                 ));
             }
         }

@@ -48,6 +48,10 @@ pub struct IncomingReference {
     /// references in a PRODUCTION signal (2026-08-16 audit §四). `refs` shows
     /// every usage site by design and ignores this.
     pub is_test: bool,
+    /// For a call written through a Rust type's path, the methods it reached
+    /// that way, as `Type::method` (see [`get_type_path_calls`]). Empty for
+    /// an edge into the target itself.
+    pub via: Vec<String>,
 }
 
 // --- Edge CRUD ---
@@ -358,7 +362,95 @@ fn map_incoming_ref(row: &rusqlite::Row) -> rusqlite::Result<IncomingReference> 
         confidence: row.get(6)?,
         is_test: row.get::<_, i64>(7)? != 0,
         qualified_name: row.get(8)?,
+        via: Vec::new(),
     })
+}
+
+/// Calls written through a Rust type's path into one of its methods
+/// (`Meter::new()`, `metrics::Meter::new()`), each with `via` naming the
+/// method as `Meter::new`. Such a call binds the method, not the type, so
+/// [`get_incoming_references`] on the type never sees it: `refs
+/// SessionMetrics` listed 1 row on this repository while 19 functions call
+/// `SessionMetrics::new()` (D2, 2026-11-11).
+///
+/// Empty unless `type_id` is a struct, enum or trait of a Rust file. The
+/// path's last segment must be the type's own name, read from the `"path"`
+/// callee qualifier only Rust writes. `Self::new()` carries `"stype"` and is
+/// not listed; `M::new()` through `use … as M` is, since the parser stores
+/// the path the alias expands to. No path naming something else
+/// (`Tr::go(m)`, a `type` alias) was seen binding a method, and the
+/// last-segment check keeps one out if the resolver ever binds it. A method
+/// in another file than the type counts only while no other Rust type has
+/// the name, since its `impl` could be for either.
+pub fn get_type_path_calls(conn: &Connection, type_id: i64) -> Result<Vec<IncomingReference>> {
+    use rusqlite::OptionalExtension;
+    let target = conn
+        .query_row(
+            "SELECT t.name, t.file_id,
+                    (SELECT COUNT(*) FROM nodes o JOIN files ofl ON ofl.id = o.file_id
+                     WHERE o.name = t.name AND o.type IN ('struct', 'enum', 'interface')
+                       AND ofl.language = 'rust')
+             FROM nodes t JOIN files f ON f.id = t.file_id
+             WHERE t.id = ?1 AND t.type IN ('struct', 'enum', 'interface')
+               AND f.language = 'rust'",
+            [type_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((type_name, type_file, namesakes)) = target else {
+        return Ok(Vec::new());
+    };
+    // `qualified_name` between `Meter.` and `Meter/` ('/' follows '.') is the
+    // index range of every name starting with `Meter.`: the type's methods,
+    // since a Rust item nested in a method gets a name of its own (`helper`,
+    // `Inner.go`), never a second dot.
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.name, n.type, f.path, n.start_line, e.relation, e.confidence, n.is_test,
+                n.qualified_name, m.name, e.metadata
+         FROM nodes m
+         JOIN files mf ON mf.id = m.file_id
+         JOIN edges e ON e.target_id = m.id AND e.relation = 'calls'
+         JOIN nodes n ON n.id = e.source_id
+         LEFT JOIN files f ON f.id = n.file_id
+         WHERE m.qualified_name >= ?1 || '.' AND m.qualified_name < ?1 || '/'
+           AND mf.language = 'rust'
+           AND (m.file_id = ?2 OR ?3)
+           AND e.metadata LIKE '%\"q\":\"path\"%'
+         ORDER BY f.path, n.start_line",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![type_name, type_file, namesakes == 1],
+        |row| {
+            Ok((
+                map_incoming_ref(row)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        },
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (mut r, method, metadata) = row?;
+        let spelled = metadata
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+            .and_then(|m| {
+                m["v"]
+                    .as_str()
+                    .and_then(|v| v.rsplit("::").next())
+                    .map(|last| last == type_name)
+            });
+        if spelled == Some(true) {
+            r.via = vec![format!("{type_name}::{method}")];
+            out.push(r);
+        }
+    }
+    Ok(out)
 }
 
 /// Batch-fetch all edge info for a set of node IDs, grouped by node_id.
