@@ -292,7 +292,7 @@ fn go_enclosing_fn_local_names(
             }
             if !nearest_body_done {
                 if let Some(body) = n.child_by_field_name("body") {
-                    collect_go_local_targets(&body, source, &mut names, 0);
+                    collect_go_local_targets(&body, source, &mut names, 0, false);
                 }
                 nearest_body_done = true;
             }
@@ -304,11 +304,15 @@ fn go_enclosing_fn_local_names(
 
 /// Walk a function body collecting `:=` / `var` / `range` / `=` TARGET names (the
 /// `left` / `name` field), not RHS values. Recurses into nested blocks.
+///
+/// `cases` also collects a type switch's alias (`switch v := x.(type)`) and a
+/// select case's received value (`case v := <-ch:`).
 fn collect_go_local_targets(
     node: &tree_sitter::Node,
     source: &str,
     out: &mut std::collections::HashSet<String>,
     depth: usize,
+    cases: bool,
 ) {
     if depth > MAX_SUBTREE_DEPTH {
         return;
@@ -324,11 +328,21 @@ fn collect_go_local_targets(
                 collect_go_idents(&nm, source, out, 0);
             }
         }
+        "type_switch_statement" if cases => {
+            if let Some(alias) = node.child_by_field_name("alias") {
+                collect_go_idents(&alias, source, out, 0);
+            }
+        }
+        "receive_statement" if cases => {
+            if let Some(l) = node.child_by_field_name("left") {
+                collect_go_idents(&l, source, out, 0);
+            }
+        }
         _ => {}
     }
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i) {
-            collect_go_local_targets(&child, source, out, depth + 1);
+            collect_go_local_targets(&child, source, out, depth + 1, cases);
         }
     }
 }
@@ -357,10 +371,10 @@ thread_local! {
     /// The current file's Go imports, bound name → import path
     /// ([`go_package_call`]). Per file: reset by [`reset_go_file`].
     static GO_IMPORTS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
-    /// [`go_enclosing_fn_local_names`] per innermost enclosing function node id:
-    /// one walk per function, not one per package call in it (prometheus: 2.2 s
-    /// of CPU over an 8.7 s index). Node ids are unique only within a tree: per
-    /// file, reset by [`reset_go_file`].
+    /// [`go_function_bound_names`] per function node id: one walk per
+    /// function, not one per package call in it (prometheus: 2.2 s of CPU over
+    /// an 8.7 s index). Node ids are unique only within a tree: per file, reset
+    /// by [`reset_go_file`].
     static GO_FN_LOCALS: RefCell<HashMap<usize, HashSet<String>>> = RefCell::new(HashMap::new());
 }
 
@@ -427,26 +441,48 @@ pub(super) fn go_package_call(
         .filter(|o| o.kind() == "identifier")?;
     let name = node_text(&operand, source);
     let path = GO_IMPORTS.with(|m| m.borrow().get(name).cloned())?;
+    // A package-level initializer has no enclosing function: no local can
+    // rebind the name there.
     let mut scope = node.parent();
     while let Some(n) = scope {
         if matches!(
             n.kind(),
             "function_declaration" | "method_declaration" | "func_literal"
         ) {
-            break;
+            let bound = GO_FN_LOCALS.with(|m| {
+                m.borrow_mut()
+                    .entry(n.id())
+                    .or_insert_with(|| go_function_bound_names(&n, source))
+                    .contains(name)
+            });
+            if bound {
+                return None;
+            }
         }
         scope = n.parent();
     }
-    let shadowed = match scope {
-        None => false, // a package-level initializer: no local can rebind it
-        Some(f) => GO_FN_LOCALS.with(|m| {
-            m.borrow_mut()
-                .entry(f.id())
-                .or_insert_with(|| go_enclosing_fn_local_names(node, source))
-                .contains(name)
-        }),
-    };
-    (!shadowed).then_some(path)
+    Some(path)
+}
+
+/// Every name Go function `f` binds: its parameters and receiver, and each
+/// `:=` / `var` / `range` / `=` target, type switch alias and select-case
+/// received value anywhere in its body. A func literal sees its enclosing
+/// functions' names, so [`go_package_call`] asks each of them. Collecting a
+/// name bound in another block than the call's only keeps the call by name.
+fn go_function_bound_names(
+    f: &tree_sitter::Node,
+    source: &str,
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for field in ["parameters", "receiver"] {
+        if let Some(p) = f.child_by_field_name(field) {
+            collect_go_idents(&p, source, &mut names, 0);
+        }
+    }
+    if let Some(body) = f.child_by_field_name("body") {
+        collect_go_local_targets(&body, source, &mut names, 0, true);
+    }
+    names
 }
 
 /// The names an import path's package conventionally goes by when the import

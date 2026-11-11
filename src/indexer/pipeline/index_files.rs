@@ -1781,6 +1781,7 @@ fn resolve_batch_relations(
     global_name_map: &HashMap<String, Vec<crate::storage::queries::NameEntry>>,
     python_module_map: &HashMap<String, Vec<String>>,
     all_file_paths: &HashSet<String>,
+    crate_roots: &super::resolve::RustCrates,
     deferred: &mut Vec<DeferredRelation>,
 ) -> Result<BatchRelations> {
     let mut py_modules = super::resolve::ProjectPythonModules::new(python_module_map);
@@ -1918,6 +1919,27 @@ fn resolve_batch_relations(
                     pf.language
                 );
             }
+            // A Go `pkg.F()` call in a file under no go.mod the walk found has
+            // no module to tell its packages from the standard library's
+            // (D#789): it stays the bare call it was before, bound by name.
+            let unmoduled;
+            let rel = if pf.language == "go"
+                && super::resolve::go_package_call_path(rel.metadata.as_deref()).is_some()
+                && !crate_roots.go_file_in_module(&pf.rel_path)
+            {
+                unmoduled = ParsedRelation {
+                    source_name: rel.source_name.clone(),
+                    target_name: rel.target_name.clone(),
+                    relation: rel.relation.clone(),
+                    metadata: None,
+                    source_language: rel.source_language.clone(),
+                    source_line: rel.source_line,
+                    call_at: rel.call_at,
+                };
+                &unmoduled
+            } else {
+                rel
+            };
 
             // Match the relation's enclosing scope (source_name) to a node.
             // Class-based languages (Python/TS/JS/Java/Ruby) qualify a
@@ -3230,6 +3252,7 @@ Restart every code-graph server on this project so they run one version.",
             &global_name_map,
             &python_module_map,
             &all_file_paths,
+            &crate_roots,
             &mut deferred,
         )?;
         total_edges_created += batch_relations.edges_created;

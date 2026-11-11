@@ -1851,6 +1851,88 @@ fn test_go_package_call_buffered_then_drained_keeps_the_package() {
     assert_eq!(callees_of(&db, "Run"), ["sub/sub.go.Helper"]);
 }
 
+/// D#789 review: a Go file under no go.mod the index finds (a GOPATH tree
+/// with none, one more than three directories down, a project opened below
+/// its module root) has no module to tell its packages from the standard
+/// library's, so its `pkg.F()` calls bind by name as before: `myapp/util`'s
+/// `Helper` binds, and `errors.New` binds the project's two `New`s
+/// `ambiguous`, hidden by the default floor. A comment after the module path
+/// is no part of it.
+#[test]
+fn test_go_package_call_under_no_found_module_binds_by_name() {
+    let confidences = |db: &Database| -> Vec<(String, String)> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT ft.path || '.' || nt.name, e.confidence FROM edges e \
+                 JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON nt.id = e.target_id \
+                 JOIN files ft ON ft.id = nt.file_id \
+                 WHERE e.relation = 'calls' AND ns.name = 'main' ORDER BY 1",
+            )
+            .unwrap();
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        rows.filter_map(Result::ok).collect()
+    };
+    let main_go = "package main\n\nimport (\n\t\"errors\"\n\t\"myapp/util\"\n)\n\n\
+                   func main() { util.Helper(); _ = errors.New(\"x\") }\n";
+    let (_p, _d, db) = fresh_index_of(&[
+        ("main.go", main_go),
+        ("util/u.go", "package util\n\nfunc Helper() {}\n"),
+        ("a/a.go", "package a\n\nfunc New() {}\n"),
+        ("b/b.go", "package b\n\nfunc New() {}\n"),
+    ]);
+    let owned = |rows: &[(&str, &str)]| -> Vec<(String, String)> {
+        rows.iter()
+            .map(|(t, c)| (t.to_string(), c.to_string()))
+            .collect()
+    };
+    assert_eq!(
+        confidences(&db),
+        owned(&[
+            ("a/a.go.New", "ambiguous"),
+            ("b/b.go.New", "ambiguous"),
+            ("util/u.go.Helper", "inferred"),
+        ])
+    );
+
+    let (_p, _d, db) = fresh_index_of(&[
+        ("w/x/y/z/go.mod", "module example.com/svc\n"),
+        (
+            "w/x/y/z/main.go",
+            "package main\n\nimport \"example.com/svc/util\"\n\nfunc main() { util.Helper() }\n",
+        ),
+        ("w/x/y/z/util/u.go", "package util\n\nfunc Helper() {}\n"),
+    ]);
+    assert_eq!(callees_of(&db, "main"), ["w/x/y/z/util/u.go.Helper"]);
+
+    // A go.mod covers its own directory only: svc2/ is no part of svc/.
+    let (_p, _d, db) = fresh_index_of(&[
+        ("svc/go.mod", "module example.com/svc\n"),
+        (
+            "svc/main.go",
+            "package main\n\nimport \"errors\"\n\nfunc main() { _ = errors.New(\"x\") }\n",
+        ),
+        (
+            "svc2/run.go",
+            "package main\n\nimport \"myapp/util\"\n\nfunc run() { util.Helper() }\n",
+        ),
+        ("util/u.go", "package util\n\nfunc Helper() {}\n"),
+        ("lib/lib.go", "package lib\n\nfunc New() {}\n"),
+    ]);
+    assert!(callees_of(&db, "main").is_empty());
+    assert_eq!(callees_of(&db, "run"), ["util/u.go.Helper"]);
+
+    let (_p, _d, db) = fresh_index_of(&[
+        ("go.mod", "module example.com/app // the main module\n"),
+        (
+            "main.go",
+            "package main\n\nimport \"example.com/app/util\"\n\nfunc main() { util.Helper() }\n",
+        ),
+        ("util/u.go", "package util\n\nfunc Helper() {}\n"),
+    ]);
+    assert_eq!(callees_of(&db, "main"), ["util/u.go.Helper"]);
+}
+
 /// D#86: a member call on an object can only run a method. Bound by bare name it
 /// reached free functions: `words.push(x)` a nested `const push`, `JSON.stringify`
 /// a project `function stringify`, `s.clear()` a free `clear()`, `ctx.get()` a

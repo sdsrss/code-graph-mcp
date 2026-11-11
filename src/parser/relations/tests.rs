@@ -760,6 +760,29 @@ fn test_go_package_call_carries_its_import_path() {
     }
 }
 
+/// D#789 review: a name the function binds anywhere is a value, whatever
+/// package it also names: an enclosing function's local seen from a func
+/// literal, a type switch's alias and a select case's received value among
+/// them. A call on it is no package call; one outside every such binding is.
+#[test]
+fn test_go_package_call_operand_bound_anywhere_in_the_function_is_a_value() {
+    let calls = call_meta(
+        "package p\n\nimport (\n\t\"log\"\n\n\t\"example.com/app/util\"\n)\n\n\
+         func a() {\n\tlog := Logger{}\n\tgo func() { log.Infof(\"x\") }()\n}\n\n\
+         func b(v any) {\n\tswitch log := v.(type) {\n\tcase Logger:\n\t\tlog.Warnf(\"x\")\n\t}\n}\n\n\
+         func c(ch chan T) {\n\tselect {\n\tcase util := <-ch:\n\t\tutil.Helper()\n\t}\n}\n\n\
+         func d() { log.Printf(\"x\") }\n",
+        "go",
+    );
+    for value_call in ["Infof", "Warnf", "Helper"] {
+        assert_eq!(meta_of(&calls, value_call), None, "{value_call}");
+    }
+    assert_eq!(
+        meta_of(&calls, "Printf"),
+        Some(r#"{"q":"gopkg","v":"log"}"#)
+    );
+}
+
 #[test]
 fn test_member_call_on_an_object_is_marked_member() {
     // D#86: `x.f()` on an object can only run a method, never a free function —

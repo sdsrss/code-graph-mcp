@@ -2835,6 +2835,19 @@ impl RustCrates {
         }
     }
 
+    /// Whether Go file `path` sits under a `go.mod` the walk found. One that
+    /// does not (no go.mod in the project, one past the walk's depth, a
+    /// project opened below its module root) has no module to tell a path of
+    /// its own packages from the standard library's.
+    pub(super) fn go_file_in_module(&self, path: &str) -> bool {
+        self.go_modules.iter().any(|(_, dir)| {
+            dir.is_empty()
+                || path
+                    .strip_prefix(dir.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+
     pub(super) fn contains(&self, name: &str) -> bool {
         self.names.contains(name)
     }
@@ -3053,6 +3066,9 @@ pub(super) fn collect_rust_crates(root: &Path) -> RustCrates {
                 let module = std::fs::read_to_string(entry.path()).ok().and_then(|text| {
                     text.lines().find_map(|line| {
                         let rest = line.trim().strip_prefix("module")?;
+                        // `module example.com/app // comment`: no module path
+                        // holds `//`.
+                        let rest = rest.split("//").next().unwrap_or_default();
                         rest.starts_with(char::is_whitespace)
                             .then(|| rest.trim().trim_matches('"').to_string())
                     })
