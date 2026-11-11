@@ -725,6 +725,41 @@ fn test_receiver_type_is_not_claimed_where_the_source_rebinds_it() {
     assert_eq!(meta_of(&calls, "go"), Some(r#"{"q":"super","v":"A"}"#));
 }
 
+/// D#789: a Go `pkg.F()` call carries the import path of `pkg`, found by
+/// alias or by the name the path conventionally gives (a `/vN` major version,
+/// a `.vN` suffix and a `go-` prefix dropped). A call on a value is no package
+/// call, and neither is one through a blank or dot import.
+#[test]
+fn test_go_package_call_carries_its_import_path() {
+    let calls = call_meta(
+        "package p\n\nimport (\n\t\"github.com/go-playground/validator/v10\"\n\t\"gopkg.in/yaml.v3\"\n\
+         \t\"github.com/mattn/go-isatty\"\n\tj \"encoding/json\"\n\t_ \"embed\"\n\t. \"strings\"\n)\n\n\
+         func f(x T) {\n\tvalidator.New()\n\tyaml.Marshal(1)\n\tisatty.IsTerminal(1)\n\tj.Valid(nil)\n\
+         \tx.Foo()\n\tembed.Bar()\n\tstrings.Baz()\n}\n",
+        "go",
+    );
+    let pkg = |path: &str| format!(r#"{{"q":"gopkg","v":"{path}"}}"#);
+    assert_eq!(
+        meta_of(&calls, "New"),
+        Some(pkg("github.com/go-playground/validator/v10").as_str())
+    );
+    assert_eq!(
+        meta_of(&calls, "Marshal"),
+        Some(pkg("gopkg.in/yaml.v3").as_str())
+    );
+    assert_eq!(
+        meta_of(&calls, "IsTerminal"),
+        Some(pkg("github.com/mattn/go-isatty").as_str())
+    );
+    assert_eq!(
+        meta_of(&calls, "Valid"),
+        Some(pkg("encoding/json").as_str())
+    );
+    for value_call in ["Foo", "Bar", "Baz"] {
+        assert_eq!(meta_of(&calls, value_call), None, "{value_call}");
+    }
+}
+
 #[test]
 fn test_member_call_on_an_object_is_marked_member() {
     // D#86: `x.f()` on an object can only run a method, never a free function —

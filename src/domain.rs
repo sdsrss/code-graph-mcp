@@ -159,6 +159,13 @@ pub const CALL_Q_IMPORT: &str = "imp";
 /// package) stays reachable by name.
 pub const CALL_Q_PACKAGE: &str = "pkg";
 
+/// `q` of a Go `pkg.F()` call through an imported package (D#789), stamped
+/// `{"q":"gopkg","v":import_path}`. It runs `F` of the package that path names,
+/// never a method and never a function of another package, so every resolution
+/// path keeps only the functions of that package's directory
+/// (`resolve::go_package_candidates`).
+pub const CALL_Q_GO_PACKAGE: &str = "gopkg";
+
 /// Key of a Python call's metadata whose receiver the source leaves untyped
 /// (D10B): `{"ur":"attr"}` for an attribute of the instance (`self.x.f()`,
 /// `cls.x.f()`), `{"ur":"rel"}` for a name a relative import binds
@@ -416,7 +423,7 @@ pub fn normalize_relation(input: &str) -> Option<&'static str> {
 // Vector-only invalidation/refresh (e.g. delete_node_vectors_batch on a
 // model=None incremental path) does NOT bump this — only node/edge/FTS output
 // changes do; vectors regenerate via the NULL-vector background-embed convention.
-pub const INDEX_VERSION: i32 = 140; // v140 (2026-11-10, D#789): a `routes_to` edge is only its handler's self-edge, and a Python route names its decorated `def` by line, so same-named handlers in one file no longer take each other's routes (flask tests/test_basic.py: 6,480 edges for 81 routes); a Flask `methods=` tuple is read, and every listed method is a route of its own (flaskr's `POST /register` was stored as GET only). // v139 (2026-11-06, D#747): a member call whose same-language namesakes are all free functions keeps its pending row (the sweep of the same run drained it). // // Older entries (v138 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
+pub const INDEX_VERSION: i32 = 140; // v140 (2026-11-10, D#789): a `routes_to` edge is only its handler's self-edge, and a Python route names its decorated `def` by line, so same-named handlers in one file no longer take each other's routes (flask tests/test_basic.py: 6,480 edges for 81 routes); a Flask `methods=` tuple is read, and every listed method is a route of its own (flaskr's `POST /register` was stored as GET only); a Go `pkg.F()` call binds only the functions of the package directory its import path names through go.mod, and none for a standard-library path (gin: 405 of 4,725 calls edges were `errors.New`, `require.Error` and the like bound to gin's own functions). // v139 (2026-11-06, D#747): a member call whose same-language namesakes are all free functions keeps its pending row (the sweep of the same run drained it). // // Older entries (v138 and down) live in CHANGELOG.md, which carries the same per-version narrative and its rebuild notices. Trimmed twice for the same reason: this one line is also a NODE in this project's own index, so every search over the repo carried it — 33,598 bytes at the first trim (2026-08-16 audit §四), 22,463 when it had grown back (2026-09-25). Keep the last two bumps here and move the rest when adding a third.
 
 // -- Pending-call buffer bound --
 // A `pending_unresolved_calls` row survives this many resolution sweeps before

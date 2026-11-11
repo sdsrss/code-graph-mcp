@@ -48,10 +48,10 @@ pub use meta::{delete_meta, get_meta, set_meta};
 pub use nodes::update_context_string;
 pub use nodes::{
     callable_node_ids, class_like_names, cpp_fields, delete_nodes_by_file, filter_method_ids,
-    filter_out_function_ids, get_all_node_names_with_ids, get_dirty_node_ids,
-    get_external_sentinel_importers, get_first_node_id_by_name, get_inbound_calls_for_pending,
-    get_inbound_cross_file_edges, get_inbound_relations_for_requeue, get_node_by_id,
-    get_node_files_and_qualified_names, get_node_ids_by_name,
+    filter_out_function_ids, filter_out_method_ids, get_all_node_names_with_ids,
+    get_dirty_node_ids, get_external_sentinel_importers, get_first_node_id_by_name,
+    get_inbound_calls_for_pending, get_inbound_cross_file_edges, get_inbound_relations_for_requeue,
+    get_node_by_id, get_node_files_and_qualified_names, get_node_ids_by_name,
     get_node_names_with_paths_excluding_files, get_node_paths_by_ids,
     get_node_qualified_names_by_ids, get_node_types_by_ids, get_node_with_file_by_id,
     get_nodes_by_file_path, get_nodes_by_name, get_nodes_missing_context,

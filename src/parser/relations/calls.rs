@@ -546,6 +546,20 @@ fn extract_generic_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
                         }),
                     some => some,
                 };
+                // `errors.New()` through `import "errors"` runs package errors'
+                // `New`, whatever the project defines (D#789).
+                let metadata = match metadata {
+                    None => {
+                        super::go::go_package_call(&node, source, ctx.config.name).map(|path| {
+                            serde_json::json!({
+                                "q": crate::domain::CALL_Q_GO_PACKAGE,
+                                "v": path,
+                            })
+                            .to_string()
+                        })
+                    }
+                    some => some,
+                };
                 // A bare call by its own name (no import, package, `use` path or
                 // receiver) picks among same-file definitions by scope (D#714).
                 let call_at = (metadata.is_none()

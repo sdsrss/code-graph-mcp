@@ -28,6 +28,9 @@
 //! GO_TYPE_REFERENCE_NOISE — otherwise `var x int` would emit a reference to
 //! `int`.
 
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+
 use super::super::node_text;
 use super::helpers::MAX_SUBTREE_DEPTH;
 use super::ParsedRelation;
@@ -348,4 +351,125 @@ fn collect_go_idents(
             collect_go_idents(&child, source, out, depth + 1);
         }
     }
+}
+
+thread_local! {
+    /// The current file's Go imports, bound name → import path
+    /// ([`go_package_call`]). Per file: reset by [`reset_go_file`].
+    static GO_IMPORTS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// [`go_enclosing_fn_local_names`] per innermost enclosing function node id:
+    /// one walk per function, not one per package call in it (prometheus: 2.2 s
+    /// of CPU over an 8.7 s index). Node ids are unique only within a tree: per
+    /// file, reset by [`reset_go_file`].
+    static GO_FN_LOCALS: RefCell<HashMap<usize, HashSet<String>>> = RefCell::new(HashMap::new());
+}
+
+/// Read the file's imports for [`go_package_call`]. MUST run once per file
+/// before its walk, whatever its language, so no file sees another's.
+pub(super) fn reset_go_file(root: tree_sitter::Node, source: &str, family: &str) {
+    GO_FN_LOCALS.with(|m| m.borrow_mut().clear());
+    let mut imports = HashMap::new();
+    if family == "go" {
+        let mut decls = root.walk();
+        for decl in root
+            .named_children(&mut decls)
+            .filter(|n| n.kind() == "import_declaration")
+        {
+            let mut cursor = decl.walk();
+            for child in decl.named_children(&mut cursor) {
+                let specs = if child.kind() == "import_spec_list" {
+                    let mut inner = child.walk();
+                    child.named_children(&mut inner).collect::<Vec<_>>()
+                } else {
+                    vec![child]
+                };
+                for spec in specs.into_iter().filter(|n| n.kind() == "import_spec") {
+                    let Some(path) = spec.child_by_field_name("path") else {
+                        continue;
+                    };
+                    let path = node_text(&path, source).trim_matches(|c| c == '"' || c == '`');
+                    match spec.child_by_field_name("name") {
+                        // Blank and dot imports bind no name.
+                        Some(alias) if alias.kind() != "package_identifier" => {}
+                        Some(alias) => {
+                            imports.insert(node_text(&alias, source).to_string(), path.to_string());
+                        }
+                        None => {
+                            for name in go_package_names(path) {
+                                imports.insert(name.to_string(), path.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    GO_IMPORTS.with(|m| *m.borrow_mut() = imports);
+}
+
+/// The import path of the package a Go `pkg.F()` call goes through (D#789):
+/// the callee's operand is a name the file imports a package under, and no
+/// parameter, receiver or local of the enclosing functions rebinds it. Any
+/// other call, a method call on a value among them, answers None.
+pub(super) fn go_package_call(
+    node: &tree_sitter::Node,
+    source: &str,
+    family: &str,
+) -> Option<String> {
+    if family != "go" {
+        return None;
+    }
+    let function = node
+        .child_by_field_name("function")
+        .filter(|f| f.kind() == "selector_expression")?;
+    let operand = function
+        .child_by_field_name("operand")
+        .filter(|o| o.kind() == "identifier")?;
+    let name = node_text(&operand, source);
+    let path = GO_IMPORTS.with(|m| m.borrow().get(name).cloned())?;
+    let mut scope = node.parent();
+    while let Some(n) = scope {
+        if matches!(
+            n.kind(),
+            "function_declaration" | "method_declaration" | "func_literal"
+        ) {
+            break;
+        }
+        scope = n.parent();
+    }
+    let shadowed = match scope {
+        None => false, // a package-level initializer: no local can rebind it
+        Some(f) => GO_FN_LOCALS.with(|m| {
+            m.borrow_mut()
+                .entry(f.id())
+                .or_insert_with(|| go_enclosing_fn_local_names(node, source))
+                .contains(name)
+        }),
+    };
+    (!shadowed).then_some(path)
+}
+
+/// The names an import path's package conventionally goes by when the import
+/// gives it none: the last element, or the one before a `/vN` major version;
+/// that, less a `.vN` suffix (`gopkg.in/yaml.v3`), and less a `go-` prefix
+/// (`github.com/mattn/go-isatty`). The package clause of the imported files is
+/// the real answer; a name none of these gives stays a value's method call.
+fn go_package_names(path: &str) -> Vec<&str> {
+    let is_major =
+        |s: &str| s.len() > 1 && s.starts_with('v') && s[1..].bytes().all(|b| b.is_ascii_digit());
+    let mut elements = path.rsplit('/');
+    let last = elements.next().unwrap_or(path);
+    let base = match elements.next() {
+        Some(before) if is_major(last) => before,
+        _ => last,
+    };
+    let base = match base.rsplit_once('.') {
+        Some((stem, version)) if is_major(version) => stem,
+        _ => base,
+    };
+    let mut names = vec![base];
+    if let Some(stripped) = base.strip_prefix("go-") {
+        names.push(stripped);
+    }
+    names
 }

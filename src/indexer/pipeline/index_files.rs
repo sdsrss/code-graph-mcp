@@ -2558,6 +2558,20 @@ fn resolve_batch_relations(
             // Tier order: same-file → same-language → (calls: drop) / (other: global).
             // Dropping calls without a same-language match prevents Rust `hasher.update()`
             // binding to an unrelated JS `function update()` via bare-name collision.
+            // A Go `pkg.F()` call is decided by the package directory its
+            // import path names (D#789), which takes the module layout the
+            // deferred pass holds: every one is decided there.
+            if rel.relation == REL_CALLS
+                && super::resolve::go_package_call_path(rel.metadata.as_deref()).is_some()
+            {
+                deferred.push(DeferredRelation::of(
+                    &source_ids,
+                    rel,
+                    &pf.rel_path,
+                    &pf.language,
+                ));
+                continue;
+            }
             let mut all_target_ids = name_to_ids
                 .get(&rel.target_name)
                 .cloned()
@@ -4737,6 +4751,16 @@ fn resolve_deferred_relations(
             if super::resolve::is_package_bound(d.metadata.as_deref()) {
                 all.retain(|id| node_id_to_path.get(id) != Some(&d.rel_path));
             }
+            let Some(all) = super::resolve::go_package_candidates(
+                db,
+                d.metadata.as_deref(),
+                crate_roots,
+                &node_id_to_path,
+                all,
+            )?
+            else {
+                continue; // a standard-library call: nothing to buffer for
+            };
             let all = classes.rust_call_shape_candidates(
                 db,
                 &d.language,

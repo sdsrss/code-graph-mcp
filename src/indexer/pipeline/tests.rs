@@ -1772,6 +1772,85 @@ fn test_same_named_route_handlers_in_one_file_each_get_their_own_route() {
     );
 }
 
+/// D#789: a Go `pkg.F()` call runs package `pkg`'s `F`, and Go names that
+/// package by its import path. Bound by bare name, gin's `errors.New(...)` and
+/// `template.New(...)` reached gin's own `New` (48 of its 202 callers), from its
+/// own file at `extracted`. The import path picks the package directory through
+/// go.mod; a path outside the module (the standard library) names no project
+/// function. A file shadowing the package name with a local keeps the old
+/// by-name answer.
+#[test]
+fn test_go_package_call_binds_the_package_its_import_path_names() {
+    let files: &[(&str, &str)] = &[
+        ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+        (
+            "app.go",
+            "package app\n\nimport (\n\t\"errors\"\n\t\"html/template\"\n\n\t\"example.com/app/sub\"\n)\n\n\
+             func New() int { return 1 }\n\n\
+             func Run() error {\n\tsub.Helper()\n\ttemplate.New(\"x\")\n\treturn errors.New(\"x\")\n}\n\n\
+             func Other() { sub.New() }\n\n\
+             func Shadow(errors *sub.T) { errors.Helper() }\n",
+        ),
+        ("sub/sub.go", "package sub\n\ntype T struct{}\n\nfunc (t *T) Helper() {}\n\nfunc Helper() {}\n\nfunc New() {}\n"),
+        // The project's own `errors` package is not the standard library's.
+        ("internal/errors/errors.go", "package errors\n\nfunc New() {}\n"),
+        (
+            "tool/tool.go",
+            "package tool\n\nimport app \"example.com/app\"\n\nfunc Use() { app.New() }\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    assert_eq!(callees_of(&db, "Run"), ["sub/sub.go.Helper"]);
+    assert_eq!(callees_of(&db, "Other"), ["sub/sub.go.New"]);
+    // Bound by its package, not guessed among the three `New`s: above the
+    // default confidence floor.
+    let confidence: String = db
+        .conn()
+        .query_row(
+            "SELECT e.confidence FROM edges e JOIN nodes ns ON ns.id = e.source_id \
+             WHERE e.relation = 'calls' AND ns.name = 'Other'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(confidence, "inferred");
+    assert_eq!(callees_of(&db, "Use"), ["app.go.New"]);
+    assert_eq!(
+        callees_of(&db, "Shadow"),
+        ["sub/sub.go.Helper", "sub/sub.go.T.Helper"]
+    );
+}
+
+/// D#789, the pending channel: a Go `pkg.F()` call left unbound is buffered
+/// with its import path, and the sweep that drains it once a namesake appears
+/// keeps the same package rule. `errors.New` stays unbound when the project
+/// later defines a `New`; `sub.Helper` binds once package sub defines it.
+#[test]
+fn test_go_package_call_buffered_then_drained_keeps_the_package() {
+    let (project, _d, db) = fresh_index_of(&[
+        ("go.mod", "module example.com/app\n"),
+        (
+            "app.go",
+            "package app\n\nimport (\n\t\"errors\"\n\n\t\"example.com/app/sub\"\n)\n\n\
+             func Run() error {\n\tsub.Helper()\n\treturn errors.New(\"x\")\n}\n",
+        ),
+    ]);
+    assert!(callees_of(&db, "Run").is_empty());
+    fs::write(
+        project.path().join("lib.go"),
+        "package app\n\nfunc New() int { return 1 }\n",
+    )
+    .unwrap();
+    fs::create_dir_all(project.path().join("sub")).unwrap();
+    fs::write(
+        project.path().join("sub/sub.go"),
+        "package sub\n\nfunc Helper() {}\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert_eq!(callees_of(&db, "Run"), ["sub/sub.go.Helper"]);
+}
+
 /// D#86: a member call on an object can only run a method. Bound by bare name it
 /// reached free functions: `words.push(x)` a nested `const push`, `JSON.stringify`
 /// a project `function stringify`, `s.clear()` a free `clear()`, `ctx.get()` a

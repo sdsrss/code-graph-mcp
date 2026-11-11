@@ -1072,6 +1072,26 @@ pub fn filter_out_function_ids(conn: &Connection, node_ids: &[i64]) -> Result<Ve
     Ok(kept)
 }
 
+/// `node_ids` minus the methods (`type = 'method'`): what a Go `pkg.F()` call
+/// can reach. Order is not preserved. Chunked under MAX_IN_PARAMS.
+pub fn filter_out_method_ids(conn: &Connection, node_ids: &[i64]) -> Result<Vec<i64>> {
+    let mut kept = Vec::new();
+    for chunk in node_ids.chunks(MAX_IN_PARAMS) {
+        let sql = format!(
+            "SELECT id FROM nodes WHERE id IN ({}) AND type <> 'method'",
+            make_placeholders(1, chunk.len())
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            row.get::<_, i64>(0)
+        })?;
+        for row in rows {
+            kept.push(row?);
+        }
+    }
+    Ok(kept)
+}
+
 /// Every function and method node: what an `inherits` / `implements` edge can
 /// never point at (a C++ constructor shares its class's name; a method may be
 /// named like a library base, `testing::Test` vs a `Test()` method).

@@ -187,6 +187,7 @@ pub fn extract_relations_from_tree(
     rust_receiver::reset();
     rust_impls::reset();
     member::reset_import_bound(tree.root_node(), source, config.name, rel_path);
+    go::reset_go_file(tree.root_node(), source, config.name);
     receiver::reset();
     walk_for_relations(
         tree.root_node(),

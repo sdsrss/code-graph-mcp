@@ -459,6 +459,14 @@ pub(super) fn resolve_pending_calls_touching(
             let caller = source_id_to_path.get(&row.source_id);
             candidates.retain(|id| node_id_to_path.get(id) != caller);
         }
+        let candidates = go_package_candidates(
+            db,
+            row.metadata.as_deref(),
+            crate_roots,
+            &node_id_to_path,
+            candidates,
+        )?
+        .unwrap_or_default();
         if candidates.is_empty() {
             continue; // still unresolvable — leave buffered
         }
@@ -2527,7 +2535,8 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                       -- ... and UNLESS the edge was resolved by a TYPE/PATH callee
                       -- qualifier (self / stype / rtype / super / path), or through a
                       -- renamed JS import to the file its specifier names (imp,
-                      -- D#120). Those bind the call
+                      -- D#120), or through a Go import to its package's
+                      -- directory (gopkg, D#789). Those bind the call
                       -- by a structural signal (the receiver's impl type, or the
                       -- module path), not by a bare-name guess among same-name
                       -- siblings — so a duplicate bare name must not relabel them
@@ -2538,7 +2547,7 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                       -- A typed call its class did not decide carries `amb`
                       -- (`ambiguous_meta`) and is classified like a bare one.
                       AND (json_extract(e.metadata, '$.q') IS NULL
-                           OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'super', 'path', 'imp')
+                           OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'super', 'path', 'imp', 'gopkg')
                            OR json_extract(e.metadata, '$.amb') IS NOT NULL)
                  THEN ?3 ELSE ?4 END"
     );
@@ -2671,6 +2680,9 @@ pub(super) struct RustCrates {
     opaque: bool,
     /// `(key, package)` dependency renames, until the walk resolves them.
     renames: Vec<(String, String)>,
+    /// `(module path, root-relative directory)` of every `go.mod` the same walk
+    /// finds: where a Go import path's package sits ([`Self::go_package_dir`]).
+    go_modules: Vec<(String, String)>,
 }
 
 /// Which of a package's two crates a file is compiled into (D#136): the one
@@ -2695,7 +2707,47 @@ enum RootMods {
     Opaque,
 }
 
+/// Where the package a Go import path names may sit (D#789).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum GoPackageDir {
+    /// The directory under a `go.mod` module the path falls in.
+    Module(String),
+    /// Under no module the walk found, and dotted (`github.com/…`, `k8s.io/…`):
+    /// a directory whose path ends with the import path (a vendored, staged or
+    /// GOPATH copy). Without any `go.mod`, also one the import path ends with.
+    Tail(String),
+    /// A path whose first element has no dot, under no module: the standard
+    /// library, which defines no project function.
+    Outside,
+}
+
 impl RustCrates {
+    /// Where the package of Go import `path` sits: the longest module path
+    /// that is the import path or a prefix of it by whole elements.
+    pub(super) fn go_package_dir(&self, path: &str) -> GoPackageDir {
+        let module = self
+            .go_modules
+            .iter()
+            .filter_map(|(module, dir)| {
+                let rest = if path == module {
+                    ""
+                } else {
+                    path.strip_prefix(module.as_str())?.strip_prefix('/')?
+                };
+                Some((module.len(), dir, rest))
+            })
+            .max_by_key(|(len, _, _)| *len);
+        match module {
+            Some((_, dir, rest)) => GoPackageDir::Module(match (dir.is_empty(), rest.is_empty()) {
+                (true, _) => rest.to_string(),
+                (false, true) => dir.clone(),
+                (false, false) => format!("{dir}/{rest}"),
+            }),
+            None if !path.split('/').next().unwrap_or("").contains('.') => GoPackageDir::Outside,
+            None => GoPackageDir::Tail(path.to_string()),
+        }
+    }
+
     pub(super) fn contains(&self, name: &str) -> bool {
         self.names.contains(name)
     }
@@ -2910,6 +2962,21 @@ pub(super) fn collect_rust_crates(root: &Path) -> RustCrates {
                     continue;
                 }
                 walk(&entry.path(), root, depth + 1, out);
+            } else if name == "go.mod" {
+                let module = std::fs::read_to_string(entry.path()).ok().and_then(|text| {
+                    text.lines().find_map(|line| {
+                        let rest = line.trim().strip_prefix("module")?;
+                        rest.starts_with(char::is_whitespace)
+                            .then(|| rest.trim().trim_matches('"').to_string())
+                    })
+                });
+                if let Some(module) = module.filter(|m| !m.is_empty()) {
+                    let rel = dir
+                        .strip_prefix(root)
+                        .map(|r| r.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_default();
+                    out.go_modules.push((module, rel));
+                }
             } else if name == "Cargo.toml" {
                 if let Ok(text) = std::fs::read_to_string(entry.path()) {
                     let names = parse_cargo_names(&text);
@@ -4123,6 +4190,58 @@ pub(super) fn module_call_skips_own_file(metadata: Option<&str>) -> bool {
                 && meta.get("loc").is_none()
                 && meta.get("attr").is_none()
         })
+}
+
+/// A Go `pkg.F()` call (`{"q":"gopkg"}`, D#789) reaches only the functions of
+/// the directory its import path names ([`RustCrates::go_package_dir`]). A
+/// method never: `pkg.M()` cannot name one. None for a standard-library path,
+/// which no project file can ever answer: the caller drops the call instead of
+/// buffering it. Every other call keeps its candidates. One helper so the
+/// deferred pass and the pending sweep cannot disagree; the batch pass defers
+/// these calls.
+pub(super) fn go_package_candidates(
+    db: &crate::storage::db::Database,
+    metadata: Option<&str>,
+    crates: &RustCrates,
+    node_id_to_path: &HashMap<i64, String>,
+    candidates: Vec<i64>,
+) -> anyhow::Result<Option<Vec<i64>>> {
+    let Some(path) = go_package_call_path(metadata) else {
+        return Ok(Some(candidates));
+    };
+    let no_modules = crates.go_modules.is_empty();
+    let dir_of = |id: &i64| {
+        node_id_to_path
+            .get(id)
+            .map(|p| p.rsplit_once('/').map_or("", |(dir, _)| dir))
+    };
+    let in_package: Vec<i64> = match crates.go_package_dir(&path) {
+        GoPackageDir::Outside => return Ok(None),
+        GoPackageDir::Module(dir) => candidates
+            .into_iter()
+            .filter(|id| dir_of(id) == Some(dir.as_str()))
+            .collect(),
+        GoPackageDir::Tail(path) => candidates
+            .into_iter()
+            .filter(|id| {
+                dir_of(id).is_some_and(|dir| {
+                    dir == path
+                        || dir.ends_with(&format!("/{path}"))
+                        || (no_modules && !dir.is_empty() && path.ends_with(&format!("/{dir}")))
+                })
+            })
+            .collect(),
+    };
+    crate::storage::queries::filter_out_method_ids(db.conn(), &in_package).map(Some)
+}
+
+/// The import path of a Go package call's metadata, if it is one.
+pub(super) fn go_package_call_path(metadata: Option<&str>) -> Option<String> {
+    let meta = metadata.filter(|m| m.contains(r#""q":"gopkg""#))?;
+    let v: serde_json::Value = serde_json::from_str(meta).ok()?;
+    (v.get("q")?.as_str()? == crate::domain::CALL_Q_GO_PACKAGE)
+        .then(|| v.get("v")?.as_str().map(str::to_string))
+        .flatten()
 }
 
 /// Candidates a call can reach given its metadata: a member call on an object
