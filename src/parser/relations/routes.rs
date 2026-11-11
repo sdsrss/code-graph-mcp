@@ -316,10 +316,15 @@ fn extract_go_route(node: &tree_sitter::Node, source: &str) -> Option<ParsedRela
     })
 }
 
-pub(super) fn extract_python_route(
+pub(super) fn extract_python_route(node: &tree_sitter::Node, source: &str) -> Vec<ParsedRelation> {
+    extract_python_route_methods(node, source).unwrap_or_default()
+}
+
+/// One `routes_to` per HTTP method the route answers.
+fn extract_python_route_methods(
     node: &tree_sitter::Node,
     source: &str,
-) -> Option<ParsedRelation> {
+) -> Option<Vec<ParsedRelation>> {
     // Look for decorator that matches @app.route(...) or @app.get(...) etc.
     // Iterate all decorators and match the first route-like one (not the last),
     // since route decorators may appear before auth/middleware decorators.
@@ -361,16 +366,16 @@ pub(super) fn extract_python_route(
     // Extract path from decorator arguments
     let path = extract_string_from_subtree(&dec, source)?;
 
-    let method: String = if dec_text.contains(".get(") {
-        "GET".into()
+    let methods: Vec<String> = if dec_text.contains(".get(") {
+        vec!["GET".into()]
     } else if dec_text.contains(".post(") {
-        "POST".into()
+        vec!["POST".into()]
     } else if dec_text.contains(".put(") {
-        "PUT".into()
+        vec!["PUT".into()]
     } else if dec_text.contains(".delete(") {
-        "DELETE".into()
+        vec!["DELETE".into()]
     } else if dec_text.contains(".patch(") {
-        "PATCH".into()
+        vec!["PATCH".into()]
     }
     // Flask `@app.route('/x', methods=['GET'])`: the decorator name is the
     // generic `.route`, so the verb lives in the `methods=` kwarg. Without
@@ -382,42 +387,58 @@ pub(super) fn extract_python_route(
     // auto-derived from it). The earlier "ANY" wildcard fixed the false
     // negative by buying a false positive: `trace 'DELETE /x'` matched a route
     // that answers 405. HEAD/OPTIONS on a bare `@app.route` remain a knowingly
-    // unmodelled approximation — the metadata schema holds one verb.
+    // unmodelled approximation: they are not routes of their own here.
     else {
-        parse_flask_methods_kwarg(dec_text).unwrap_or_else(|| "GET".into())
+        parse_flask_methods_kwarg(dec_text).unwrap_or_else(|| vec!["GET".into()])
     };
 
-    let metadata = serde_json::json!({"method": method, "path": path}).to_string();
-
-    Some(ParsedRelation {
-        source_name: func_name.to_string(),
-        target_name: func_name.to_string(),
-        relation: REL_ROUTES_TO.into(),
-        metadata: Some(metadata),
-        source_language: String::new(),
-        // The decorated `def` itself: a test file nests one `def index()` per
-        // test, and the line is what tells the resolver which one this is.
-        source_line: Some(func.start_position().row as u32 + 1),
-        call_at: None,
-    })
+    // The decorated `def` itself: a test file nests one `def index()` per
+    // test, and the line is what tells the resolver which one this is.
+    let source_line = Some(func.start_position().row as u32 + 1);
+    Some(
+        methods
+            .into_iter()
+            .map(|method| ParsedRelation {
+                source_name: func_name.to_string(),
+                target_name: func_name.to_string(),
+                relation: REL_ROUTES_TO.into(),
+                metadata: Some(serde_json::json!({"method": method, "path": path}).to_string()),
+                source_language: String::new(),
+                source_line,
+                call_at: None,
+            })
+            .collect(),
+    )
 }
 
-/// Extract the first HTTP method from a Flask `methods=['GET', 'POST']` kwarg in
-/// an `@app.route(...)` decorator. Returns None when no `methods=` kwarg is
-/// present (caller falls back to Flask's own default, "GET"). The scan is
-/// confined to the bracketed list literal, so a path segment like
-/// `/get-methods` cannot be mistaken for a
-/// verb; the failure mode is always None → "GET". The single-method metadata
-/// schema stores the first listed method when several are given.
-fn parse_flask_methods_kwarg(dec_text: &str) -> Option<String> {
-    let after_kw = dec_text.split_once("methods").map(|(_, rest)| rest)?;
-    let list_start = after_kw.find('[')?;
-    let list = after_kw[list_start + 1..].split(']').next().unwrap_or("");
+/// The HTTP methods a Flask `methods=['GET', 'POST']` (or tuple, or set) kwarg
+/// of an `@app.route(...)` decorator lists, in order. None when there is no
+/// such literal (no kwarg, or `methods=VERBS`): the caller falls back to
+/// Flask's own default, "GET". Only the `methods=` literal is read, and only
+/// whole items, so neither a path like `/get-methods` nor an item like
+/// `'get_all'` is taken for a verb.
+fn parse_flask_methods_kwarg(dec_text: &str) -> Option<Vec<String>> {
     const METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
-    let upper = list.to_uppercase();
-    METHODS
-        .iter()
-        .filter_map(|m| upper.find(m).map(|pos| (pos, *m)))
-        .min_by_key(|&(pos, _)| pos)
-        .map(|(_, m)| m.to_string())
+    let list = dec_text.match_indices("methods").find_map(|(at, kw)| {
+        let value = dec_text[at + kw.len()..].trim_start().strip_prefix('=')?;
+        let value = value.trim_start();
+        let close = match value.chars().next()? {
+            '[' => ']',
+            '(' => ')',
+            '{' => '}',
+            _ => return None,
+        };
+        value[1..].split(close).next()
+    })?;
+    let mut methods: Vec<String> = Vec::new();
+    for item in list.split(',') {
+        let verb = item
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_uppercase();
+        if METHODS.contains(&verb.as_str()) && !methods.contains(&verb) {
+            methods.push(verb);
+        }
+    }
+    (!methods.is_empty()).then_some(methods)
 }

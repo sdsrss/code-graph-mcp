@@ -843,9 +843,7 @@ fn walk_for_relations(
     // are reached through `CALL_PASSES`. One arm for one language is not a table
     // yet — it is a row waiting for a second language to justify the shape.
     if kind == "decorated_definition" {
-        if let Some(route_rel) = extract_python_route(&node, source) {
-            results.push(route_rel);
-        }
+        results.extend(extract_python_route(&node, source));
     }
 
     // Determine class context for children: when entering a class body,

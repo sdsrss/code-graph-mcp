@@ -304,7 +304,13 @@ fn test_extract_flask_route_methods_kwarg() {
         @app.route('/multi', methods=['POST', 'PUT'])\n\
         def multi():\n    return None\n\
         @app.route('/noverb')\n\
-        def noverb():\n    return None\n";
+        def noverb():\n    return None\n\
+        @app.route('/create', methods=(\"POST\",))\n\
+        def create():\n    return None\n\
+        @app.route('/get-methods', methods = ['put', 'get_all'])\n\
+        def tricky():\n    return None\n\
+        @app.route('/methods', methods=VERBS)\n\
+        def by_name():\n    return None\n";
     let rels = extract_relations(code, "python").unwrap();
     let route_method = |handler: &str| -> Option<String> {
         rels.iter()
@@ -323,12 +329,33 @@ fn test_extract_flask_route_methods_kwarg() {
         Some("DELETE"),
         "methods=['DELETE'] → DELETE"
     );
-    // Multi-method: the single-method metadata schema stores the first listed.
+    // Multi-method: one route per listed verb, as axum's `get(h).post(h)` gets.
+    // Only the first was kept, so `trace 'PUT /multi'` found nothing.
+    let route_methods = |handler: &str| -> Vec<String> {
+        rels.iter()
+            .filter(|r| r.relation == REL_ROUTES_TO && r.source_name == handler)
+            .filter_map(|r| r.metadata.as_ref())
+            .filter_map(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .filter_map(|v| v.get("method").and_then(|x| x.as_str()).map(String::from))
+            .collect()
+    };
     assert_eq!(
-        route_method("multi").as_deref(),
-        Some("POST"),
-        "methods=['POST','PUT'] → first (POST)"
+        route_methods("multi"),
+        ["POST", "PUT"],
+        "methods=['POST','PUT']"
     );
+    // A tuple is as common as a list (`methods=("POST",)`), and was read as no
+    // list at all, so the route was stored as the default GET.
+    assert_eq!(route_methods("create"), ["POST"], "methods=(\"POST\",)");
+    // Only whole items of the `methods=` literal are verbs: not the `get` of a
+    // path, not an item that merely starts with one.
+    assert_eq!(
+        route_methods("tricky"),
+        ["PUT"],
+        "path and item are no verbs"
+    );
+    // A list the parser cannot see keeps the framework default.
+    assert_eq!(route_methods("by_name"), ["GET"], "methods=VERBS → GET");
     // No methods= kwarg → GET, Flask's own default (`methods` defaults to
     // `["GET"]`, with HEAD/OPTIONS auto-derived). Storing the wildcard "ANY"
     // here traded a false negative for a false positive: `trace 'DELETE /noverb'`
