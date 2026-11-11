@@ -6955,6 +6955,73 @@ fn test_cli_trace_nests_calls_under_their_caller() {
     );
 }
 
+// Two route handlers with one name in one file (each Flask app factory, or
+// test, nests its own `def index()`) each trace their OWN calls. The chain was
+// traversed by handler name + file, so it seeded on both definitions: the JSON
+// listed both handlers' calls under each, and the text tree printed the first
+// definition's calls under both and the second's nowhere.
+#[test]
+fn test_cli_trace_follows_each_same_named_handler_by_itself() {
+    let project = index_project(&[(
+        "app.py",
+        "from flask import Flask\n\napp = Flask(__name__)\n\n\n\
+         def make_a():\n    @app.route(\"/\")\n    def index():\n        return helper_a()\n\n\n\
+         def make_b():\n    @app.route(\"/\")\n    def index():\n        return helper_b()\n\n\n\
+         def helper_a():\n    return 1\n\n\ndef helper_b():\n    return 2\n",
+    )]);
+    let (out, err, code) = run_cli(&project, &["trace", "GET /"]);
+    assert_eq!(code, 0, "out={out} err={err}");
+    let mut blocks: Vec<(String, Vec<String>)> = Vec::new();
+    for line in out.lines().map(str::trim_end) {
+        if line.starts_with("GET / → index") {
+            blocks.push((line.to_string(), Vec::new()));
+        } else if line.trim_start().starts_with('→') {
+            blocks
+                .last_mut()
+                .expect("a chain line follows its route")
+                .1
+                .push(line.trim().to_string());
+        }
+    }
+    blocks.sort();
+    let want = |l: &str, c: &str| {
+        (
+            format!("GET / → index (app.py:{l})"),
+            vec![format!("→ {c} (app.py)")],
+        )
+    };
+    let mut expected = vec![want("7", "helper_a"), want("13", "helper_b")];
+    expected.sort();
+    assert_eq!(blocks, expected, "{out}");
+
+    let (out, err, code) = run_cli(&project, &["trace", "GET /", "--json"]);
+    assert_eq!(code, 0, "out={out} err={err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let mut chains: Vec<(u64, Vec<String>)> = v["handlers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            let names = h["call_chain"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n["name"].as_str().unwrap().to_string())
+                .collect();
+            (h["start_line"].as_u64().unwrap(), names)
+        })
+        .collect();
+    chains.sort();
+    assert_eq!(
+        chains,
+        vec![
+            (7, vec!["helper_a".to_string()]),
+            (13, vec!["helper_b".to_string()])
+        ],
+        "{out}"
+    );
+}
+
 #[test]
 fn test_cli_trace_no_routes() {
     let project = setup_indexed_project();

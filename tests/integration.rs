@@ -1567,6 +1567,53 @@ fn test_trace_http_chain_counts_each_hidden_edge_once_per_handler() {
     );
 }
 
+/// MCP half of `test_cli_trace_follows_each_same_named_handler_by_itself`:
+/// two `index` handlers in one file each carry their own call chain, through
+/// both the hidden `trace_http_chain` name and `get_call_graph`'s `route_path`.
+#[test]
+fn test_trace_http_chain_follows_each_same_named_handler_by_itself() {
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("app.py"),
+        "from flask import Flask\n\napp = Flask(__name__)\n\n\n\
+         def make_a():\n    @app.route(\"/\")\n    def index():\n        return helper_a()\n\n\n\
+         def make_b():\n    @app.route(\"/\")\n    def index():\n        return helper_b()\n\n\n\
+         def helper_a():\n    return 1\n\n\ndef helper_b():\n    return 2\n",
+    )
+    .unwrap();
+    let server = McpServer::from_project_root(project.path()).unwrap();
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+    server.handle_message(init).unwrap();
+    for tool in ["trace_http_chain", "get_call_graph"] {
+        let msg = tool_call_json(tool, serde_json::json!({"route_path": "GET /"}));
+        let resp = server.handle_message(&msg).unwrap();
+        let result = parse_tool_result(&resp);
+        let mut chains: Vec<(u64, Vec<String>)> = result["handlers"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{tool}: no handlers: {result}"))
+            .iter()
+            .map(|h| {
+                let names = h["call_chain"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|n| n["name"].as_str().unwrap().to_string())
+                    .collect();
+                (h["start_line"].as_u64().unwrap(), names)
+            })
+            .collect();
+        chains.sort();
+        assert_eq!(
+            chains,
+            vec![
+                (7, vec!["helper_a".to_string()]),
+                (13, vec!["helper_b".to_string()])
+            ],
+            "{tool}: {result}"
+        );
+    }
+}
+
 #[test]
 fn test_project_map_detects_main_entry_points() {
     let project = TempDir::new().unwrap();

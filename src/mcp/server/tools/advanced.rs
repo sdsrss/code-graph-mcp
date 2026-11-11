@@ -71,31 +71,29 @@ impl McpServer {
         // (`cli/commands/trace.rs`) does the same, for the same reason.
         // `find_routes_by_path` returns one row per route EDGE, so a handler
         // registered on two matching paths appears twice, and the traversal is
-        // keyed by exactly `handler_name` + `file_path`, so the repeat run was
+        // keyed by the handler's node, so the repeat run would be
         // byte-identical. The wasted work was the smaller half: adding
         // `suppressed_ambiguous` once per ROW made `ambiguous_edges_hidden`
         // report the same hidden edges once per route (SURF-07, audit
-        // 2026-09-05).
-        let mut chains: std::collections::HashMap<
-            (&str, &str),
-            crate::graph::query::CallGraphResult,
-        > = std::collections::HashMap::new();
+        // 2026-09-05). Seeded on that node, not on name + file, which seeded
+        // every same-named handler of the file and gave each the union of
+        // their chains.
+        let mut chains: std::collections::HashMap<i64, crate::graph::query::CallGraphResult> =
+            std::collections::HashMap::new();
         let mut ambiguous_hidden: usize = 0;
         for rm in &rows {
-            let key = (rm.handler_name.as_str(), rm.file_path.as_str());
-            if chains.contains_key(&key) {
+            if chains.contains_key(&rm.node_id) {
                 continue;
             }
-            let chain = crate::graph::query::get_call_graph_filtered(
+            let chain = crate::graph::query::get_call_graph_seeded(
                 self.db.conn(),
-                &rm.handler_name,
+                crate::graph::query::CallGraphSeed::Node(rm.node_id),
                 "callees",
                 depth,
-                Some(&rm.file_path),
                 min_conf_rank,
             )?;
             ambiguous_hidden += chain.suppressed_ambiguous;
-            chains.insert(key, chain);
+            chains.insert(rm.node_id, chain);
         }
 
         let mut handlers: Vec<serde_json::Value> = Vec::new();
@@ -120,7 +118,7 @@ impl McpServer {
             // Recursive call chain via call graph — traversed once above, per
             // distinct handler; every row's key is present.
             let chain = chains
-                .get(&(rm.handler_name.as_str(), rm.file_path.as_str()))
+                .get(&rm.node_id)
                 .expect("every route row's handler was traversed above");
             let chain_nodes: Vec<serde_json::Value> = chain
                 .nodes
