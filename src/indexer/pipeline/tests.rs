@@ -18274,3 +18274,60 @@ fn a_python_module_two_roots_spell_binds_the_same_files_across_a_batch_boundary(
     run_incremental_index(&multi, multi_dir.path(), None, None).unwrap();
     assert_eq!(edges_of(&multi), expected, "after an edit of the importer");
 }
+
+// C4 again: a `from m import x` the module lookup cannot answer bound, through
+// the name chain, a `def` nested in another file's function or method, which
+// is no attribute of any module (nltk `from nltk.corpus import words` -> the
+// `words` inside a method of tag/hmm.py; stdlib `from codecs import lookup` ->
+// one inside a function of shutil.py). C4 kept such a `def` out only while it
+// was typed `method`; it is a `function` now. A nested `def` that its own
+// module binds at module level still answers the lookup of that module
+// (`fsencode, fsdecode = _fscodec()` in os.py).
+#[test]
+fn a_python_from_import_binds_no_def_nested_in_a_function() {
+    let files: &[(&str, &str)] = &[
+        ("corpus/__init__.py", "words = object()\n"),
+        (
+            "hmm.py",
+            "class Tagger:\n    def run(self):\n        def words():\n            return 1\n\
+             \x20       return words()\n",
+        ),
+        (
+            "tree.py",
+            "def build():\n    def words():\n        return 2\n    return words()\n",
+        ),
+        (
+            "user.py",
+            "from corpus import words\n\n\ndef use():\n    return words\n",
+        ),
+        (
+            "oslike.py",
+            "def _codec():\n    def enc(x):\n        return x\n    return enc\n\n\nenc = _codec()\n",
+        ),
+        ("user2.py", "from oslike import enc\n"),
+        // The name chain itself still binds a module-level `def`.
+        ("pkg/__init__.py", "from .impl import *\n"),
+        (
+            "pkg/impl.py",
+            "def first():\n    return 1\n\n\ndef tag():\n    return 2\n",
+        ),
+        ("user3.py", "from pkg import tag\n"),
+    ];
+    let (_p, _d, db) = fresh_index_of(files);
+    let edges = edge_set(&db);
+    let has = |e: &str| edges.iter().any(|x| x == e);
+    for nested in ["hmm.py.words", "tree.py.words"] {
+        assert!(
+            !has(&format!("user.py.<module> --imports--> {nested}")),
+            "{edges:#?}"
+        );
+    }
+    assert!(
+        has("user2.py.<module> --imports--> oslike.py.enc"),
+        "{edges:#?}"
+    );
+    assert!(
+        has("user3.py.<module> --imports--> pkg/impl.py.tag"),
+        "{edges:#?}"
+    );
+}

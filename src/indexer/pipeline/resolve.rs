@@ -4757,7 +4757,8 @@ pub(super) struct ProjectClassNames {
     /// Free functions no member call reaches (`filter_out_function_ids`'s
     /// complement); None until loaded.
     free_functions: Option<HashSet<i64>>,
-    /// Every `method` node ([`Self::python_import_candidates`]); None until loaded.
+    /// Every `method` node and every Python `def` nested in a function or
+    /// method ([`Self::python_import_candidates`]); None until loaded.
     methods: Option<HashSet<i64>>,
     /// Rust function id → its parameters ([`rust_call_shape_admits`]); None
     /// until loaded.
@@ -5262,7 +5263,7 @@ impl ProjectClassNames {
     }
 
     /// A Python `from m import x` binds a module-level name, never a method:
-    /// neither a class member nor a nested `def` (typed as a method too) is an
+    /// neither a class member nor a `def` nested in a function or method is an
     /// attribute of its module. flask's `from flask import url_for` names a
     /// re-export of `helpers.url_for`, which the module lookup cannot follow,
     /// so the name chain took `Flask.url_for` beside it and every
@@ -5270,6 +5271,14 @@ impl ProjectClassNames {
     /// evaluation). With the import unique, `prune_import_contradicted_call_edges`
     /// drops the method from the calls too. Calls are left alone: a Python call
     /// without metadata may still be `self.app.f()` or `imported_obj.f()`.
+    ///
+    /// A nested `def` is a `function` since it stopped being stored as a
+    /// method of the class around it, so it is found by its lines: inside a
+    /// function or method of its file, which in Python's line-based blocks is
+    /// exactly being defined in its body. Only the name chain asks; the module
+    /// lookup before it still finds one its module binds at module level
+    /// (`fsencode, fsdecode = _fscodec()` in os.py). The query reads Python
+    /// files only because nothing else is ever asked of the set.
     pub(super) fn python_import_candidates(
         &mut self,
         db: &crate::storage::db::Database,
@@ -5280,9 +5289,15 @@ impl ProjectClassNames {
             return Ok(candidates);
         }
         if self.methods.is_none() {
-            let mut stmt = db
-                .conn()
-                .prepare("SELECT id FROM nodes WHERE type = 'method'")?;
+            let mut stmt = db.conn().prepare(
+                "SELECT id FROM nodes WHERE type = 'method'
+                 UNION
+                 SELECT n.id FROM nodes n JOIN files f ON f.id = n.file_id
+                 WHERE f.language = 'python' AND n.type = 'function'
+                   AND EXISTS (SELECT 1 FROM nodes o
+                               WHERE o.file_id = n.file_id AND o.type IN ('function', 'method')
+                                 AND o.start_line < n.start_line AND n.end_line <= o.end_line)",
+            )?;
             let ids = stmt
                 .query_map([], |row| row.get::<_, i64>(0))?
                 .collect::<rusqlite::Result<HashSet<i64>>>()?;
