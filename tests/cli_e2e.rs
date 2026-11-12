@@ -15682,6 +15682,12 @@ fn hold_index_run_lock(project: &TempDir) -> std::fs::File {
     run
 }
 
+/// A query as a model or a person runs it: the plugin's hooks set
+/// `CODE_GRAPH_INTERNAL=1`, which skips the wait, and a test run from a shell
+/// that has it set must not inherit that.
+#[cfg(unix)]
+const NOT_INTERNAL: (&str, &str) = ("CODE_GRAPH_INTERNAL", "0");
+
 /// Converge R8 (2026-11-12): a query beside a live index run answered from the
 /// rows that run was rewriting, exit 0 and nothing on stderr. On a copy of this
 /// repository with 145 files edited, 33 of 68 queries during one
@@ -15713,6 +15719,7 @@ fn test_cli_query_waits_for_a_live_index_run_to_finish() {
         Command::new(binary_path())
             .current_dir(dir)
             .args(["refs", "validateToken", "--relation", "calls"])
+            .env("CODE_GRAPH_INTERNAL", "0")
             .output()
     });
     // The run finishes: its edges are back, then the lock goes.
@@ -15734,8 +15741,11 @@ fn test_cli_query_waits_for_a_live_index_run_to_finish() {
     // whole 2 s the notice names.
     let _run = hold_index_run_lock(&project);
     let started = std::time::Instant::now();
-    let (stdout, stderr, code) =
-        run_cli(&project, &["refs", "validateToken", "--relation", "calls"]);
+    let (stdout, stderr, code) = run_cli_env(
+        &project,
+        &["refs", "validateToken", "--relation", "calls"],
+        &[NOT_INTERNAL],
+    );
     let waited = started.elapsed();
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("handleLogin"), "{stdout}");
@@ -15749,7 +15759,7 @@ fn test_cli_query_waits_for_a_live_index_run_to_finish() {
     );
 
     // `similar` opens the index with its vector tables, and waits the same.
-    let (_, stderr, _) = run_cli(&project, &["similar", "validateToken"]);
+    let (_, stderr, _) = run_cli_env(&project, &["similar", "validateToken"], &[NOT_INTERNAL]);
     assert!(
         stderr.contains("An index run is still writing this index"),
         "{stderr}"

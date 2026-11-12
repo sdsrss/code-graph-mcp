@@ -37,11 +37,13 @@ of the run. Queried 0.8 seconds into the same kind of run, `refs`, `impact`,
 (0.192.0: within 0.1 seconds), and so do `trace` and `similar` beside a
 held run lock; a `refs` asked 2.8 seconds in returned after 1.8 seconds with
 no line. `grep`, `health-check` and `stats` do not wait. Nor do the queries
-the plugin's hooks run (they set `CODE_GRAPH_INTERNAL=1` and kill a query
-after 1.5 to 2 seconds): beside a held run lock, the grep hooks' `show`
-answers in 6 ms, the Read hook's `overview` in 12 ms and the Stop hook's
-`refs` in 4 ms, as in 0.192.0, where waiting would have cost them the
-answer. On Windows the CLI cannot see a run
+the plugin runs with `CODE_GRAPH_INTERNAL=1`: its hooks, which kill a query
+after 1.5 to 5 seconds, and the code-graph command the grep hook rewrites a
+grep into. Beside a held run lock on flask (d086db85), waiting cost the
+hooks capped at 2 seconds or less their answer: the grep hooks' `show` came
+back "no hits" after 2.0 seconds, the Read hook's `overview` "unavailable",
+and the Stop hook's `refs` was killed at 1.5 seconds. Without the wait they
+answer in 6, 12 and 4 ms, as in 0.192.0. On Windows the CLI cannot see a run
 in flight (there is no run lock there) and answers at once, as before. This
 wait is the CLI's; the MCP server's waiting is unchanged.
 
@@ -61,8 +63,9 @@ the CLI prints "Ambiguous symbol 'h': 67 matches." with a list and exits 1;
 67."). A near match is now the answer only when it is the one production
 name among every matching row, read up to 200 (Not covered). The other way
 round, a production name past the first ten rows is now found: with
-`hello_world` in `src/` and ten test functions `ha` to `hj`, 0.192.0 said
-"Symbol not found: h" (exit 1) and now answers for `hello_world` (exit 0).
+`hello_world` in `src/` and ten test functions `ha` to `hj`, 0.192.0's
+`refs h` said "Symbol not found: h" and `callgraph h` "No call graph results
+for: h" (exit 1); both now answer for `hello_world` (exit 0).
 
 ### fix: same-named functions nested in different definitions are counted apart
 
@@ -122,8 +125,11 @@ re-run. A deleted file is not reported as a test gap: with this change alone,
   input, is still listed as a test to re-run until an index run drops it, as
   in 0.192.0 (gin: with `render/render_test.go` deleted, `affected
   render/text.go` lists it among its 36 tests).
-- The plugin's hook queries can still answer from a half-written index while
-  a run is going, as in 0.192.0.
+- The plugin's queries do not wait, so while a run is going they can still
+  answer from a half-written index, as in 0.192.0. That includes the ones
+  with time for the wait (the Edit hook's `impact` has 2.5 seconds, the
+  prompt hook's queries 3, session start's `map` 5) and a grep the grep hook
+  rewrites into a code-graph command, which runs in the model's own shell.
 - `impact --json` caller rows carry no node id or line, so the two nested
   `wrapper` callers are two identical rows; `callgraph --json` and the MCP
   rows carry `node_id`.

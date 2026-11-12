@@ -380,11 +380,13 @@ const INDEX_RUN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// check, while the query reads; and targets without the lock (non-Unix),
 /// where no run is ever seen in flight.
 ///
-/// The plugin's hooks run their queries with `CODE_GRAPH_INTERNAL=1` and kill
-/// each one after 1.5-2 s (cg-answer.js, stop-impact.js; session-init's `map`
-/// gets 5 s of a shared budget), so the wait would cost them the answer and the
-/// time. They answer at once, as before this wait existed (review R1 of
-/// 0.193.0).
+/// The plugin runs its queries with `CODE_GRAPH_INTERNAL=1`, and its hooks kill
+/// one after 1.5 to 5 s: at 2 s or less (cg-answer.js, stop-impact.js) the wait
+/// cost them the answer (review R1 of 0.193.0). All of them answer at once, as
+/// before this wait existed, including those with room for it (pre-edit-guide's
+/// `impact` 2.5 s, user-prompt-context 3 s, session-init's `map` 5 s) and the
+/// command pre-grep-guide rewrites a grep into: no added latency, and while a
+/// run is going, an answer from the half-written index.
 fn wait_for_index_run(db: &Database) {
     use crate::indexer::pipeline::index_run_in_flight;
     if std::env::var("CODE_GRAPH_INTERNAL").as_deref() == Ok("1") || !index_run_in_flight(db) {
