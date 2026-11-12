@@ -91,11 +91,18 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
     // has no business retiring a deletion from the graph anyway; the next real
     // index run does that. (Caught by the v0.127.0 pre-tag review — this
     // regression arrived with the refresh itself.)
-    let fresh_inputs: Vec<String> = raw
+    //
+    // Each input is normalized once, so a near-miss rebase notes it once.
+    let normalized: Vec<Result<String>> = raw
         .iter()
-        .filter_map(|r| normalize_user_path(project_root, r).ok())
+        .map(|r| normalize_user_path(project_root, r))
+        .collect();
+    let fresh_inputs: Vec<String> = normalized
+        .iter()
+        .filter_map(|n| n.as_ref().ok())
         .filter(|p| !p.is_empty())
         .filter(|p| project_root.join(p).exists())
+        .cloned()
         .collect();
     let freshness = refresh_input_files(&ctx.db, &ctx.project_root, &fresh_inputs);
     freshness.disclose();
@@ -109,9 +116,12 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
             .and_then(|v| serde_json::from_str(&v).ok())
             .unwrap_or_default();
     let mut dropped: HashMap<String, Vec<String>> = HashMap::new();
+    let known = |path: &str| -> Result<bool> {
+        Ok(queries::file_is_indexed(conn, path)? || deleted_record.iter().any(|(p, _)| p == path))
+    };
 
-    for r in &raw {
-        let norm = match normalize_user_path(project_root, r) {
+    for (r, norm) in raw.iter().zip(normalized) {
+        let mut norm = match norm {
             Ok(p) => p,
             Err(_) => {
                 if !not_indexed.contains(r) {
@@ -122,6 +132,18 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
         };
         if norm.is_empty() {
             continue;
+        }
+        // `git diff --name-only` prints root-relative paths from any directory,
+        // and the near-miss rebase takes the root reading only for a file that
+        // exists: a deleted one exists under neither reading. The index knows
+        // which one it held.
+        if !is_cwd_anchored(r) && !known(&norm)? {
+            if let Ok(root_reading) = normalize_user_path_from(project_root, project_root, r) {
+                if known(&root_reading)? {
+                    note_root_rebase(r, project_root);
+                    norm = root_reading;
+                }
+            }
         }
         if !queries::file_is_indexed(conn, &norm)? {
             if let Some((_, dependents)) = deleted_record.iter().find(|(path, _)| *path == norm) {

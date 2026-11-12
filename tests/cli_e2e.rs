@@ -814,6 +814,79 @@ fn test_cli_affected_names_a_deleted_files_dependents_after_the_index_dropped_it
     assert_eq!(recorded, None);
 }
 
+/// `affected --stdin --json` with the shell in `subdir`, fed `stdin`.
+fn affected_from_subdir_stdin(
+    project: &TempDir,
+    subdir: &str,
+    stdin: &str,
+) -> (serde_json::Value, String) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(binary_path())
+        .current_dir(project.path().join(subdir))
+        .args(["affected", "--stdin", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{stderr}");
+    let v = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {stderr}"));
+    (v, stderr)
+}
+
+// `git diff --name-only` prints root-relative paths from any directory. The
+// near-miss rebase takes the root reading only when that file exists, and a
+// deleted file exists under neither reading, so from `tests/` the deleted
+// `lib.py` was read as `tests/lib.py` and dropped: 0 tests where the root gives
+// 2. The index knows the root reading. An existing file's note printed twice.
+#[test]
+fn test_cli_affected_stdin_from_a_subdirectory_keeps_a_deleted_root_relative_path() {
+    let project = setup_deleted_dependency_project();
+    std::fs::remove_file(project.path().join("lib.py")).unwrap();
+    let (v, stderr) = affected_from_subdir_stdin(&project, "tests", "lib.py\n");
+    assert_eq!(
+        v["tests"],
+        serde_json::json!(["tests/test_app.py", "tests/test_lib.py"]),
+        "{v}"
+    );
+    assert_eq!(
+        stderr.matches("resolved against project root").count(),
+        1,
+        "{stderr}"
+    );
+
+    // Dropped from the index since: the deletion record answers the same.
+    let (_, stderr, code) = run_cli(&project, &["incremental-index", "--quiet", "--no-embed"]);
+    assert_eq!(code, 0, "{stderr}");
+    let (v, _) = affected_from_subdir_stdin(&project, "tests", "lib.py\n");
+    assert_eq!(
+        v["tests"],
+        serde_json::json!(["tests/test_app.py", "tests/test_lib.py"]),
+        "{v}"
+    );
+
+    // An existing file takes the rebase it took before, its note once.
+    let (v, stderr) = affected_from_subdir_stdin(&project, "tests", "app.py\n");
+    assert_eq!(v["tests"], serde_json::json!(["tests/test_app.py"]), "{v}");
+    assert_eq!(
+        stderr.matches("resolved against project root").count(),
+        1,
+        "{stderr}"
+    );
+    // An explicitly cwd-anchored path keeps its cwd reading.
+    let (v, _) = affected_from_subdir_stdin(&project, "tests", "./lib.py\n");
+    assert_eq!(v["not_indexed"], serde_json::json!(["./lib.py"]), "{v}");
+}
+
 #[test]
 fn test_cli_affected_blast_radius_disjoint_from_changed() {
     // F4: a changed file must never appear in affected_files. api.ts imports auth.ts;
