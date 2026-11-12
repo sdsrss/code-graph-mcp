@@ -880,11 +880,17 @@ pub enum FuzzyResolution {
 /// module exists to prevent, where the two copies gave opposite answers for one
 /// input. The MCP twin was regression-pinned; the CLI copy had zero tests.
 pub fn resolve_fuzzy(conn: &Connection, name: &str) -> Result<FuzzyResolution> {
-    let (candidates, test_code): (Vec<NameCandidate>, Vec<NameCandidate>) =
-        queries::find_functions_by_fuzzy_name(conn, name)?
-            .into_iter()
-            .filter(|c| is_selectable_definition(&c.file_path))
-            .partition(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path));
+    // Read past the ten rows a suggestion list shows: test code is filtered out
+    // below, and a pool cut before that filter made the one production row of
+    // ten the answer (flask `refs h` → `hello` among 49 `src/` names with an
+    // `h`, converge R8). A pool this query fills may still hold another
+    // production row past its end, so no near match is unique then.
+    let rows = queries::find_functions_by_fuzzy_name_up_to(conn, name, FUZZY_RESOLVE_ROWS)?;
+    let pool_is_cut = rows.len() >= FUZZY_RESOLVE_ROWS;
+    let (candidates, test_code): (Vec<NameCandidate>, Vec<NameCandidate>) = rows
+        .into_iter()
+        .filter(|c| is_selectable_definition(&c.file_path))
+        .partition(|c| !crate::domain::is_test_symbol(&c.name, &c.file_path));
 
     // Prefer exact name matches if any exist.
     let exact: Vec<NameCandidate> = candidates
@@ -916,12 +922,15 @@ pub fn resolve_fuzzy(conn: &Connection, name: &str) -> Result<FuzzyResolution> {
     }
     match candidates.len() {
         0 => Ok(FuzzyResolution::NotFound),
-        1 => Ok(FuzzyResolution::Unique(
+        1 if !pool_is_cut => Ok(FuzzyResolution::Unique(
             candidates.into_iter().next().unwrap().name,
         )),
         _ => Ok(FuzzyResolution::Ambiguous(candidates)),
     }
 }
+
+/// Rows [`resolve_fuzzy`] reads before it filters out test code.
+const FUZZY_RESOLVE_ROWS: usize = 200;
 
 #[cfg(test)]
 mod tests {
@@ -1208,6 +1217,83 @@ mod fuzzy_tests {
                 FuzzyResolution::Unique(n) => assert_eq!(n, "after_request", "{typed}"),
                 _ => panic!("{typed} must resolve to after_request"),
             }
+        }
+    }
+
+    /// Converge R8 (2026-11-12): the near-match rows stopped at ten BEFORE test
+    /// code was filtered out, so nine test names and one production name made
+    /// that one the answer: flask `refs h` and `callgraph h` answered for
+    /// `hello`, the one non-test name of ten rows, where 49 `src/` names hold an
+    /// `h`. A near match is the answer only when it is the one of every row.
+    #[test]
+    fn a_near_match_is_unique_only_among_every_matching_row() {
+        let test_fns: String = (b'a'..=b'i')
+            .map(|c| format!("fn h{}() {{}}\n", c as char))
+            .collect();
+        let (_p, _d, db) = indexed(&[
+            ("src/h_test.rs", test_fns.as_str()),
+            ("src/one.rs", "pub fn hzz() {}\n"),
+            ("src/two.rs", "pub fn hollow() {}\n"),
+        ]);
+        let rows = queries::find_functions_by_fuzzy_name(db.conn(), "h").unwrap();
+        let shown: Vec<&str> = rows.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            rows.len(),
+            10,
+            "precondition: the display rows are full: {shown:?}"
+        );
+        assert!(
+            !shown.contains(&"hollow") && shown.contains(&"hzz"),
+            "precondition: the second production name is past the display rows: {shown:?}"
+        );
+        match resolve_fuzzy(db.conn(), "h").unwrap() {
+            FuzzyResolution::Ambiguous(c) => {
+                let names: Vec<&str> = c.iter().map(|c| c.name.as_str()).collect();
+                assert!(
+                    names.contains(&"hzz") && names.contains(&"hollow"),
+                    "{names:?}"
+                );
+                assert!(
+                    !names.iter().any(|n| n.len() == 2),
+                    "test code is no candidate: {names:?}"
+                );
+            }
+            FuzzyResolution::Unique(n) => panic!("answered for {n}, one of two production names"),
+            FuzzyResolution::NotFound => panic!("two production names match"),
+        }
+        // Control: with every row in view, one production name is the answer.
+        let (_p2, _d2, db2) = indexed(&[
+            ("src/h_test.rs", test_fns.as_str()),
+            ("src/one.rs", "pub fn hzz() {}\n"),
+        ]);
+        assert!(matches!(
+            resolve_fuzzy(db2.conn(), "h").unwrap(),
+            FuzzyResolution::Unique(n) if n == "hzz"
+        ));
+        // A pool that fills its rows proves no uniqueness either: the second
+        // production name is past its end.
+        let many: String = (0..FUZZY_RESOLVE_ROWS - 1)
+            .map(|i| format!("fn h{i:03}() {{}}\n"))
+            .collect();
+        let (_p3, _d3, db3) = indexed(&[
+            ("src/h_test.rs", many.as_str()),
+            ("src/one.rs", "pub fn hzzzz() {}\n"),
+            ("src/two.rs", "pub fn hzzzzzzz() {}\n"),
+        ]);
+        match resolve_fuzzy(db3.conn(), "h").unwrap() {
+            FuzzyResolution::Ambiguous(c) => {
+                assert_eq!(
+                    c.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                    ["hzzzz"]
+                );
+            }
+            other => panic!(
+                "a full pool answered {}",
+                match other {
+                    FuzzyResolution::Unique(n) => format!("Unique({n})"),
+                    _ => "NotFound".into(),
+                }
+            ),
         }
     }
 

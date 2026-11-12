@@ -69,7 +69,10 @@ pub use routes::{
 };
 #[cfg(test)]
 pub use search::fts5_search_with_tests;
-pub use search::{find_functions_by_fuzzy_name, fts5_search, FtsResult, NameCandidate};
+pub use search::{
+    find_functions_by_fuzzy_name, find_functions_by_fuzzy_name_up_to, fts5_search, FtsResult,
+    NameCandidate,
+};
 pub use vectors::{
     any_node_vector, compact_node_vectors, compact_node_vectors_if_wasteful,
     count_nodes_with_vectors, count_unembedded_nodes, delete_node_vectors_batch,

@@ -574,9 +574,20 @@ const FUZZY_EDIT_DISTANCE_SQL: &str = "SELECT DISTINCT n.name, f.path, n.type, n
          ORDER BY n.id
          LIMIT 5000";
 
+/// The definitions named like `partial_name`, best first, at most ten: the
+/// rows a "did you mean" list shows.
 pub fn find_functions_by_fuzzy_name(
     conn: &Connection,
     partial_name: &str,
+) -> Result<Vec<NameCandidate>> {
+    find_functions_by_fuzzy_name_up_to(conn, partial_name, 10)
+}
+
+/// [`find_functions_by_fuzzy_name`] with `limit` rows at most.
+pub fn find_functions_by_fuzzy_name_up_to(
+    conn: &Connection,
+    partial_name: &str,
+    limit: usize,
 ) -> Result<Vec<NameCandidate>> {
     // Phase 1: LIKE-based substring + token matching (fast path)
     let escaped = escape_like(partial_name);
@@ -603,14 +614,14 @@ pub fn find_functions_by_fuzzy_name(
                 ELSE 2
            END,
            LENGTH(n.name)
-         LIMIT 10";
+         LIMIT ?5";
     let mut stmt = conn.prepare(sql)?;
     // ?2 is the raw name for the exact-equality bucket (`=` treats %/_ literally);
     // ?4 is the %/_-escaped form for the prefix-LIKE bucket, so a query containing
     // a wildcard char cannot mis-bucket names via the ordering LIKE (matches the
     // WHERE clause, which already escapes). Ordering-only fix; result set unchanged.
     let rows = stmt.query_map(
-        rusqlite::params![pattern, partial_name, token_pattern, escaped],
+        rusqlite::params![pattern, partial_name, token_pattern, escaped, limit as i64],
         |row| {
             Ok(NameCandidate {
                 name: row.get(0)?,
@@ -654,7 +665,7 @@ pub fn find_functions_by_fuzzy_name(
         }
     }
     scored.sort_by_key(|(dist, c)| (*dist, c.name.len()));
-    scored.truncate(10);
+    scored.truncate(limit);
     Ok(scored.into_iter().map(|(_, c)| c).collect())
 }
 
