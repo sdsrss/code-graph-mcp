@@ -15387,3 +15387,117 @@ fn test_cli_query_waits_for_a_live_index_run_to_finish() {
         "{stderr}"
     );
 }
+
+/// A Rust project whose `src/lib.rs` is `lib`, indexed.
+fn setup_rust_lib(lib: &str) -> TempDir {
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"k\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(project.path().join("src/lib.rs"), lib).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+/// The ids of the definitions named `qualified`, in source order.
+fn node_ids_by_line(project: &TempDir, qualified: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open(project.path().join(".code-graph/index.db")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id FROM nodes WHERE qualified_name = ?1 ORDER BY start_line")
+        .unwrap();
+    stmt.query_map([qualified], |r| r.get::<_, i64>(0))
+        .unwrap()
+        .map(|id| id.unwrap().to_string())
+        .collect()
+}
+
+/// D#441 (converge R8, gin `Error.JSON`): `show --node-id N --impact` seeded the
+/// caller walk with N's name and file, so it counted every same-named
+/// definition's callers in that file: 3 direct where `impact --node-id N` and
+/// MCP `get_ast_node` said 1.
+#[test]
+fn test_cli_show_node_id_impact_counts_only_that_definitions_callers() {
+    let project = setup_rust_lib(
+        "pub struct A;\npub struct B;\n\
+         impl A {\n    pub fn run(&self) -> i32 {\n        1\n    }\n}\n\
+         impl B {\n    pub fn run(&self) -> i32 {\n        2\n    }\n}\n\
+         pub fn use_a() -> i32 {\n    A::run(&A)\n}\n\
+         pub fn use_b1() -> i32 {\n    B::run(&B)\n}\n\
+         pub fn use_b2() -> i32 {\n    B::run(&B)\n}\n",
+    );
+    let a = node_ids_by_line(&project, "A.run").remove(0);
+    let (stdout, stderr, code) = run_cli(&project, &["impact", "--node-id", &a]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("1 direct,"), "{stdout}");
+    let (stdout, stderr, code) =
+        run_cli(&project, &["show", "--node-id", &a, "--impact", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v[0]["impact"]["direct_callers"], 1, "{stdout}");
+    let (stdout, _, _) = run_cli(&project, &["show", "--node-id", &a, "--impact"]);
+    assert!(stdout.contains("Impact: LOW — 1 direct"), "{stdout}");
+    // The same after a refresh re-indexed the file.
+    let mut lib = std::fs::OpenOptions::new()
+        .append(true)
+        .open(project.path().join("src/lib.rs"))
+        .unwrap();
+    std::io::Write::write_all(&mut lib, b"// edited\n").unwrap();
+    drop(lib);
+    let (stdout, stderr, code) =
+        run_cli(&project, &["show", "--node-id", &a, "--impact", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v[0]["name"], "A.run", "{stdout}");
+    assert_eq!(
+        v[0]["impact"]["direct_callers"], 1,
+        "after a refresh: {stdout}"
+    );
+
+    // By name, each definition's walk starts from every definition of its name
+    // in its file, as MCP get_ast_node's does for a name.
+    let (stdout, stderr, code) = run_cli(
+        &project,
+        &["show", "run", "--file", "src/lib.rs", "--impact", "--json"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let direct: Vec<_> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["impact"]["direct_callers"].clone())
+        .collect();
+    assert_eq!(direct, [3, 3], "{stdout}");
+}
+
+/// D#441: after a refresh re-indexed its file, `show --node-id` re-found the
+/// node as the FIRST definition sharing its identity, so the second of two
+/// `#[cfg]` twins printed the first one's lines and walked its callers.
+#[test]
+fn test_cli_show_node_id_keeps_its_place_among_twins_after_a_refresh() {
+    let project = setup_rust_lib(
+        "#[cfg(unix)]\npub fn f() -> i32 {\n    1\n}\n\n\
+         #[cfg(not(unix))]\npub fn f() -> i32 {\n    2\n}\n",
+    );
+    let twins = node_ids_by_line(&project, "f");
+    assert_eq!(twins.len(), 2, "precondition: two twins");
+    let mut lib = std::fs::OpenOptions::new()
+        .append(true)
+        .open(project.path().join("src/lib.rs"))
+        .unwrap();
+    std::io::Write::write_all(&mut lib, b"// edited\n").unwrap();
+    drop(lib);
+    let (stdout, stderr, code) = run_cli(&project, &["show", "--node-id", &twins[1], "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        v[0]["start_line"], 7,
+        "the second twin, not the first: {stdout}"
+    );
+}

@@ -297,6 +297,23 @@ pub(crate) fn resolve_show_nodes(
     Ok(nodes)
 }
 
+/// Where `show --impact` starts the caller walk for `node`: that node when
+/// `--node-id` named it (`impact_node`), else every definition of its name in
+/// `file`, as MCP `get_ast_node` does for a name.
+fn impact_seed<'a>(
+    impact_node: Option<i64>,
+    node: &'a queries::NodeResult,
+    file: &'a str,
+) -> crate::graph::query::CallGraphSeed<'a> {
+    match impact_node {
+        Some(id) if id == node.id => crate::graph::query::CallGraphSeed::Node(id),
+        _ => crate::graph::query::CallGraphSeed::Name {
+            name: &node.name,
+            file_path: Some(file),
+        },
+    }
+}
+
 pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
     let json_mode = args.json;
     let compact = args.compact;
@@ -351,6 +368,13 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
     let ctx = CliContext::open(project_root)?;
     let conn = ctx.db.conn();
 
+    // The one definition `--impact` walks the callers of, as `impact --node-id`
+    // does: set only when `--node-id` named it and it was re-found at its own
+    // place. Without it the walk starts from every definition of the node's
+    // name in its file, which counted gin `errorMsgs.JSON`'s callers as
+    // `Error.JSON`'s (D#441).
+    let mut impact_node: Option<i64> = None;
+
     // Resolve node(s): by --node-id, or by positional symbol name
     let nodes_with_paths: Vec<(queries::NodeResult, String)> = if let Some(nid) = node_id_arg {
         match queries::get_node_with_file_by_id(conn, nid)? {
@@ -363,21 +387,46 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
             //
             // Re-resolve by identity, never by id: ids are rowid-scoped and a
             // re-index reuses freed ones — see `resolve::reresolve_node_by_identity`.
+            // And at the node's place among the definitions sharing that
+            // identity (`#[cfg]` twins, overloads), as `CliNodeTarget` does: the
+            // first of them printed the other twin's lines (D#441).
             Some(nwf) => {
+                let identity_group = || {
+                    crate::resolve::identity_group_ids(
+                        conn,
+                        &nwf.file_path,
+                        &nwf.node.name,
+                        nwf.node.qualified_name.as_deref(),
+                        &nwf.node.node_type,
+                    )
+                };
+                let before = identity_group()?;
+                let at = before.iter().position(|&id| id == nid).unwrap_or(0);
                 let outcome = refresh_files_if_stale(
                     &ctx.db,
                     &ctx.project_root,
                     std::slice::from_ref(&nwf.file_path),
                 );
                 let resolved = if outcome.any_changed {
-                    crate::resolve::reresolve_node_by_identity(
-                        conn,
-                        &nwf.file_path,
-                        &nwf.node.name,
-                        nwf.node.qualified_name.as_deref(),
-                        &nwf.node.node_type,
-                    )?
+                    let after = identity_group()?;
+                    match after.get(at).filter(|_| after.len() == before.len()) {
+                        Some(&id) => {
+                            impact_node = Some(id);
+                            queries::get_node_with_file_by_id(conn, id)?
+                        }
+                        // A group that grew or shrank has no such place: the
+                        // first definition is shown, and its walk starts from
+                        // the name.
+                        None => crate::resolve::reresolve_node_by_identity(
+                            conn,
+                            &nwf.file_path,
+                            &nwf.node.name,
+                            nwf.node.qualified_name.as_deref(),
+                            &nwf.node.node_type,
+                        )?,
+                    }
                 } else {
+                    impact_node = Some(nid);
                     Some(nwf)
                 };
                 outcome.disclose();
@@ -584,7 +633,7 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
                 // Shared prod/test partition + risk (graph::impact) — same source as
                 // `cmd_impact`/MCP get_ast_node. Trusts the AST `is_test` flag so inline
                 // `#[cfg(test)]` unit tests don't inflate the prod count / risk level.
-                let caller_set = crate::graph::routes::get_callers_with_route_info(conn, &node.name, Some(fp.as_str()), 3, SHOW_IMPACT_MIN_CONF_RANK)?;
+                let caller_set = crate::graph::routes::get_callers_with_route_info_seeded(conn, impact_seed(impact_node, node, fp), 3, SHOW_IMPACT_MIN_CONF_RANK)?;
                 let is_function_like = crate::domain::is_function_node_type(&node.node_type);
                 let cls = crate::graph::impact::classify_impact(&caller_set.callers, "behavior", is_function_like);
                 obj["impact"] = serde_json::json!({
@@ -686,10 +735,9 @@ pub fn cmd_show(project_root: &Path, args: ShowArgs) -> Result<()> {
         }
         let mut impact = String::new();
         if include_impact {
-            let caller_set = crate::graph::routes::get_callers_with_route_info(
+            let caller_set = crate::graph::routes::get_callers_with_route_info_seeded(
                 conn,
-                &node.name,
-                Some(fp.as_str()),
+                impact_seed(impact_node, node, fp),
                 3,
                 SHOW_IMPACT_MIN_CONF_RANK,
             )?;
