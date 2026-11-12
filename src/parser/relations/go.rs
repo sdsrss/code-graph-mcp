@@ -376,12 +376,195 @@ thread_local! {
     /// an 8.7 s index). Node ids are unique only within a tree: per file, reset
     /// by [`reset_go_file`].
     static GO_FN_LOCALS: RefCell<HashMap<usize, HashSet<String>>> = RefCell::new(HashMap::new());
+    /// The file's top-level functions and methods ([`go_value_call`]), in
+    /// source order. Per file: reset by [`reset_go_file`].
+    static GO_DECLS: RefCell<Vec<GoDecl>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Read the file's imports for [`go_package_call`]. MUST run once per file
-/// before its walk, whatever its language, so no file sees another's.
+/// A Go function or method declaration, for [`go_value_call`]. Both are only
+/// ever top-level, and Go records no call outside one, so the last declaration
+/// starting before a call holds it: found without climbing the tree.
+struct GoDecl {
+    start: usize,
+    /// The receiver's name and the type it is declared with (`c`, `Context`
+    /// for `func (c *Context)`).
+    receiver: Option<(String, String)>,
+    /// Every name it declares besides the receiver, in any block: parameters,
+    /// named results, `:=` / `var` / `range` targets, type switch aliases,
+    /// select-case values and func literal parameters. One of these may be a
+    /// variable of another type under the receiver's name.
+    declared: HashSet<String>,
+    /// The bare names it assigns with `=`. Such a name is a variable, but
+    /// assigning keeps its type (`r.f = x` and `*p = x` assign neither).
+    assigned: HashSet<String>,
+}
+
+impl GoDecl {
+    fn of(decl: tree_sitter::Node, source: &str) -> Self {
+        let receiver = decl
+            .child_by_field_name("receiver")
+            .and_then(|list| list.named_child(0))
+            .filter(|p| p.kind() == "parameter_declaration")
+            .and_then(|p| {
+                let name = p.child_by_field_name("name")?;
+                let ty = go_embedded_type_name(&p.child_by_field_name("type")?, source)?;
+                Some((node_text(&name, source).to_string(), ty.to_string()))
+            });
+        let mut declared = HashSet::new();
+        let mut assigned = HashSet::new();
+        for field in ["parameters", "result"] {
+            if let Some(p) = decl.child_by_field_name(field) {
+                collect_go_idents(&p, source, &mut declared, 0);
+            }
+        }
+        if let Some(body) = decl.child_by_field_name("body") {
+            collect_go_body_names(&body, source, &mut declared, &mut assigned, 0);
+        }
+        GoDecl {
+            start: decl.start_byte(),
+            receiver,
+            declared,
+            assigned,
+        }
+    }
+}
+
+/// [`GoDecl`]'s `declared` and `assigned` names under `node`.
+fn collect_go_body_names(
+    node: &tree_sitter::Node,
+    source: &str,
+    declared: &mut HashSet<String>,
+    assigned: &mut HashSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_SUBTREE_DEPTH {
+        return;
+    }
+    let bare = |list: tree_sitter::Node, out: &mut HashSet<String>| {
+        let mut cursor = list.walk();
+        let names: Vec<_> = if list.kind() == "expression_list" {
+            list.named_children(&mut cursor).collect()
+        } else {
+            vec![list]
+        };
+        for n in names.into_iter().filter(|n| n.kind() == "identifier") {
+            out.insert(node_text(&n, source).to_string());
+        }
+    };
+    match node.kind() {
+        "short_var_declaration" | "range_clause" | "receive_statement" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                bare(left, declared);
+            }
+        }
+        "assignment_statement" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                bare(left, assigned);
+            }
+        }
+        "var_spec" => {
+            let mut cursor = node.walk();
+            for name in node.children_by_field_name("name", &mut cursor) {
+                bare(name, declared);
+            }
+        }
+        "type_switch_statement" => {
+            if let Some(alias) = node.child_by_field_name("alias") {
+                collect_go_idents(&alias, source, declared, 0);
+            }
+        }
+        "func_literal" => {
+            for field in ["parameters", "result"] {
+                if let Some(p) = node.child_by_field_name(field) {
+                    collect_go_idents(&p, source, declared, 0);
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_go_body_names(&child, source, declared, assigned, depth + 1);
+    }
+}
+
+/// What a Go `x.f()` call says of its receiver (R11), when `x` — the root of
+/// `x.f()`, `x.y.f()`, `x.g().f()`, `x[i].f()` — is a name the enclosing
+/// function or method binds:
+/// - `Typed(T)`: `x.f()` on the method's own receiver `x` of type `T`, which
+///   nothing in the method rebinds;
+/// - `Member`: any other such call — a method of a value whose type the
+///   source does not write here, never a free function.
+///
+/// None for a name nothing in the function binds: a package the imports
+/// spell another way, a package-level value, or a package call
+/// ([`go_package_call`]); those bind by name, as before.
+pub(super) enum GoValueCall {
+    Typed(String),
+    Member,
+}
+
+pub(super) fn go_value_call(call: &tree_sitter::Node, source: &str) -> Option<GoValueCall> {
+    let function = call
+        .child_by_field_name("function")
+        .filter(|f| f.kind() == "selector_expression")?;
+    let operand = function.child_by_field_name("operand")?;
+    let mut root = operand;
+    for _ in 0..MAX_SUBTREE_DEPTH {
+        let inner = match root.kind() {
+            "selector_expression" | "index_expression" | "type_assertion_expression" => {
+                root.child_by_field_name("operand")
+            }
+            "call_expression" => root.child_by_field_name("function"),
+            "parenthesized_expression" => root.named_child(0),
+            "unary_expression" => root.child_by_field_name("operand"),
+            _ => break,
+        };
+        match inner {
+            Some(n) => root = n,
+            None => break,
+        }
+    }
+    if root.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&root, source);
+    let at = call.start_byte();
+    GO_DECLS.with(|decls| {
+        let decls = decls.borrow();
+        let i = decls.partition_point(|d| d.start <= at).checked_sub(1)?;
+        let decl = decls.get(i)?;
+        let receiver = decl.receiver.as_ref().filter(|(r, _)| r == name);
+        match receiver {
+            Some((_, ty)) if !decl.declared.contains(name) && root.id() == operand.id() => {
+                Some(GoValueCall::Typed(ty.clone()))
+            }
+            Some(_) => Some(GoValueCall::Member),
+            None if decl.declared.contains(name) || decl.assigned.contains(name) => {
+                Some(GoValueCall::Member)
+            }
+            None => None,
+        }
+    })
+}
+
+/// Read the file's imports for [`go_package_call`] and its declarations for
+/// [`go_value_call`]. MUST run once per file before its walk, whatever its
+/// language, so no file sees another's.
 pub(super) fn reset_go_file(root: tree_sitter::Node, source: &str, family: &str) {
     GO_FN_LOCALS.with(|m| m.borrow_mut().clear());
+    GO_DECLS.with(|d| {
+        let mut decls = d.borrow_mut();
+        decls.clear();
+        if family == "go" {
+            let mut cursor = root.walk();
+            decls.extend(
+                root.named_children(&mut cursor)
+                    .filter(|n| matches!(n.kind(), "function_declaration" | "method_declaration"))
+                    .map(|n| GoDecl::of(n, source)),
+            );
+        }
+    });
     let mut imports = HashMap::new();
     if family == "go" {
         let mut decls = root.walk();

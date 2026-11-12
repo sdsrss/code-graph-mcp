@@ -513,7 +513,7 @@ pub(super) fn resolve_pending_calls_touching(
         let resolved: Vec<i64> = match parse_callee_metadata(row.metadata.as_deref()) {
             Some(meta @ (CalleeMeta::RecvType(_) | CalleeMeta::SuperType(_))) => {
                 let (t, dispatch) = match meta {
-                    CalleeMeta::RecvType(t) => (t, true),
+                    CalleeMeta::RecvType(t) => (t, recv_type_dispatches(&row.source_language)),
                     CalleeMeta::SuperType(t) => (t, false),
                     _ => unreachable!("matched above"),
                 };
@@ -4746,6 +4746,14 @@ pub(super) fn ambiguous_meta(metadata: &str) -> String {
         }
         _ => crate::domain::CALL_META_MEMBER.to_string(),
     }
+}
+
+/// Whether a call on a receiver of known type (`CalleeMeta::RecvType`) also
+/// runs its subclasses' overrides. Not in Go: the receiver's static type fixes
+/// its method set, and a type embedding it (an `inherits` edge) that declares
+/// the same method is never reached through it (R11).
+pub(super) fn recv_type_dispatches(language: &str) -> bool {
+    language != "go"
 }
 
 /// What a call on a receiver of class `ty` (`CalleeMeta::RecvType`) binds.

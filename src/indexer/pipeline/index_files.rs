@@ -5020,7 +5020,9 @@ fn resolve_deferred_relations(
                 }
                 Some(meta @ (CalleeMeta::RecvType(_) | CalleeMeta::SuperType(_))) => {
                     let (recv_type, dispatch) = match meta {
-                        CalleeMeta::RecvType(t) => (t, true),
+                        CalleeMeta::RecvType(t) => {
+                            (t, super::resolve::recv_type_dispatches(&d.language))
+                        }
                         CalleeMeta::SuperType(t) => (t, false),
                         _ => unreachable!("matched above"),
                     };

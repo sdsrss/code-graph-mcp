@@ -1068,6 +1068,9 @@ pub(super) fn js_imported_from_package(name: &str) -> bool {
 
 /// Whether the call node is a member call on an object (see module docs).
 pub(super) fn is_member_call(call: tree_sitter::Node, source: &str, family: &str) -> bool {
+    if family == "go" {
+        return super::go::go_value_call(&call, source).is_some();
+    }
     let Some(function) = super::helpers::call_function(&call) else {
         return false;
     };

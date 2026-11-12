@@ -1777,8 +1777,8 @@ fn test_same_named_route_handlers_in_one_file_each_get_their_own_route() {
 /// `template.New(...)` reached gin's own `New` (48 of its 202 callers), from its
 /// own file at `extracted`. The import path picks the package directory through
 /// go.mod; a path outside the module (the standard library) names no project
-/// function. A file shadowing the package name with a local keeps the old
-/// by-name answer.
+/// function. A local shadowing the package name is a value: a call on it binds
+/// a method by name, never a free function (R11).
 #[test]
 fn test_go_package_call_binds_the_package_its_import_path_names() {
     let files: &[(&str, &str)] = &[
@@ -1815,9 +1815,74 @@ fn test_go_package_call_binds_the_package_its_import_path_names() {
         .unwrap();
     assert_eq!(confidence, "inferred");
     assert_eq!(callees_of(&db, "Use"), ["app.go.New"]);
+    assert_eq!(callees_of(&db, "Shadow"), ["sub/sub.go.T.Helper"]);
+}
+
+/// R11: a call on a Go method's receiver runs a method of the receiver's
+/// type: its own, else one its embedded types promote. Go has no virtual
+/// dispatch, so a type embedding it and declaring the same method is never
+/// reached through it. Bound by bare name, gin's `msg.JSON()` in
+/// `Error.MarshalJSON` reached `errorMsgs.JSON` too, and `s.Helper()` could
+/// reach a free function `Helper`.
+const GO_RECEIVER_FILES: &[(&str, &str)] = &[
+    ("go.mod", "module example.com/app\n"),
+    (
+        "errors.go",
+        "package app\n\ntype Error struct{}\ntype errorMsgs []*Error\n\n\
+         func (msg *Error) JSON() any { return nil }\n\
+         func (msg *Error) MarshalJSON() { msg.JSON() }\n\
+         func (a errorMsgs) JSON() any { return nil }\n\
+         func (a errorMsgs) MarshalJSON() { a.JSON() }\n",
+    ),
+    (
+        "embed.go",
+        "package app\n\ntype Base struct{}\ntype Sub struct{ Base }\n\n\
+         func (b *Base) Run() {}\n\
+         func (b *Base) Helper() { b.Run() }\n\
+         func (s *Sub) Run() { s.Helper() }\n\
+         func Helper() {}\n",
+    ),
+];
+
+fn go_callees_of(db: &Database, caller: &str) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT nt.qualified_name FROM edges e \
+             JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON nt.id = e.target_id \
+             WHERE e.relation = 'calls' AND ns.qualified_name = ?1 ORDER BY 1",
+        )
+        .unwrap();
+    let rows = stmt.query_map([caller], |r| r.get::<_, String>(0)).unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+#[test]
+fn test_go_call_on_the_receiver_binds_its_types_method() {
+    let (_p, _d, db) = fresh_index_of(GO_RECEIVER_FILES);
+    assert_eq!(go_callees_of(&db, "Error.MarshalJSON"), ["Error.JSON"]);
     assert_eq!(
-        callees_of(&db, "Shadow"),
-        ["sub/sub.go.Helper", "sub/sub.go.T.Helper"]
+        go_callees_of(&db, "errorMsgs.MarshalJSON"),
+        ["errorMsgs.JSON"]
+    );
+    assert_eq!(go_callees_of(&db, "Base.Helper"), ["Base.Run"]);
+    assert_eq!(go_callees_of(&db, "Sub.Run"), ["Base.Helper"]);
+    // The method's own file ahead of a batch boundary or after it, and the
+    // promoted method's type arriving later, bind as a rebuild does.
+    assert_incremental_matches_rebuild(
+        &GO_RECEIVER_FILES[..2],
+        &[("embed.go", Some(GO_RECEIVER_FILES[2].1))],
+    );
+    assert_incremental_matches_rebuild(
+        GO_RECEIVER_FILES,
+        &[(
+            "embed.go",
+            Some(
+                "package app\n\ntype Base struct{}\ntype Sub struct{ Base }\n\n\
+                  func (s *Sub) Run() { s.Helper() }\n\
+                  func Helper() {}\n",
+            ),
+        )],
     );
 }
 

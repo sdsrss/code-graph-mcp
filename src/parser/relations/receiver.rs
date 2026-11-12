@@ -26,6 +26,10 @@ pub(super) fn receiver_type(call: tree_sitter::Node, source: &str, family: &str)
     match family {
         "cpp" => cpp_receiver_type(function, source),
         "javascript" | "typescript" | "tsx" => js_receiver_type(function, source),
+        "go" => match super::go::go_value_call(&call, source)? {
+            super::go::GoValueCall::Typed(ty) => Some(ty),
+            super::go::GoValueCall::Member => None,
+        },
         _ => None,
     }
 }

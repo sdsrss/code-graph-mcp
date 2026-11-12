@@ -755,7 +755,10 @@ fn test_go_package_call_carries_its_import_path() {
         meta_of(&calls, "Valid"),
         Some(pkg("encoding/json").as_str())
     );
-    for value_call in ["Foo", "Bar", "Baz"] {
+    // A call on a value is a member call (R11); one through a blank or dot
+    // import binds by name.
+    assert_eq!(meta_of(&calls, "Foo"), Some(MEMBER));
+    for value_call in ["Bar", "Baz"] {
         assert_eq!(meta_of(&calls, value_call), None, "{value_call}");
     }
 }
@@ -775,12 +778,79 @@ fn test_go_package_call_operand_bound_anywhere_in_the_function_is_a_value() {
         "go",
     );
     for value_call in ["Infof", "Warnf", "Helper"] {
-        assert_eq!(meta_of(&calls, value_call), None, "{value_call}");
+        assert_eq!(meta_of(&calls, value_call), Some(MEMBER), "{value_call}");
     }
     assert_eq!(
         meta_of(&calls, "Printf"),
         Some(r#"{"q":"gopkg","v":"log"}"#)
     );
+}
+
+/// R11: a Go method's receiver has the type its declaration writes, so a
+/// call on it carries that type; a call on any other value the function binds
+/// is a method call on a value of unwritten type (`member`), which never runs
+/// a free function. Bound by bare name, gin's `msg.JSON()` in
+/// `Error.MarshalJSON` reached `errorMsgs.JSON` beside `Error.JSON`, and
+/// `remoteIP.String()` (a `net.IP`) reached `Context.String`.
+#[test]
+fn test_go_call_on_a_value_carries_its_receiver() {
+    let calls = call_meta(
+        "package p\n\nimport \"net\"\n\n\
+         func (msg *Error) MarshalJSON() { msg.JSON() }\n\
+         func (s *Set[T]) Add() { s.grow() }\n\
+         func (a errorMsgs) Last() { a.First().Pick(); a[0].Index() }\n\
+         func (c *Context) ClientIP() { remoteIP := net.ParseIP(\"\"); remoteIP.String(); c.engine.Trusted() }\n\
+         func (c *Context) Shadow() { if true { c := other(); c.Shadowed() } }\n\
+         func (c *Context) Lit() { go func(c *Other) { c.InLiteral() }(nil) }\n\
+         func (c *Context) Later() { defer func() { c.Captured() }() }\n\
+         func Free(x *Context) (r Reader) { x.OnParam(); r.OnResult() }\n\
+         func Global() { Validator.Validate() }\n\
+         func (r Reader) Render() { r.Headers = nil; r.WriteContentType() }\n\
+         func (x *FOO) UnmarshalJSON() { x.Descriptor(); *x = FOO(1) }\n\
+         func Assign() { Engine = nil; Engine.OnAssigned(); net.Flag = 1; net.Dial() }\n\
+         func (n *node) Walk() { n = n.next; n.Visit() }\n\
+         func (r AsciiJSON) Render() { r.Before(); for _, r := range s { _ = r } }\n\
+         func V() { var w Writer; w.Flush() }\n",
+        "go",
+    );
+    let rtype = |t: &str| format!(r#"{{"q":"rtype","v":"{t}"}}"#);
+    assert_eq!(meta_of(&calls, "JSON"), Some(rtype("Error").as_str()));
+    assert_eq!(meta_of(&calls, "grow"), Some(rtype("Set").as_str()));
+    assert_eq!(meta_of(&calls, "Captured"), Some(rtype("Context").as_str()));
+    assert_eq!(meta_of(&calls, "First"), Some(rtype("errorMsgs").as_str()));
+    // Assigning to a field of the receiver, or through it, keeps its type.
+    assert_eq!(
+        meta_of(&calls, "WriteContentType"),
+        Some(rtype("Reader").as_str())
+    );
+    assert_eq!(meta_of(&calls, "Descriptor"), Some(rtype("FOO").as_str()));
+    // So does assigning the receiver itself: `=` never changes a type.
+    assert_eq!(meta_of(&calls, "Visit"), Some(rtype("node").as_str()));
+    for member in [
+        "Pick",
+        "Index",
+        "String",
+        "Trusted",
+        "Shadowed",
+        "InLiteral",
+        "OnParam",
+        "OnResult",
+        "OnAssigned",
+        "Before",
+        "Flush",
+    ] {
+        assert_eq!(meta_of(&calls, member), Some(MEMBER), "{member}");
+    }
+    // A name no function binds may be a package the imports do not spell, or
+    // a package-level value: bound by name, as before.
+    assert_eq!(meta_of(&calls, "Validate"), None);
+    assert_eq!(
+        meta_of(&calls, "ParseIP"),
+        Some(r#"{"q":"gopkg","v":"net"}"#)
+    );
+    // `net.Flag = 1` assigns a package's variable, not `net`: no member call
+    // (D#789 leaves it bound by name).
+    assert_eq!(meta_of(&calls, "Dial"), None);
 }
 
 #[test]
