@@ -4526,6 +4526,54 @@ fn resolve_deferred_relations(
             }
         }
 
+        // A supertype a JS/TS file imports (R11, parser
+        // `member::js_heritage_import`): what the export walk resolves the
+        // import to in the file its specifier names, a class or interface
+        // whatever name it is exported under (hono's `export { Hono as
+        // HonoBase }`). The walk is a function of the files, and a run that
+        // moves the export or the file re-extracts the importer (the D#740
+        // fan-out), as for its `imports` edge. With no answer, by name below.
+        if d.relation == REL_INHERITS || d.relation == REL_IMPLEMENTS {
+            if let Some(CalleeMeta::Import { module, export }) =
+                parse_callee_metadata(d.metadata.as_deref())
+            {
+                if let Some(file) = resolve_js_specifier_path(&module, &d.rel_path, all_file_paths)
+                {
+                    if let Some((targets, _)) = super::js_exports::js_import_edge_targets(
+                        db.conn(),
+                        &mut js_exports,
+                        &file,
+                        &export,
+                        all_file_paths,
+                        &name_to_ids,
+                        &node_id_to_path,
+                    )? {
+                        if callable_ids.is_none() {
+                            callable_ids =
+                                Some(crate::storage::queries::callable_node_ids(db.conn())?);
+                        }
+                        let callables = callable_ids.as_ref().expect("loaded above");
+                        let targets: Vec<i64> = targets
+                            .into_iter()
+                            .filter(|id| !callables.contains(id))
+                            .collect();
+                        if !targets.is_empty() {
+                            edges_created += insert_relation_edges(
+                                db,
+                                &mut written,
+                                &source_ids,
+                                &targets,
+                                &d.relation,
+                                d.metadata.as_deref(),
+                                false,
+                            )?;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
         let import_meta: Option<serde_json::Value> = if d.relation == REL_IMPORTS {
             d.metadata
                 .as_deref()

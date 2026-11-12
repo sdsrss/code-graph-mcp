@@ -460,6 +460,62 @@ pub(super) fn js_renamed_import_call(
     None
 }
 
+/// The export and specifier of the named import that a JS/TS class heritage
+/// name is bound by (R11): `extends B` after `import { a as B } from './x'` →
+/// (`a`, `./x`). Only a relative specifier, which the export walk follows to
+/// the file it names and through that file's re-exports and aliases
+/// (`js_exports.rs`); and only where no scope between the class and the
+/// program declares `B`. Hono's `export { Hono as HonoBase }` is such an
+/// alias: no node is named `HonoBase`, so by name `extends HonoBase` bound
+/// nothing.
+pub(super) fn js_heritage_import(
+    class: tree_sitter::Node,
+    name: &str,
+    source: &str,
+    family: &str,
+) -> Option<(String, String)> {
+    if !matches!(family, "javascript" | "typescript" | "tsx") {
+        return None;
+    }
+    let spec = IMPORT_BOUND.with(|b| b.borrow().get(name).cloned().flatten())?;
+    if !(spec.starts_with("./") || spec.starts_with("../")) {
+        return None;
+    }
+    let mut child = class;
+    let program = loop {
+        let scope = child.parent()?;
+        if scope.kind() == "program" {
+            break scope;
+        }
+        if binding_in(scope, child, name, source).is_some() {
+            return None;
+        }
+        child = scope;
+    };
+    let mut cursor = program.walk();
+    let statements: Vec<_> = program
+        .named_children(&mut cursor)
+        .filter(|n| n.kind() == "import_statement")
+        .collect();
+    for statement in statements {
+        let mut stack = vec![statement];
+        while let Some(n) = stack.pop() {
+            if n.kind() == "import_specifier" {
+                let export = n.child_by_field_name("name");
+                let local = n.child_by_field_name("alias").or(export);
+                if local.is_some_and(|l| node_text(&l, source) == name) {
+                    let module = js_import_specifier(n, source)?;
+                    return Some((node_text(&export?, source).to_string(), module));
+                }
+                continue;
+            }
+            let mut inner = n.walk();
+            stack.extend(n.named_children(&mut inner));
+        }
+    }
+    None
+}
+
 /// JS/Node built-in globals: a member call on one (`Object.create`, `JSON.parse`)
 /// runs no project code.
 const JS_BUILTIN_GLOBALS: &[&str] = &[

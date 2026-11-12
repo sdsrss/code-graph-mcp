@@ -853,6 +853,52 @@ fn test_go_call_on_a_value_carries_its_receiver() {
     assert_eq!(meta_of(&calls, "Dial"), None);
 }
 
+/// R11: a JS/TS class heritage name bound by a named import of a relative
+/// path carries the import, so the resolver can follow the export the named
+/// file gives that name: hono's `export { Hono as HonoBase }` left the three
+/// `extends HonoBase` with no edge, there being no node named `HonoBase`. A
+/// package's import, a name a nearer scope declares and a name no import binds
+/// carry nothing and bind by name, as before.
+#[test]
+fn test_js_heritage_through_an_import_carries_it() {
+    let rels = extract_relations(
+        "import { HonoBase } from './hono-base'\n\
+         import { Base as B } from '../base'\n\
+         import type { Iface } from './iface'\n\
+         import { Pkg } from 'pkg'\n\
+         export class Hono extends HonoBase<E> {}\n\
+         class R extends B implements Iface {}\n\
+         class P extends Pkg {}\n\
+         function f() { const HonoBase = class {}; class Inner extends HonoBase {} }\n\
+         class Local extends Other {}\n",
+        "typescript",
+    )
+    .unwrap();
+    let meta = |source: &str, relation: &str| -> Option<String> {
+        rels.iter()
+            .find(|r| r.source_name == source && r.relation == relation)
+            .unwrap_or_else(|| panic!("no {relation} of {source}"))
+            .metadata
+            .clone()
+    };
+    let imp = |module: &str, export: &str| {
+        Some(
+            serde_json::json!({
+                "q": crate::domain::CALL_Q_IMPORT,
+                "js_module": module,
+                "v": export,
+            })
+            .to_string(),
+        )
+    };
+    assert_eq!(meta("Hono", REL_INHERITS), imp("./hono-base", "HonoBase"));
+    assert_eq!(meta("R", REL_INHERITS), imp("../base", "Base"));
+    assert_eq!(meta("R", REL_IMPLEMENTS), imp("./iface", "Iface"));
+    for plain in ["P", "Inner", "Local"] {
+        assert_eq!(meta(plain, REL_INHERITS), None, "{plain}");
+    }
+}
+
 #[test]
 fn test_member_call_on_an_object_is_marked_member() {
     // D#86: `x.f()` on an object can only run a method, never a free function —

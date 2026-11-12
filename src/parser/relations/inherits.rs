@@ -200,6 +200,7 @@ fn extract_declaration_heritage(ctx: &HeritageCtx, results: &mut Vec<ParsedRelat
     else {
         return;
     };
+    let first = results.len();
     // extends / superclass (supports multiple inheritance)
     for parent in extract_superclasses(&ctx.node, ctx.source) {
         results.push(ParsedRelation {
@@ -213,6 +214,24 @@ fn extract_declaration_heritage(ctx: &HeritageCtx, results: &mut Vec<ParsedRelat
         });
     }
     extract_implements(&ctx.node, ctx.source, &cls, results);
+    // A supertype a JS/TS file imports binds what the import binds (R11).
+    for rel in &mut results[first..] {
+        if let Some((export, module)) = super::member::js_heritage_import(
+            ctx.node,
+            &rel.target_name,
+            ctx.source,
+            ctx.config.name,
+        ) {
+            rel.metadata = Some(
+                serde_json::json!({
+                    "q": crate::domain::CALL_Q_IMPORT,
+                    "js_module": module,
+                    "v": export,
+                })
+                .to_string(),
+            );
+        }
+    }
 }
 
 fn extract_cpp_heritage(ctx: &HeritageCtx, results: &mut Vec<ParsedRelation>) {

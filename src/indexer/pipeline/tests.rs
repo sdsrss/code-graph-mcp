@@ -1886,6 +1886,75 @@ fn test_go_call_on_the_receiver_binds_its_types_method() {
     );
 }
 
+/// R11: a JS/TS class extending a name it imports extends what that import
+/// binds, through the export walk: hono's `export { Hono as HonoBase }` gave
+/// `extends HonoBase` in hono.ts and the presets no edge, no node being named
+/// `HonoBase`. An incremental run that adds or drops the alias, or adds an
+/// importer, ends where a rebuild does.
+#[test]
+fn test_js_class_extends_through_an_export_alias() {
+    // A method sharing the class's name is no supertype.
+    const BASE: &str = "class Hono { Hono() { return 1 } }\nexport { Hono as HonoBase }\n";
+    const BASE_NO_ALIAS: &str = "export class Hono {}\n";
+    const IMPORTER: &str = "import { HonoBase } from './hono-base'\n\
+                            export class Hono extends HonoBase {}\n";
+    const TINY: &str = "import { HonoBase as Base } from '../hono-base'\n\
+                        export class Tiny extends Base {}\n";
+    let inherits = |db: &Database| -> Vec<String> {
+        graph_projection(db)
+            .1
+            .into_iter()
+            .filter(|(_, _, r, _, _)| r == crate::domain::REL_INHERITS)
+            .map(|(p, n, _, t, _)| format!("{p}:{n} -> {t}"))
+            .collect()
+    };
+    // A class elsewhere named like the local binding is not what it imports.
+    let (_p, _d, db) = fresh_index_of(&[
+        ("hono-base.ts", BASE),
+        ("hono.ts", IMPORTER),
+        ("preset/tiny.ts", TINY),
+        ("other/decoy.ts", "export class Base {}\n"),
+    ]);
+    assert_eq!(
+        inherits(&db),
+        [
+            "hono.ts:Hono -> hono-base.ts:Hono",
+            "preset/tiny.ts:Tiny -> hono-base.ts:Hono"
+        ]
+    );
+    let parity = |before: &[(&str, &str)], after: &[(&str, &str)]| {
+        let (project, _d, db) = fresh_index_of(before);
+        let mut tree: Vec<(&str, &str)> = before.to_vec();
+        for (path, body) in after {
+            let file = project.path().join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, body).unwrap();
+            tree.retain(|(p, _)| p != path);
+            tree.push((path, body));
+        }
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        let (_p2, _d2, control) = fresh_index_of(&tree);
+        assert_eq!(
+            graph_projection(&db),
+            graph_projection(&control),
+            "incremental after {after:?} must equal a rebuild"
+        );
+        inherits(&db)
+    };
+    let gained = parity(
+        &[("hono-base.ts", BASE_NO_ALIAS), ("hono.ts", IMPORTER)],
+        &[("hono-base.ts", BASE)],
+    );
+    assert_eq!(gained, ["hono.ts:Hono -> hono-base.ts:Hono"]);
+    let lost = parity(
+        &[("hono-base.ts", BASE), ("hono.ts", IMPORTER)],
+        &[("hono-base.ts", BASE_NO_ALIAS)],
+    );
+    assert!(lost.is_empty(), "{lost:?}");
+    let added = parity(&[("hono-base.ts", BASE)], &[("preset/tiny.ts", TINY)]);
+    assert_eq!(added, ["preset/tiny.ts:Tiny -> hono-base.ts:Hono"]);
+}
+
 /// D#789, the pending channel: a Go `pkg.F()` call left unbound is buffered
 /// with its import path, and the sweep that drains it once a namesake appears
 /// keeps the same package rule. `errors.New` stays unbound when the project
