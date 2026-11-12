@@ -1,5 +1,112 @@
 # Changelog
 
+## 0.193.0
+
+**Upgrading: no index rebuild, and a CLI query can now wait up to 2
+seconds.** `INDEX_VERSION` stays 140. On Linux and macOS, a CLI query that
+finds an index run writing the index (the plugin's session-start run, a CLI
+`incremental-index`, the MCP server's run) waits for it to finish, up to 2
+seconds; a run still going after that gets the answer anyway, with this on
+stderr: "[code-graph] An index run is still writing this index (waited 2 s);
+answers may miss the files and edges it has not finished. Rerun when it is
+done." 0.192.0 answered at once from the half-written index (below). Other
+answers change for scripts and MCP clients: a name that only near-matches can
+now be ambiguous (CLI exit 1 where it was 0), caller counts change where
+same-named functions are nested in different definitions, and `affected`
+answers for deleted files in more cases. To pin the binary back: `npm i -g
+@sdsrs/code-graph@0.192.0` (or, from source, `cargo install --locked --git
+https://github.com/sdsrss/code-graph-mcp --tag v0.192.0 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The one plugin
+script that changed, `pr-impact-comment.js`, is run only by this
+repository's PR workflow.
+
+### fix: a CLI query waits for an index run before answering
+
+A run rewrites the index file by file, and the edges into a file come back
+after it, so a query beside the run read a graph with parts missing and
+exited 0. Sampled about 300 times through one 4.3-second run (a 1,144-file
+tree with every source file edited), 0.192.0 answered `refs Database` with
+226 and then 2 references where the index holds 630, and `affected
+src/storage/db.rs` with 17 and then 0 tests where it holds 25, for one second
+of the run. Queried 0.8 seconds into the same kind of run, `refs`, `impact`,
+`callgraph`, `show`, `affected`, `search`, `map`, `overview`, `deps` and
+`dead-code` now return after 2.0 to 2.1 seconds with the stderr line
+(0.192.0: within 0.1 seconds); a `refs` asked 2.8 seconds in returned after
+1.8 seconds with no line. `grep` and `health-check` do not wait. On Windows
+the CLI cannot see a run in flight (there is no run lock there) and answers
+at once, as before. This wait is the CLI's; the MCP server's waiting is
+unchanged.
+
+### fix: a name that only near-matches answers for no single match among many
+
+For a name no definition has, the lookup read the first ten matching rows
+and then dropped test code, so one production name among ten rows became the
+answer.
+On flask (d086db85), `refs h` and `callgraph h` answered for `hello`
+("Resolved 'h' → 'hello'", exit 0), and so did MCP `find_references` and
+`get_call_graph`. All four now say the name is ambiguous among 67 matches:
+the CLI prints "Ambiguous symbol 'h': 67 matches." with a list and exits 1;
+`find_references` returns an `error` with the first 5 of 67 as
+`suggestions`; `get_call_graph` returns no callers and 5 `candidates`
+("No exact match for 'h'. Did you mean one of these? Showing the first 5 of
+67."). A near match is now the answer only when it is the one production
+name among every matching row, read up to 200 (Not covered).
+
+### fix: same-named functions nested in different definitions are counted apart
+
+With `make_a` and `make_b` each defining a `wrapper` that calls `target()`,
+0.192.0 counted one caller of `target`: `impact`, `show --impact` and MCP
+`get_ast_node` with `include_impact` said 1 direct, and `callgraph` and MCP
+`get_call_graph` listed one `wrapper`. All now count 2. Text output names
+each as `wrapper in make_a` and `wrapper in make_b`; JSON rows keep their
+shape. `#[cfg]` twins (one function defined twice under different `cfg`s)
+still count as one caller.
+
+### fix: `show --node-id N --impact` counts the callers of node N
+
+It counted the callers of every definition sharing N's name in N's file. On
+gin (75ccf94d), node 852 (`Error.JSON`) got "2 direct" from `show --node-id
+852 --impact` and "3 direct" from `impact --node-id 852`; both now say 3.
+
+### fix: `affected` answers for a file deleted before it was asked
+
+On gin (75ccf94d), `affected render/text.go` names 36 tests and 76 files.
+With the file deleted, 0.192.0 still said so until something dropped the
+file from the index, and from then on said 0 tests and "not in index": after
+an index run (`incremental-index`, or the plugin's hooks and the MCP
+server's watcher after an edit), after `show` of a symbol defined in that
+file (`show WriteString`), and at once when asked from a subdirectory
+(`cd render`, then `affected render/text.go`, the root-relative path `git
+diff --name-only` prints). Each of these now names the 36 tests and 76 files.
+An index run that deletes a file records the files with an edge into it,
+dependents or none, for the latest 2,000 deleted paths; a path indexed again
+leaves the record. A deleted test file is no longer listed as a test to
+re-run: 0.192.0 listed one deleted a moment before, with no index run since.
+
+### This repository's PR impact review
+
+The workflow built its index on the PR alone, where a file the PR deletes
+never was, so a gin PR deleting `render/text.go` and
+`internal/json/go_json.go` got "No indexed code changed", 0 tests. It now
+indexes the PR's base and then the PR, and the same PR gets 36 tests to
+re-run. A deleted file is not reported as a test gap: with this change alone,
+`go_json.go`, which nothing calls, would have been one.
+
+### Not covered
+
+- A run that starts after the query has checked for one is not waited for.
+- A name whose near matches fill the 200 rows is declined even when one of
+  them is the only production name: with `hello` in `src/` and 205
+  `h_case_*` functions in `tests/`, `refs h` says "Ambiguous symbol 'h': 1
+  matches." and exits 1, where 0.192.0 answered for `hello`.
+- A function nested on the same line as the definition around it is counted
+  with that definition's other same-named nested functions as one caller:
+  the index holds line numbers, not columns.
+- `affected` on a deleted file that no index run saw deleted (the record is
+  absent, as in an index built after the deletion) still says "not in
+  index".
+
 ## 0.192.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 139 → 140
