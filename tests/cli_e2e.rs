@@ -15309,3 +15309,81 @@ fn test_cli_callgraph_text_does_not_root_at_a_heading() {
     assert_eq!(code, 0, "{stdout}{stderr}");
     assert!(stdout.starts_with("Cache (src/cache.py)"), "{stdout}");
 }
+
+/// Hold `index-run.lock` shared, as `in_flight::begin` holds it for a live run.
+#[cfg(unix)]
+fn hold_index_run_lock(project: &TempDir) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let run = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(project.path().join(".code-graph/index-run.lock"))
+        .unwrap();
+    // SAFETY: `run` is an open File owned by the caller.
+    assert_eq!(
+        unsafe { libc::flock(run.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        0
+    );
+    run
+}
+
+/// Converge R8 (2026-11-12): a query beside a live index run answered from the
+/// rows that run was rewriting, exit 0 and nothing on stderr. On a copy of this
+/// repository with 145 files edited, 33 of 68 queries during one
+/// `incremental-index --no-embed` said `refs get_reverse_dependents` 6 (9),
+/// `impact` 0 direct callers (1) and `affected` 0 tests (11). The plugin starts
+/// that run detached at session start, and parallel tool calls or subagents
+/// query beside it. A query now waits for the run to finish, briefly.
+#[cfg(unix)]
+#[test]
+fn test_cli_query_waits_for_a_live_index_run_to_finish() {
+    let project = setup_indexed_project();
+    let (whole, stderr, code) =
+        run_cli(&project, &["refs", "validateToken", "--relation", "calls"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(whole.contains("handleLogin"), "{whole}");
+
+    // Mid-run: the lock held, and the target's inbound calls gone, as between a
+    // batch's purge of the caller's file and the edges that replace them.
+    let run = hold_index_run_lock(&project);
+    let conn = rusqlite::Connection::open(project.path().join(".code-graph/index.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TEMP TABLE held AS SELECT * FROM edges WHERE relation = 'calls' \
+           AND target_id IN (SELECT id FROM nodes WHERE name = 'validateToken'); \
+         DELETE FROM edges WHERE id IN (SELECT id FROM temp.held);",
+    )
+    .unwrap();
+    let dir = project.path().to_path_buf();
+    let query = std::thread::spawn(move || {
+        Command::new(binary_path())
+            .current_dir(dir)
+            .args(["refs", "validateToken", "--relation", "calls"])
+            .output()
+    });
+    // The run finishes: its edges are back, then the lock goes.
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    conn.execute_batch("INSERT INTO edges SELECT * FROM temp.held;")
+        .unwrap();
+    drop(run);
+    let out = query.join().unwrap().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        stdout.contains("handleLogin"),
+        "answered from the half-written index: {stdout}{stderr}"
+    );
+    assert!(!stderr.contains("index run"), "{stderr}");
+
+    // A run that outlasts the wait: the answer comes with a notice.
+    let _run = hold_index_run_lock(&project);
+    let (stdout, stderr, code) =
+        run_cli(&project, &["refs", "validateToken", "--relation", "calls"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("handleLogin"), "{stdout}");
+    assert!(
+        stderr.contains("An index run is still writing this index"),
+        "{stderr}"
+    );
+}

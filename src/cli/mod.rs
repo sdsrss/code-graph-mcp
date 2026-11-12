@@ -251,6 +251,7 @@ impl CliContext {
     pub fn open(project_root: &Path) -> Result<Self> {
         refuse_during_build(project_root)?;
         let ctx = Self::open_inner(project_root, false)?;
+        wait_for_index_run(&ctx.db);
         announce_index_version(&ctx.db);
         announce_interrupted_run(&ctx.db);
         Ok(ctx)
@@ -270,6 +271,7 @@ impl CliContext {
     pub fn open_with_vec(project_root: &Path) -> Result<Self> {
         refuse_during_build(project_root)?;
         let ctx = Self::open_inner(project_root, true)?;
+        wait_for_index_run(&ctx.db);
         announce_index_version(&ctx.db);
         announce_interrupted_run(&ctx.db);
         Ok(ctx)
@@ -359,6 +361,42 @@ fn refuse_during_build(project_root: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// How long a query waits for a live index run to finish. The plugin's hooks
+/// that query get 3-5 s in all (`HOOK_TIMEOUT_SECONDS` in hook-fail-open.js);
+/// a run for one edited file takes well under a second.
+const INDEX_RUN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Wait for an index run that holds the run lock (a CLI `incremental-index`,
+/// the MCP server's run) to finish before answering. A run commits each batch
+/// of files before their callers' edges are back, so a query beside it read
+/// the files it was rewriting: 33 of 68 queries during one run over 145 edited
+/// files answered `refs` 6 for 9 and `affected` 0 tests for 11, exit 0
+/// (converge R8). The plugin starts that run detached at session start, and
+/// parallel tool calls and subagents query beside it.
+///
+/// A run that outlasts the wait (a first build, embeddings) gets the answer
+/// anyway, with a line on stderr. Not covered: a run that starts after this
+/// check, while the query reads; and targets without the lock (non-Unix),
+/// where no run is ever seen in flight.
+fn wait_for_index_run(db: &Database) {
+    use crate::indexer::pipeline::index_run_in_flight;
+    if !index_run_in_flight(db) {
+        return;
+    }
+    let deadline = std::time::Instant::now() + INDEX_RUN_WAIT;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        if !index_run_in_flight(db) {
+            return;
+        }
+    }
+    eprintln!(
+        "[code-graph] An index run is still writing this index (waited {} s); answers may miss \
+         the files and edges it has not finished. Rerun when it is done.",
+        INDEX_RUN_WAIT.as_secs()
+    );
 }
 
 /// Say on stderr that the last index run died, so the answer may miss files
