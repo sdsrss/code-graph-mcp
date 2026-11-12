@@ -47,8 +47,19 @@ jobs:
       - name: Build (no-embed)
         run: cargo build --locked --release --no-default-features
 
+      # Index the PR's base, then the PR. The second run sees each file the PR
+      # deletes and records what depended on it, so `affected` answers for a
+      # deleted file; an index built on the PR alone never held it and answered
+      # "not in index" with no tests.
       - name: Index repository
-        run: ./target/release/code-graph-mcp incremental-index --quiet
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          PR_SHA=$(git rev-parse HEAD)
+          git checkout --quiet --detach "$BASE_SHA"
+          ./target/release/code-graph-mcp incremental-index --quiet
+          git checkout --quiet --detach "$PR_SHA"
+          ./target/release/code-graph-mcp incremental-index --quiet
 
       - name: Compute changed files
         id: diff

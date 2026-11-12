@@ -124,6 +124,7 @@ process.exit(0);
 test('computeReview: aggregate + per-file test-gap detection', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-prreview-'));
   try {
+    writeCheckoutFiles(dir, ['src/a.rs', 'src/b.rs', 'tests/a_test.rs']);
     const binary = writeStubBinary(dir);
     const review = computeReview(binary, ['src/a.rs', 'src/b.rs', 'tests/a_test.rs', 'NEW.md'], dir);
     assert.ok(review, 'review computed');
@@ -174,6 +175,7 @@ process.exit(0);
 test('computeReview: a failed per-file analysis is reported as unanalyzed, never as covered', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-prreview-fail-'));
   try {
+    writeCheckoutFiles(dir, ['src/a.rs', 'src/b.rs']);
     const binary = writeFlakyStubBinary(dir, 'src/b.rs');
     const review = computeReview(binary, ['src/a.rs', 'src/b.rs'], dir);
     assert.ok(review, 'aggregate succeeded, so the review is still produced');
@@ -193,9 +195,67 @@ test('computeReview: a failed per-file analysis is reported as unanalyzed, never
 test('computeReview: a successful run reports no unanalyzed files', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-prreview-ok-'));
   try {
+    writeCheckoutFiles(dir, ['src/a.rs', 'src/b.rs']);
     const review = computeReview(writeStubBinary(dir), ['src/a.rs', 'src/b.rs'], dir);
     assert.deepStrictEqual(review.unanalyzed, []);
     assert.deepStrictEqual(review.uncovered, ['src/b.rs']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Puts each relative path on disk under `dir`: the changed files of a PR's
+// checkout. A changed file left off disk is one the PR deleted.
+function writeCheckoutFiles(dir, files) {
+  for (const f of files) {
+    fs.mkdirSync(path.join(dir, path.dirname(f)), { recursive: true });
+    fs.writeFileSync(path.join(dir, f), '');
+  }
+}
+
+// What the binary answers once the index has seen the PR delete `src/gone.rs`
+// (it indexes the base, then the PR): the deleted file comes back in `changed`
+// from the index's deletion record, and alone it names no test — it had no
+// dependents, as dead code does.
+function writeDeletionStubBinary(dir) {
+  const stub = path.join(dir, 'stub-cg-deleted.js');
+  fs.writeFileSync(stub, `#!/usr/bin/env node
+'use strict';
+const args = process.argv.slice(2);
+if (args.includes('--stdin')) {
+  process.stdout.write(JSON.stringify({
+    changed: ['src/a.rs', 'src/b.rs', 'src/gone.rs'],
+    tests: ['tests/a_test.rs'],
+    affected_files: [{path:'tests/a_test.rs',depth:1,is_test:true}],
+    not_indexed: [],
+  }));
+  process.exit(0);
+}
+const file = args[1];
+const tests = file === 'src/a.rs' ? ['tests/a_test.rs'] : [];
+process.stdout.write(JSON.stringify({ changed:[file], tests, affected_files:[], not_indexed:[] }));
+process.exit(0);
+`);
+  fs.chmodSync(stub, 0o755);
+  const shim = path.join(dir, 'cg-deleted');
+  fs.writeFileSync(shim, `#!/usr/bin/env bash\nexec node "${stub}" "$@"\n`);
+  fs.chmodSync(shim, 0o755);
+  return shim;
+}
+
+test('computeReview: a file the PR deleted is no test gap', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-prreview-deleted-'));
+  try {
+    writeCheckoutFiles(dir, ['src/a.rs', 'src/b.rs']);
+    const review = computeReview(
+      writeDeletionStubBinary(dir), ['src/a.rs', 'src/b.rs', 'src/gone.rs'], dir
+    );
+    assert.deepStrictEqual(review.changed, ['src/a.rs', 'src/b.rs', 'src/gone.rs']);
+    assert.deepStrictEqual(
+      review.uncovered, ['src/b.rs'],
+      'deleting a file leaves no untested code of its own; its dependents carry the tests'
+    );
+    assert.deepStrictEqual(review.unanalyzed, []);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

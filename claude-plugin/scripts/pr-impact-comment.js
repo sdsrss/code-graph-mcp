@@ -16,6 +16,8 @@
 // cg-answer.js).
 
 const { spawnSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 const { hidden } = require('./proc-opts');
 
 const MARKER = '<!-- code-graph-impact-review -->';
@@ -132,8 +134,14 @@ function computeReview(binary, changedFiles, cwd) {
   // covered file: the most dangerous direction for a test-gap report to fail in.
   const uncovered = [];
   const unanalyzed = [];
+  //
+  // A changed file missing from the checkout is one the PR deleted. `affected`
+  // answers for it from the index's deletion record, and its dependents' tests
+  // are already in the aggregate. It leaves no code of its own to cover, so it
+  // is no gap: deleting dead code (no dependents, so no tests) is not one.
   for (const f of changed) {
     if (isTestPath(f)) continue;
+    if (!fs.existsSync(path.join(cwd, f))) continue;
     const single = runAffected(binary, ['affected', f, '--json'], cwd, '');
     if (!single) {
       unanalyzed.push(f);
@@ -305,7 +313,6 @@ function upsertComment(repo, prNumber, body) {
 
 function main(argv) {
   // argv: [changedFilesPath]. Env: GH_REPO, PR_NUMBER, CODE_GRAPH_FAIL_ON_RISK.
-  const fs = require('fs');
   const changedPath = argv[0];
   if (!changedPath) {
     console.error('usage: pr-impact-comment.js <changed-files.txt>');
