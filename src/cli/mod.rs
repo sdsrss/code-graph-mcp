@@ -363,9 +363,8 @@ fn refuse_during_build(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// How long a query waits for a live index run to finish. The plugin's hooks
-/// that query get 3-5 s in all (`HOOK_TIMEOUT_SECONDS` in hook-fail-open.js);
-/// a run for one edited file takes well under a second.
+/// How long a query waits for a live index run to finish; a run for one edited
+/// file takes well under a second. The plugin's hooks do not wait (below).
 const INDEX_RUN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Wait for an index run that holds the run lock (a CLI `incremental-index`,
@@ -380,9 +379,15 @@ const INDEX_RUN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// anyway, with a line on stderr. Not covered: a run that starts after this
 /// check, while the query reads; and targets without the lock (non-Unix),
 /// where no run is ever seen in flight.
+///
+/// The plugin's hooks run their queries with `CODE_GRAPH_INTERNAL=1` and kill
+/// each one after 1.5-2 s (cg-answer.js, stop-impact.js; session-init's `map`
+/// gets 5 s of a shared budget), so the wait would cost them the answer and the
+/// time. They answer at once, as before this wait existed (review R1 of
+/// 0.193.0).
 fn wait_for_index_run(db: &Database) {
     use crate::indexer::pipeline::index_run_in_flight;
-    if !index_run_in_flight(db) {
+    if std::env::var("CODE_GRAPH_INTERNAL").as_deref() == Ok("1") || !index_run_in_flight(db) {
         return;
     }
     let deadline = std::time::Instant::now() + INDEX_RUN_WAIT;

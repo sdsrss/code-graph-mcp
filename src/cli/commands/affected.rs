@@ -136,8 +136,9 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
         // `git diff --name-only` prints root-relative paths from any directory,
         // and the near-miss rebase takes the root reading only for a file that
         // exists: a deleted one exists under neither reading. The index knows
-        // which one it held.
-        if !is_cwd_anchored(r) && !known(&norm)? {
+        // which one it held. A cwd reading on disk is the file meant, indexed or
+        // not (an ignored one), as for that rebase.
+        if !is_cwd_anchored(r) && !known(&norm)? && !project_root.join(&norm).exists() {
             if let Ok(root_reading) = normalize_user_path_from(project_root, project_root, r) {
                 if known(&root_reading)? {
                     note_root_rebase(r, project_root);

@@ -779,6 +779,35 @@ fn test_cli_affected_names_a_deleted_files_dependents_after_the_index_dropped_it
         serde_json::json!(["tests/test_app.py"]),
         "a recorded dependent deleted since: {v}"
     );
+    // `--depth` counts the recorded dependents as depth 1, as an indexed file's:
+    // with app.py <- main.py <- entry.py, depth 2 stops at main.py.
+    std::fs::write(
+        project.path().join("main.py"),
+        "from app import run\n\n\ndef main():\n    return run()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("entry.py"),
+        "from main import main\n\n\ndef start():\n    return main()\n",
+    )
+    .unwrap();
+    let (_, stderr, code) = run_cli(&project, &["incremental-index", "--quiet", "--no-embed"]);
+    assert_eq!(code, 0, "{stderr}");
+    let v = affected_json(&project, &["lib.py", "--depth", "1"]);
+    assert_eq!(
+        v["affected_files"],
+        serde_json::json!([{"depth": 1, "is_test": false, "path": "app.py"}]),
+        "{v}"
+    );
+    let v = affected_json(&project, &["lib.py", "--depth", "2"]);
+    let paths: Vec<&str> = v["affected_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"main.py"), "{v}");
+    assert!(!paths.contains(&"entry.py"), "depth 3 under --depth 2: {v}");
 
     // A query's refresh retires the path the same way.
     let project = setup_deleted_dependency_project();
@@ -885,6 +914,32 @@ fn test_cli_affected_stdin_from_a_subdirectory_keeps_a_deleted_root_relative_pat
     // An explicitly cwd-anchored path keeps its cwd reading.
     let (v, _) = affected_from_subdir_stdin(&project, "tests", "./lib.py\n");
     assert_eq!(v["not_indexed"], serde_json::json!(["./lib.py"]), "{v}");
+}
+
+// Review R1 of 0.193.0: the root reading is for a path that exists under
+// neither reading. From `tests/`, `lib.py` where `tests/lib.py` exists but is
+// ignored, so not indexed, answered for the deleted root `lib.py`, with a note
+// that `tests/lib.py` was not found.
+#[test]
+fn test_cli_affected_from_a_subdirectory_keeps_an_existing_unindexed_cwd_reading() {
+    let project = setup_deleted_dependency_project();
+    std::fs::remove_file(project.path().join("lib.py")).unwrap();
+    let (_, stderr, code) = run_cli(&project, &["incremental-index", "--quiet", "--no-embed"]);
+    assert_eq!(code, 0, "{stderr}");
+    std::fs::create_dir_all(project.path().join(".git")).unwrap();
+    std::fs::write(project.path().join(".gitignore"), "tests/lib.py\n").unwrap();
+    std::fs::write(
+        project.path().join("tests/lib.py"),
+        "def helper():\n    return 2\n",
+    )
+    .unwrap();
+    let (v, stderr) = affected_from_subdir_stdin(&project, "tests", "lib.py\n");
+    assert_eq!(v["changed"], serde_json::json!([]), "{v}");
+    assert_eq!(v["not_indexed"], serde_json::json!(["lib.py"]), "{v}");
+    assert!(
+        !stderr.contains("resolved against project root"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -15675,15 +15730,55 @@ fn test_cli_query_waits_for_a_live_index_run_to_finish() {
     );
     assert!(!stderr.contains("index run"), "{stderr}");
 
-    // A run that outlasts the wait: the answer comes with a notice.
+    // A run that outlasts the wait: the answer comes with a notice, after the
+    // whole 2 s the notice names.
     let _run = hold_index_run_lock(&project);
+    let started = std::time::Instant::now();
     let (stdout, stderr, code) =
         run_cli(&project, &["refs", "validateToken", "--relation", "calls"]);
+    let waited = started.elapsed();
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("handleLogin"), "{stdout}");
     assert!(
+        stderr.contains("An index run is still writing this index (waited 2 s)"),
+        "{stderr}"
+    );
+    assert!(
+        waited >= std::time::Duration::from_millis(1900),
+        "answered after {waited:?}, before the 2 s wait was out"
+    );
+
+    // `similar` opens the index with its vector tables, and waits the same.
+    let (_, stderr, _) = run_cli(&project, &["similar", "validateToken"]);
+    assert!(
         stderr.contains("An index run is still writing this index"),
         "{stderr}"
+    );
+}
+
+/// Review R1 of 0.193.0: the plugin's hooks run their queries with
+/// `CODE_GRAPH_INTERNAL=1` under a per-call budget of 1.5-2 s (cg-answer.js,
+/// stop-impact.js), so a 2 s wait beside a run killed every one of them: `show`
+/// came back as "no hits" and grep went raw, about 2 s later. Those queries
+/// answer at once, as in 0.192.0.
+#[cfg(unix)]
+#[test]
+fn test_cli_hook_query_answers_at_once_beside_a_live_index_run() {
+    let project = setup_indexed_project();
+    let _run = hold_index_run_lock(&project);
+    let started = std::time::Instant::now();
+    let (stdout, stderr, code) = run_cli_env(
+        &project,
+        &["refs", "validateToken", "--relation", "calls"],
+        &[("CODE_GRAPH_INTERNAL", "1")],
+    );
+    let took = started.elapsed();
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("handleLogin"), "{stdout}");
+    assert!(!stderr.contains("index run"), "{stderr}");
+    assert!(
+        took < std::time::Duration::from_millis(1500),
+        "a hook's query waited {took:?} beside the run"
     );
 }
 

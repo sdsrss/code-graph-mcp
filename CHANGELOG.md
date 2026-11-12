@@ -9,11 +9,13 @@ finds an index run writing the index (the plugin's session-start run, a CLI
 seconds; a run still going after that gets the answer anyway, with this on
 stderr: "[code-graph] An index run is still writing this index (waited 2 s);
 answers may miss the files and edges it has not finished. Rerun when it is
-done." 0.192.0 answered at once from the half-written index (below). Other
-answers change for scripts and MCP clients: a name that only near-matches can
-now be ambiguous (CLI exit 1 where it was 0), caller counts change where
-same-named functions are nested in different definitions, and `affected`
-answers for deleted files in more cases. To pin the binary back: `npm i -g
+done." 0.192.0 answered at once from the half-written index (below). The
+plugin's own hook queries do not wait. Other answers change for scripts and
+MCP clients: a name that only near-matches can now be ambiguous (CLI exit 1
+where it was 0) or, the other way, answered where 0.192.0 said it was not
+found (exit 0 where it was 1); caller counts change where same-named
+functions are nested in different definitions; and `affected` answers for
+deleted files in more cases. To pin the binary back: `npm i -g
 @sdsrs/code-graph@0.192.0` (or, from source, `cargo install --locked --git
 https://github.com/sdsrss/code-graph-mcp --tag v0.192.0 --features
 embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
@@ -32,11 +34,16 @@ src/storage/db.rs` with 17 and then 0 tests where it holds 25, for one second
 of the run. Queried 0.8 seconds into the same kind of run, `refs`, `impact`,
 `callgraph`, `show`, `affected`, `search`, `map`, `overview`, `deps` and
 `dead-code` now return after 2.0 to 2.1 seconds with the stderr line
-(0.192.0: within 0.1 seconds); a `refs` asked 2.8 seconds in returned after
-1.8 seconds with no line. `grep` and `health-check` do not wait. On Windows
-the CLI cannot see a run in flight (there is no run lock there) and answers
-at once, as before. This wait is the CLI's; the MCP server's waiting is
-unchanged.
+(0.192.0: within 0.1 seconds), and so do `trace` and `similar` beside a
+held run lock; a `refs` asked 2.8 seconds in returned after 1.8 seconds with
+no line. `grep`, `health-check` and `stats` do not wait. Nor do the queries
+the plugin's hooks run (they set `CODE_GRAPH_INTERNAL=1` and kill a query
+after 1.5 to 2 seconds): beside a held run lock, the grep hooks' `show`
+answers in 6 ms, the Read hook's `overview` in 12 ms and the Stop hook's
+`refs` in 4 ms, as in 0.192.0, where waiting would have cost them the
+answer. On Windows the CLI cannot see a run
+in flight (there is no run lock there) and answers at once, as before. This
+wait is the CLI's; the MCP server's waiting is unchanged.
 
 ### fix: a name that only near-matches answers for no single match among many
 
@@ -45,20 +52,24 @@ and then dropped test code, so one production name among ten rows became the
 answer.
 On flask (d086db85), `refs h` and `callgraph h` answered for `hello`
 ("Resolved 'h' → 'hello'", exit 0), and so did MCP `find_references` and
-`get_call_graph`. All four now say the name is ambiguous among 67 matches:
+`get_call_graph`. All four now say the name is ambiguous among 67 matches
+(counted among the first 200 matching rows, so the count can fall short):
 the CLI prints "Ambiguous symbol 'h': 67 matches." with a list and exits 1;
 `find_references` returns an `error` with the first 5 of 67 as
 `suggestions`; `get_call_graph` returns no callers and 5 `candidates`
 ("No exact match for 'h'. Did you mean one of these? Showing the first 5 of
 67."). A near match is now the answer only when it is the one production
-name among every matching row, read up to 200 (Not covered).
+name among every matching row, read up to 200 (Not covered). The other way
+round, a production name past the first ten rows is now found: with
+`hello_world` in `src/` and ten test functions `ha` to `hj`, 0.192.0 said
+"Symbol not found: h" (exit 1) and now answers for `hello_world` (exit 0).
 
 ### fix: same-named functions nested in different definitions are counted apart
 
 With `make_a` and `make_b` each defining a `wrapper` that calls `target()`,
 0.192.0 counted one caller of `target`: `impact`, `show --impact` and MCP
-`get_ast_node` with `include_impact` said 1 direct, and `callgraph` and MCP
-`get_call_graph` listed one `wrapper`. All now count 2. Text output names
+`get_ast_node` with `include_impact` said 1 direct, and `callgraph` (text)
+and MCP `get_call_graph` listed one `wrapper`. All now count 2. Text output names
 each as `wrapper in make_a` and `wrapper in make_b`; JSON rows keep their
 shape. `#[cfg]` twins (one function defined twice under different `cfg`s)
 still count as one caller.
@@ -81,8 +92,9 @@ file (`show WriteString`), and at once when asked from a subdirectory
 diff --name-only` prints). Each of these now names the 36 tests and 76 files.
 An index run that deletes a file records the files with an edge into it,
 dependents or none, for the latest 2,000 deleted paths; a path indexed again
-leaves the record. A deleted test file is no longer listed as a test to
-re-run: 0.192.0 listed one deleted a moment before, with no index run since.
+leaves the record. A deleted test file given to `affected` is no longer
+listed as a test to re-run: 0.192.0 listed one deleted a moment before, with
+no index run since.
 
 ### This repository's PR impact review
 
@@ -106,6 +118,15 @@ re-run. A deleted file is not reported as a test gap: with this change alone,
 - `affected` on a deleted file that no index run saw deleted (the record is
   absent, as in an index built after the deletion) still says "not in
   index".
+- A deleted test file that `affected` reaches as a dependent, not as an
+  input, is still listed as a test to re-run until an index run drops it, as
+  in 0.192.0 (gin: with `render/render_test.go` deleted, `affected
+  render/text.go` lists it among its 36 tests).
+- The plugin's hook queries can still answer from a half-written index while
+  a run is going, as in 0.192.0.
+- `impact --json` caller rows carry no node id or line, so the two nested
+  `wrapper` callers are two identical rows; `callgraph --json` and the MCP
+  rows carry `node_id`.
 
 ## 0.192.0
 

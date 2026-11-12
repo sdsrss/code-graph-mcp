@@ -762,8 +762,8 @@ fn resolve_project_root_unindexed_git_root_uses_indexed_mid() {
 
 #[test]
 fn test_record_cli_use_rotates_recommendations_jsonl() {
-    // record_cli_use is the sole reader of CODE_GRAPH_INTERNAL and no other
-    // test mutates it, so toggling it here is race-free.
+    // No test sets CODE_GRAPH_INTERNAL to "1" in-process and parallel removes
+    // are idempotent, so removing it here is race-free.
     std::env::remove_var("CODE_GRAPH_INTERNAL");
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
