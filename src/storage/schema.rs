@@ -78,6 +78,17 @@ pub const META_KEY_RUST_ROOT_MODS: &str = "rust_root_mods";
 /// which is what every index built before this key holds.
 pub const META_KEY_VANISHED_DEPENDENTS: &str = "vanished_file_dependents";
 
+/// Same shape and life as [`META_KEY_VANISHED_DEPENDENTS`], every relation
+/// `affected` follows (`get_reverse_dependents` at depth 1) and every deleted
+/// path the index held, dependents or none: what `affected` answers for a path
+/// an index run or a query's refresh has already dropped, and with it the edges
+/// into it (`index_files::deleted_file_dependents`). That record keeps only the
+/// dependents no buffer carries back, for re-extraction; this one is the answer.
+///
+/// No SCHEMA_VERSION bump: absent or unreadable reads as "nothing recorded",
+/// and `affected` then reports the path as not in the index, as it did before.
+pub const META_KEY_DELETED_DEPENDENTS: &str = "deleted_file_dependents";
+
 /// FTS5 sync trigger SQL — single source of truth.
 /// Used by CREATE_TABLES (fresh init) and migrations that recreate the FTS5 table.
 const FTS5_TRIGGERS: &str = "

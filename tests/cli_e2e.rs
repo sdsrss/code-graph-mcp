@@ -689,6 +689,131 @@ fn test_cli_affected_nonexistent_test_path_not_in_tests() {
     );
 }
 
+/// `lib.py` ← `app.py` ← `tests/test_app.py`, and `tests/test_lib.py` ← `lib.py`.
+fn setup_deleted_dependency_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let tests = project.path().join("tests");
+    std::fs::create_dir_all(&tests).unwrap();
+    std::fs::write(
+        project.path().join("lib.py"),
+        "def helper():\n    return 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("app.py"),
+        "from lib import helper\n\n\ndef run():\n    return helper()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tests.join("test_app.py"),
+        "from app import run\n\n\ndef test_run():\n    assert run() == 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tests.join("test_lib.py"),
+        "from lib import helper\n\n\ndef test_helper():\n    assert helper() == 1\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+    project
+}
+
+fn affected_json(project: &TempDir, args: &[&str]) -> serde_json::Value {
+    let mut all = vec!["affected", "--json"];
+    all.extend_from_slice(args);
+    let (stdout, stderr, code) = run_cli(project, &all);
+    assert_eq!(code, 0, "{stderr}");
+    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("{e}: {stdout}"))
+}
+
+// A deleted file's dependents are what `affected` exists to name, and the
+// command left a deleted path out of its own refresh for that reason. But any
+// index run (the hooks and the MCP watcher run one after an edit) or another
+// query's refresh retired the path first, and with it the edges into it:
+// `affected lib.py` answered 0 tests and "not in index". The run that drops a
+// file now records the files that had an edge into it, and `affected` starts
+// the closure there. A deleted test file is not a test to re-run.
+#[test]
+fn test_cli_affected_names_a_deleted_files_dependents_after_the_index_dropped_it() {
+    let project = setup_deleted_dependency_project();
+    let v = affected_json(&project, &["lib.py"]);
+    assert_eq!(
+        v["tests"],
+        serde_json::json!(["tests/test_app.py", "tests/test_lib.py"]),
+        "{v}"
+    );
+
+    std::fs::remove_file(project.path().join("lib.py")).unwrap();
+    std::fs::remove_file(project.path().join("tests/test_lib.py")).unwrap();
+    let (_, stderr, code) = run_cli(&project, &["incremental-index", "--quiet", "--no-embed"]);
+    assert_eq!(code, 0, "{stderr}");
+    let v = affected_json(&project, &["lib.py", "tests/test_lib.py"]);
+    assert_eq!(
+        v["changed"],
+        serde_json::json!(["lib.py", "tests/test_lib.py"]),
+        "{v}"
+    );
+    assert_eq!(v["tests"], serde_json::json!(["tests/test_app.py"]), "{v}");
+    assert_eq!(v["not_indexed"], serde_json::json!([]), "{v}");
+    let depth_of = |path: &str| {
+        v["affected_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == path)
+            .map(|f| f["depth"].clone())
+    };
+    assert_eq!(depth_of("app.py"), Some(serde_json::json!(1)), "{v}");
+    assert_eq!(
+        depth_of("tests/test_app.py"),
+        Some(serde_json::json!(2)),
+        "{v}"
+    );
+    let v = affected_json(&project, &["lib.py"]);
+    assert_eq!(
+        v["tests"],
+        serde_json::json!(["tests/test_app.py"]),
+        "a recorded dependent deleted since: {v}"
+    );
+
+    // A query's refresh retires the path the same way.
+    let project = setup_deleted_dependency_project();
+    std::fs::remove_file(project.path().join("lib.py")).unwrap();
+    run_cli(&project, &["show", "helper"]);
+    let v = affected_json(&project, &["lib.py"]);
+    assert_eq!(
+        v["tests"],
+        serde_json::json!(["tests/test_app.py", "tests/test_lib.py"]),
+        "{v}"
+    );
+
+    // Back on disk and indexed again, the record is spent: the graph answers.
+    std::fs::write(
+        project.path().join("lib.py"),
+        "def helper():\n    return 1\n",
+    )
+    .unwrap();
+    let (_, stderr, code) = run_cli(&project, &["incremental-index", "--quiet", "--no-embed"]);
+    assert_eq!(code, 0, "{stderr}");
+    let index = project
+        .path()
+        .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
+        .join("index.db");
+    let conn = rusqlite::Connection::open(&index).unwrap();
+    let recorded: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'deleted_file_dependents'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    assert_eq!(recorded, None);
+}
+
 #[test]
 fn test_cli_affected_blast_radius_disjoint_from_changed() {
     // F4: a changed file must never appear in affected_files. api.ts imports auth.ts;

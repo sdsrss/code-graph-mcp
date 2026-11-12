@@ -234,8 +234,8 @@ const STATS_REFRESH_MIN_FILES: usize = 50;
 /// is the base case every later incremental run's completeness argument assumes.
 pub(super) const SCOPED_POST_PASS_MAX_FILES: usize = 64;
 
-/// Deleted paths the vanished-file record keeps (`vanished_file_dependents`);
-/// past it the oldest entry goes. A file that comes back usually does so within
+/// Deleted paths each vanished-file record keeps (`vanished_file_dependents`,
+/// `deleted_file_dependents`); past it the oldest entry goes. A file that comes back usually does so within
 /// a few runs (an undo, a branch switch and back), and a file deleted for good
 /// would otherwise keep its entry forever. An evicted entry costs what the index
 /// cost before the record existed: that file's dependents stay as the deletion
@@ -1480,6 +1480,42 @@ fn vanished_file_dependents(
     }
 
     Ok((returned, changed.then_some(record)))
+}
+
+/// [`META_KEY_DELETED_DEPENDENTS`](crate::storage::schema::META_KEY_DELETED_DEPENDENTS):
+/// each path this run deletes with the files that have an edge into it, read
+/// before Phase 0 drops them, and no entry left for a path this run indexes.
+/// Returns the record to store when this run changed it.
+fn deleted_file_dependents(
+    db: &Database,
+    files: &[String],
+    delete_paths: &[String],
+) -> Result<Option<VanishedRecord>> {
+    use crate::storage::schema::META_KEY_DELETED_DEPENDENTS;
+    let mut record: VanishedRecord =
+        crate::storage::queries::get_meta(db.conn(), META_KEY_DELETED_DEPENDENTS)?
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
+    if record.is_empty() && delete_paths.is_empty() {
+        return Ok(None);
+    }
+    let in_run: HashSet<&str> = files.iter().map(String::as_str).collect();
+    let stored = record.len();
+    record.retain(|(path, _)| !in_run.contains(path.as_str()));
+    let mut changed = record.len() != stored;
+    for path in delete_paths {
+        let dependents = crate::storage::queries::get_reverse_dependents(db.conn(), path, 1)?
+            .into_iter()
+            .map(|(dep, _)| dep)
+            .collect();
+        changed = true;
+        record.retain(|(p, _)| p != path);
+        record.push((path.clone(), dependents));
+    }
+    if record.len() > VANISHED_RECORD_MAX_PATHS {
+        record.drain(..record.len() - VANISHED_RECORD_MAX_PATHS);
+    }
+    Ok(changed.then_some(record))
 }
 
 /// The Python files whose imports name other files once this run's modules
@@ -2954,6 +2990,7 @@ Restart every code-graph server on this project so they run one version.",
     // direction needs to know which files to re-extract, and only the deletion
     // knew that for sure: it records them (D#543, `vanished_file_dependents`).
     let (extra, vanished_record) = existence_change_dependents(db, root, &files, delete_paths)?;
+    let deleted_record = deleted_file_dependents(db, &files, delete_paths)?;
     let files: Vec<String> = {
         if extra.is_empty() {
             files
@@ -3079,8 +3116,17 @@ Restart every code-graph server on this project so they run one version.",
 
     // After the in-flight marker, like every other write of the run: a run that
     // dies past here is re-indexed in full, which needs no record.
-    if let Some(record) = &vanished_record {
-        let key = crate::storage::schema::META_KEY_VANISHED_DEPENDENTS;
+    for (key, record) in [
+        (
+            crate::storage::schema::META_KEY_VANISHED_DEPENDENTS,
+            &vanished_record,
+        ),
+        (
+            crate::storage::schema::META_KEY_DELETED_DEPENDENTS,
+            &deleted_record,
+        ),
+    ] {
+        let Some(record) = record else { continue };
         if record.is_empty() {
             crate::storage::queries::delete_meta(db.conn(), key)?;
         } else {

@@ -100,6 +100,16 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
     let freshness = refresh_input_files(&ctx.db, &ctx.project_root, &fresh_inputs);
     freshness.disclose();
 
+    // The guard above does not outlive the next index run: the hooks and the MCP
+    // watcher run one after an edit, and another query's refresh drops a
+    // deleted file too, taking the edges into it. What depended on it is then
+    // the record the dropping run kept (`META_KEY_DELETED_DEPENDENTS`).
+    let deleted_record: Vec<(String, Vec<String>)> =
+        queries::get_meta(conn, crate::storage::schema::META_KEY_DELETED_DEPENDENTS)?
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
+    let mut dropped: HashMap<String, Vec<String>> = HashMap::new();
+
     for r in &raw {
         let norm = match normalize_user_path(project_root, r) {
             Ok(p) => p,
@@ -114,6 +124,13 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
             continue;
         }
         if !queries::file_is_indexed(conn, &norm)? {
+            if let Some((_, dependents)) = deleted_record.iter().find(|(path, _)| *path == norm) {
+                if seen_changed.insert(norm.clone()) {
+                    dropped.insert(norm.clone(), dependents.clone());
+                    changed.push(norm);
+                }
+                continue;
+            }
             if !not_indexed.contains(r) {
                 not_indexed.push(r.clone());
             }
@@ -131,7 +148,27 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
     let changed_set: HashSet<&str> = changed.iter().map(|s| s.as_str()).collect();
     let mut affected: BTreeMap<String, i32> = BTreeMap::new();
     for f in &changed {
-        for (dep_path, dep_depth) in queries::get_reverse_dependents(conn, f, depth)? {
+        // A dropped file's recorded dependents are its depth 1; the closure goes
+        // on from those the index still holds.
+        let dependents = match dropped.get(f) {
+            None => queries::get_reverse_dependents(conn, f, depth)?,
+            Some(recorded) => {
+                let mut found = Vec::new();
+                for dep in recorded {
+                    if !queries::file_is_indexed(conn, dep)? {
+                        continue;
+                    }
+                    found.push((dep.clone(), 1));
+                    if depth > 1 {
+                        for (p, d) in queries::get_reverse_dependents(conn, dep, depth - 1)? {
+                            found.push((p, d + 1));
+                        }
+                    }
+                }
+                found
+            }
+        };
+        for (dep_path, dep_depth) in dependents {
             if !crate::utils::config::is_compatible_lang(f, &dep_path) {
                 continue;
             }
@@ -180,7 +217,8 @@ pub fn cmd_affected(project_root: &Path, args: AffectedArgs) -> Result<()> {
         .cloned()
         .collect();
     for f in &changed {
-        if test_flags[f.as_str()] && !tests.contains(f) {
+        // A deleted test file is no test to re-run: a runner handed it fails.
+        if test_flags[f.as_str()] && !tests.contains(f) && project_root.join(f).exists() {
             tests.push(f.clone());
         }
     }
