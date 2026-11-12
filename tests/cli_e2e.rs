@@ -13582,6 +13582,107 @@ fn test_cli_same_named_callers_in_one_file_are_counted_apart() {
     assert_eq!(v["direct_callers"], 2, "A.run and B.run: {v}");
 }
 
+/// Same-named definitions nested in different functions of one file (one with
+/// a sibling on its line, which does not enclose it), and one nested in each
+/// of two cfg twins.
+fn setup_same_named_nested_callers_project() -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub mod n;\npub fn target() -> i32 { 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("n.rs"),
+        "use crate::target;\n\
+         pub fn make_a() -> i32 {\n    fn wrapper() -> i32 { target() }\n    wrapper()\n}\n\
+         pub fn make_b() -> i32 {\n    fn wrapper() -> i32 { target() } fn beside() {}\n    wrapper()\n}\n\
+         #[cfg(unix)]\npub fn outer() -> i32 {\n    fn inner() -> i32 { target() }\n    inner()\n}\n\
+         #[cfg(not(unix))]\npub fn outer() -> i32 {\n    fn inner() -> i32 { target() }\n    inner()\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("app.py"),
+        "def py_target():\n    return 1\n\n\nclass A:\n    def run(self):\n        def helper():\n            \
+         return py_target()\n        return helper()\n\n\nclass B:\n    def run(self):\n        \
+         def helper():\n            return py_target()\n        return helper()\n",
+    )
+    .unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    drop(db);
+    project
+}
+
+// A nested definition's qualified name is its bare name, so the D#237 fold on
+// (qualified name, file, depth) still folded the `wrapper`s of `make_a` and
+// `make_b` into one caller: `impact target` said 2 direct for 3, and the
+// callgraph tree lost `B.run`, whose parent was the folded `helper`. The two
+// `inner`s sit in cfg twins of one function and still fold.
+#[test]
+fn test_cli_same_named_nested_callers_are_counted_apart() {
+    let project = setup_same_named_nested_callers_project();
+
+    let (stdout, stderr, code) = run_cli(&project, &["impact", "target", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["direct_callers"], 3, "wrapper ×2, inner once: {v}");
+    assert_eq!(v["total_callers"], 6, "+ make_a, make_b, outer once: {v}");
+
+    let (stdout, _, code) = run_cli(&project, &["impact", "target"]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("wrapper in make_a  (function) src/n.rs")
+            && stdout.contains("wrapper in make_b  (function) src/n.rs")
+            && stdout.matches("inner  (function) src/n.rs").count() == 1,
+        "{stdout}"
+    );
+
+    let (stdout, _, code) = run_cli(&project, &["show", "target", "--impact", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v[0]["impact"]["direct_callers"], 3, "{v}");
+
+    let (stdout, _, code) = run_cli(
+        &project,
+        &["callgraph", "py_target", "--direction", "callers"],
+    );
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("helper in A.run (src/app.py)")
+            && stdout.contains("helper in B.run (src/app.py)")
+            && stdout.contains("A.run (src/app.py)")
+            && stdout.contains("B.run (src/app.py)"),
+        "{stdout}"
+    );
+    let (stdout, _, code) = run_cli(
+        &project,
+        &[
+            "callgraph",
+            "py_target",
+            "--direction",
+            "callers",
+            "--budget",
+            "2000",
+        ],
+    );
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("helper in A.run (src/app.py)")
+            && stdout.contains("helper in B.run (src/app.py)")
+            && stdout.contains("B.run (src/app.py)"),
+        "the budgeted tree: {stdout}"
+    );
+    let (stdout, _, code) = run_cli(&project, &["callgraph", "target", "--direction", "callers"]);
+    assert_eq!(code, 0);
+    assert_eq!(stdout.matches("inner (src/n.rs)").count(), 1, "{stdout}");
+    assert_eq!(stdout.matches("outer (src/n.rs)").count(), 1, "{stdout}");
+}
+
 /// Every file directly in `dir`, name → bytes. The whole listing, so a sidecar
 /// a command creates there (`index-run.lock`, `-wal`, `-shm`) shows up as a
 /// difference as surely as a rewritten `index.db`.

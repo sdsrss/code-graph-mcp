@@ -504,10 +504,15 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
         if n.depth == 0 {
             continue;
         }
-        // Dedup cfg-gated duplicates: one symbol (qualified name), file,
-        // direction and depth, different node_id. Keyed on the bare name, it
-        // folded `Waiter.new` into `Recv.new` too (D#237).
-        if !dedup.insert((n.identity(), &n.file_path, n.direction.as_str(), n.depth)) {
+        // Dedup cfg-gated duplicates: one symbol in one place, file, direction
+        // and depth, different node_id. Keyed on the bare name, it folded
+        // `Waiter.new` into `Recv.new` too (D#237); see `fold_identity`.
+        if !dedup.insert((
+            n.fold_identity(),
+            &n.file_path,
+            n.direction.as_str(),
+            n.depth,
+        )) {
             continue;
         }
         let parent = n.parent_id.unwrap_or(root_id);
@@ -518,12 +523,12 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
     }
 
     // Two kept rows a name and a file cannot tell apart print their qualified
-    // names (D#237).
+    // names, and where they sit when those are alike too (D#237).
     let shared_names = crate::graph::query::names_shared_by_distinct_symbols(
         display_nodes
             .iter()
             .filter(|n| n.depth > 0)
-            .map(|n| (n.name.as_str(), n.identity(), n.file_path.as_str())),
+            .map(|n| (n.name.as_str(), n.fold_identity(), n.file_path.as_str())),
     );
 
     fn render_subtree<W: std::io::Write>(
@@ -550,7 +555,7 @@ pub fn cmd_callgraph(project_root: &Path, args: CallgraphArgs) -> Result<()> {
                 // <module> (users.test.ts) [module]` reads as a symbol the reader
                 // cannot find in their file. --json keeps the raw name.
                 let label = if shared_names.contains(&(n.name.as_str(), n.file_path.as_str())) {
-                    n.identity()
+                    n.fold_identity()
                 } else {
                     crate::domain::display_node_name(&n.name)
                 };
@@ -743,7 +748,7 @@ fn callgraph_budget_text(
         crate::graph::query::names_shared_by_distinct_symbols(lines.iter().map(|l| {
             (
                 l.node.name.as_str(),
-                l.node.identity(),
+                l.node.fold_identity(),
                 l.node.file_path.as_str(),
             )
         }));
@@ -761,7 +766,7 @@ fn callgraph_budget_text(
     let line_text = |l: &TreeLine, level: Level| -> String {
         let indent = "  ".repeat(l.node.depth as usize);
         let label = if shared_names.contains(&(l.node.name.as_str(), l.node.file_path.as_str())) {
-            l.node.identity()
+            l.node.fold_identity()
         } else {
             crate::domain::display_node_name(&l.node.name)
         };

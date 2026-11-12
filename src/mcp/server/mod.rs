@@ -3449,6 +3449,55 @@ function handleLogin(req: Request) {
         assert_eq!(result["impact"]["direct_callers"], 3, "{result}");
     }
 
+    /// A nested definition's qualified name is its bare name, so the D#237
+    /// fold still made one caller of the `wrapper`s nested in `make_a` and
+    /// `make_b`. The `inner`s of two cfg twins still fold.
+    #[test]
+    fn test_same_named_nested_callers_are_counted_apart() {
+        let project_dir = TempDir::new().unwrap();
+        let src = project_dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            "pub mod n;\npub fn target() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("n.rs"),
+            "use crate::target;\n\
+             pub fn make_a() -> i32 {\n    fn wrapper() -> i32 { target() }\n    wrapper()\n}\n\
+             pub fn make_b() -> i32 {\n    fn wrapper() -> i32 { target() }\n    wrapper()\n}\n\
+             #[cfg(unix)]\npub fn outer() -> i32 {\n    fn inner() -> i32 { target() }\n    inner()\n}\n\
+             #[cfg(not(unix))]\npub fn outer() -> i32 {\n    fn inner() -> i32 { target() }\n    inner()\n}\n",
+        )
+        .unwrap();
+        let server = McpServer::new_test_with_project(project_dir.path());
+        server.ensure_indexed().unwrap();
+
+        let resp = server
+            .handle_message(&tool_call_json(
+                "get_call_graph",
+                json!({"symbol_name": "target", "direction": "callers", "depth": 1}),
+            ))
+            .unwrap();
+        let result = parse_tool_result(&resp);
+        let rows = result["callers"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{result}"));
+        let mut names: Vec<&str> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["inner", "wrapper", "wrapper"], "{result}");
+
+        let resp = server
+            .handle_message(&tool_call_json(
+                "get_ast_node",
+                json!({"symbol_name": "target", "include_impact": true}),
+            ))
+            .unwrap();
+        let result = parse_tool_result(&resp);
+        assert_eq!(result["impact"]["direct_callers"], 3, "{result}");
+    }
+
     /// D#274: `find_references` named every `file_path` miss "Symbol 'x' not
     /// found in file 'y'", for a path the index does not hold too, and never
     /// listed the files that define `x`; `get_call_graph` (D#253) does both.

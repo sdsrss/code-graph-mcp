@@ -119,6 +119,7 @@ pub fn get_callers_with_route_info_seeded(
             route_info: route_map.get(&caller.node_id).cloned(),
             qualified_name: caller.qualified_name.clone(),
             is_test: caller.is_test,
+            placed_identity: caller.placed_identity.clone(),
         })
         .collect();
     Ok(RouteCallers {

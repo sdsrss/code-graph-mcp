@@ -72,13 +72,23 @@ pub struct CallerWithRouteInfo {
     /// unit test the `is_test_symbol` name/path heuristic misses is still excluded
     /// from the production blast radius.
     pub is_test: bool,
+    /// `crate::graph::query::CallGraphNode::placed_identity`.
+    pub placed_identity: Option<String>,
 }
 
 impl CallerWithRouteInfo {
-    /// Its qualified name, else its name: the dedup identity of a caller
+    /// Its qualified name, else its name
     /// (`crate::graph::query::CallGraphNode::identity`).
     pub fn identity(&self) -> &str {
         self.qualified_name.as_deref().unwrap_or(&self.name)
+    }
+
+    /// The dedup identity of a caller and its label where a name and a file
+    /// cannot tell it apart (`crate::graph::query::CallGraphNode::fold_identity`).
+    pub fn fold_identity(&self) -> &str {
+        self.placed_identity
+            .as_deref()
+            .unwrap_or_else(|| self.identity())
     }
 }
 

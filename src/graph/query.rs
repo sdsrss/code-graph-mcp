@@ -53,14 +53,28 @@ pub struct CallGraphNode {
     /// inline unit test whose descriptive snake_case name the `is_test_symbol`
     /// name/path heuristic misses (see [`crate::domain::is_test_symbol`]).
     pub is_test: bool,
+    /// `wrapper in make_a`: set by [`get_call_graph_seeded`] only on a node that
+    /// shares its identity and file with another node of the result and sits
+    /// inside definitions of its own. See [`CallGraphNode::fold_identity`].
+    pub placed_identity: Option<String>,
 }
 
 impl CallGraphNode {
-    /// What one symbol is called: its qualified name, else its name. Callers
-    /// are folded on `(identity, file, depth)`, which folds the cfg twins of one
-    /// function and nothing else (D#237).
+    /// What one symbol is called: its qualified name, else its name.
     pub fn identity(&self) -> &str {
         self.qualified_name.as_deref().unwrap_or(&self.name)
+    }
+
+    /// What callers fold on, `(fold_identity, file, depth)`, and what a row
+    /// prints as when a name and a file cannot tell it apart (D#237): the
+    /// identity, with the definitions it sits in spelled out when it needs
+    /// them. A nested definition's qualified name is its bare name, so the
+    /// `wrapper`s of `make_a` and `make_b` share an identity and folded into
+    /// one caller; cfg twins sit in the same place and still fold.
+    pub fn fold_identity(&self) -> &str {
+        self.placed_identity
+            .as_deref()
+            .unwrap_or_else(|| self.identity())
     }
 }
 
@@ -204,7 +218,7 @@ pub fn get_call_graph_seeded(
     let effective_max_depth = max_depth.min(CALL_GRAPH_MAX_DEPTH);
     let depth_capped = max_depth > CALL_GRAPH_MAX_DEPTH;
 
-    let (nodes, limit_hit) = match direction {
+    let (mut nodes, limit_hit) = match direction {
         "callees" => query_direction_seeded(
             conn,
             seed,
@@ -243,6 +257,7 @@ pub fn get_call_graph_seeded(
             ))
         }
     };
+    place_same_named_nodes(conn, &mut nodes)?;
 
     // Disclose, rather than silently drop, the pruned fan-out: count the seed's
     // direct sub-threshold edges in the queried direction(s).
@@ -278,6 +293,82 @@ pub fn get_call_graph_seeded(
 /// Max node ids bound into one frontier / metadata query. Keeps every
 /// `IN (...)` list well under SQLite's variable cap on a wide fan-out.
 const FRONTIER_CHUNK: usize = 400;
+
+/// Set [`CallGraphNode::placed_identity`] on the nodes that share an identity
+/// and a file with another node of `nodes`: the definitions enclosing each one
+/// by line range, outermost first, the file's `<module>` left out. Twins in
+/// one place get the same answer (none at top level) and keep folding. Nodes
+/// carry lines, not columns, so a range equal to the node's own is a sibling
+/// on its line, not an enclosing definition; a nested definition written on
+/// its enclosing one's only line is therefore not placed, and still folds.
+/// Runs one query per [`FRONTIER_CHUNK`] of such nodes, and none for a result
+/// without them.
+fn place_same_named_nodes(conn: &Connection, nodes: &mut [CallGraphNode]) -> Result<()> {
+    let mut ids_by_symbol: HashMap<(&str, &str), Vec<i64>> = HashMap::new();
+    for n in nodes.iter() {
+        let ids = ids_by_symbol
+            .entry((n.identity(), n.file_path.as_str()))
+            .or_default();
+        if !ids.contains(&n.node_id) {
+            ids.push(n.node_id);
+        }
+    }
+    let shared: Vec<i64> = ids_by_symbol
+        .into_values()
+        .filter(|ids| ids.len() > 1)
+        .flatten()
+        .collect();
+    let mut enclosing: HashMap<i64, Vec<String>> = HashMap::new();
+    for chunk in shared.chunks(FRONTIER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT c.id, COALESCE(p.qualified_name, p.name)
+             FROM nodes c JOIN nodes p ON p.file_id = c.file_id AND p.id <> c.id
+             WHERE c.id IN ({placeholders})
+               AND p.name <> '<module>'
+               AND p.start_line <= c.start_line AND p.end_line >= c.end_line
+               AND (p.start_line < c.start_line OR p.end_line > c.end_line)
+             ORDER BY c.id, p.start_line, p.end_line DESC, p.id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, outer) = row?;
+            enclosing.entry(id).or_default().push(outer);
+        }
+    }
+    for n in nodes.iter_mut() {
+        if let Some(outer) = enclosing.get(&n.node_id) {
+            n.placed_identity = placed_identity(outer, n.identity());
+        }
+    }
+    Ok(())
+}
+
+/// `identity in a.b`, the enclosing identities `outer` (outermost first)
+/// joined, each dropped where the next one spells it out (`A`, then `A.run`).
+fn placed_identity(outer: &[String], identity: &str) -> Option<String> {
+    let mut path: Vec<&str> = Vec::new();
+    for name in outer.iter().map(String::as_str).chain([identity]) {
+        if path.last().is_some_and(|last| {
+            name.strip_prefix(last)
+                .is_some_and(|rest| rest.starts_with('.'))
+        }) {
+            path.pop();
+        }
+        path.push(name);
+    }
+    path.pop();
+    (!path.is_empty()).then(|| format!("{identity} in {}", path.join(".")))
+}
 
 /// Returns `(nodes, limit_hit)`. `limit_hit` is true when the traversal found at
 /// least `CALL_GRAPH_ROW_LIMIT` nodes — more nodes may exist beyond the
@@ -540,6 +631,7 @@ fn query_direction_seeded(
                 parent_id,
                 qualified_name,
                 is_test,
+                placed_identity: None,
             },
         ));
     }
@@ -810,6 +902,7 @@ mod tests {
                 parent_id: row.get(5)?,
                 qualified_name: row.get(7)?,
                 is_test: row.get(6)?,
+                placed_identity: None,
             })
         };
 

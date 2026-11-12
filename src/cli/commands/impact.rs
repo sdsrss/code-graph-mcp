@@ -350,11 +350,18 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
     let impact = crate::graph::impact::classify_impact(callers, change_type, is_function_like);
     let prod_callers = &impact.prod_callers;
     // Two kept callers that a name and a file cannot tell apart (`Waiter.new`
-    // and `Recv.new`) are shown by their qualified names (D#237).
+    // and `Recv.new`) are shown by their qualified names (D#237). The text also
+    // tells apart two that share one (`wrapper in make_a`); the JSON rows keep
+    // the qualified name only.
     let shared_names = crate::graph::query::names_shared_by_distinct_symbols(
         prod_callers
             .iter()
             .map(|c| (c.name.as_str(), c.identity(), c.file_path.as_str())),
+    );
+    let shared_in_text = crate::graph::query::names_shared_by_distinct_symbols(
+        prod_callers
+            .iter()
+            .map(|c| (c.name.as_str(), c.fold_identity(), c.file_path.as_str())),
     );
     let routes = &impact.route_callers;
     let direct_callers = prod_callers.iter().filter(|c| c.depth == 1).count();
@@ -525,8 +532,8 @@ pub fn cmd_impact(project_root: &Path, args: ImpactArgs) -> Result<()> {
         writeln!(stdout, "Callers:")?;
         for c in prod_callers {
             let indent = "  ".repeat(c.depth as usize);
-            let label = if shared_names.contains(&(c.name.as_str(), c.file_path.as_str())) {
-                c.identity()
+            let label = if shared_in_text.contains(&(c.name.as_str(), c.file_path.as_str())) {
+                c.fold_identity()
             } else {
                 c.name.as_str()
             };

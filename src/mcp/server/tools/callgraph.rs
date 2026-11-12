@@ -402,11 +402,17 @@ impl McpServer {
             .nodes
             .iter()
             .filter(|n| n.depth > 0 && (include_tests || !is_test(n)))
-            // Deduplicate cfg-gated functions: one symbol (qualified name), file,
+            // Deduplicate cfg-gated functions: one symbol in one place, file,
             // depth and direction, different node_id. Keyed on the bare name it
-            // also folded `Waiter.new` into `Recv.new` (D#237).
+            // also folded `Waiter.new` into `Recv.new` (D#237); see
+            // `CallGraphNode::fold_identity`.
             .filter(|n| {
-                seen_nodes.insert((n.identity(), &n.file_path, n.depth, n.direction.as_str()))
+                seen_nodes.insert((
+                    n.fold_identity(),
+                    &n.file_path,
+                    n.depth,
+                    n.direction.as_str(),
+                ))
             })
             .collect();
         // Rows a name and a file cannot tell apart carry their qualified names.
