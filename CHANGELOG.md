@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.195.0
+
+**Upgrading: no index rebuild; upgrade soon.** `INDEX_VERSION` stays 141.
+An index holding a trigger, view or virtual table that this version does not
+create is now refused: `incremental-index`, `health-check` and query
+commands such as `show` and `callgraph` exit 1 with a message naming the
+objects and saying to delete `.code-graph/index.db*` and re-run, and the MCP
+server exits at start. `health-check --json` reports `"reason": "refused"`.
+Nine indexes on one machine, written by versions from INDEX_VERSION 71 to
+140, opened as before (`health-check --json` answered `"healthy": true`).
+An index written by 0.2.2 and not opened by a later version is refused: its
+full-text triggers predate the columns 0.4.0 added. 0.194.0 upgraded that
+index in place; this version names its three triggers and exits 1, and
+deleting `.code-graph/index.db*` rebuilds it. To pin the binary back, which
+brings back the crash below: `npm i -g @sdsrs/code-graph@0.194.0` (or, from
+source, `cargo install --locked --git
+https://github.com/sdsrss/code-graph-mcp --tag v0.194.0 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The plugin's
+scripts are unchanged.
+
+### security: an index holding SQL code-graph-mcp does not write is refused
+
+An index carries SQL of its own, and SQLite runs it inside code-graph-mcp: a
+trigger when the tool writes, a view or virtual table when it is read. A
+repository can commit `.code-graph/index.db`, and with sqlite-vec loaded a
+crafted one still crashed code-graph-mcp after 0.191.1
+(GHSA-q67h-24gq-4263, Not fixed): a trigger querying a vec0 table whose
+internal tables were edited trips an `assert` in sqlite-vec. Measured on
+0.194.0 with such an index and one source file it had not indexed:
+
+- `incremental-index` aborted (exit 134).
+- The MCP server answered `initialize` and aborted at the first tool call
+  (`project_map`, sent 2 s in, never answered). Sent no tool call, it
+  aborted when its input closed.
+- `health-check --json`, `show` and `callgraph` exited 0.
+
+Every open now checks the index's schema first and refuses the index if it
+holds a trigger, view or virtual table that is not one of this version's
+own (an older `nodes_fts` column set and a `node_vectors` of another
+dimension are still upgraded, as before). On the same index, this version's
+`incremental-index`, `show`, `callgraph` and `health-check` exit 1, the MCP
+server exits 1 before answering `initialize`, and the index files are byte
+for byte the same afterwards. Each command reads the schema once more:
+`show` 2.2 → 3.3 ms and `health-check --json` 74.8 → 78.4 ms (medians of 40
+interleaved runs on this repository, both arms built from source without
+the embedding model).
+
+### Not covered
+
+- SQL in the tool's own tables still runs: a CHECK, DEFAULT, generated
+  column or index expression in a rewritten table runs on the tool's
+  writes, and can call SQLite's functions and sqlite-vec's scalar
+  functions. We know of no defect in sqlite-vec v0.1.9's scalar functions.
+- Forged rows in the tool's own tables, including the internal tables of
+  the vector and full-text tables, are read as data: `health-check`'s
+  integrity check and vector search read them. We know of no path from
+  them to a crash (from reading sqlite-vec's code; not fuzzed).
+- Which `.code-graph` to trust is still not decided: an index that passes
+  this check is used as it is, contents included (0.191.0, Not covered).
+  Not running code-graph-mcp in a repository that commits `.code-graph/`
+  remains the workaround.
+
 ## 0.194.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 140 → 141
