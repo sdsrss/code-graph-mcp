@@ -127,9 +127,10 @@ fn reject_unowned_files(db_path: &Path) -> std::io::Result<()> {
 /// itself, and a row whose SQL starts with it parses as nothing else.
 const PLAIN_SCHEMA_PREFIXES: [&str; 3] = ["CREATE TABLE ", "CREATE INDEX ", "CREATE UNIQUE INDEX "];
 
-/// SQL text with each run of SQLite's whitespace made one space. The tool's
-/// own schema SQL has no whitespace inside a literal or quoted name, so a row
-/// equal to it after this is the same statement.
+/// SQL text with each run of SQLite's whitespace made one space. In the
+/// tool's own schema SQL only `tokenize='porter unicode61'` holds whitespace
+/// inside a literal, so a row equal to it after this is the same statement
+/// but for that literal's spacing, which FTS5 then fails to parse.
 fn normalized_sql(sql: &str) -> String {
     sql.split([' ', '\t', '\n', '\r', '\x0c'])
         .filter(|word| !word.is_empty())
@@ -212,7 +213,8 @@ fn schema_cannot_load(e: &rusqlite::Error) -> bool {
 /// eight), then `content='nodes', content_rowid='id'`, then from schema v4
 /// the porter tokenizer. FTS5 reads an external-content table's rows with a
 /// query on the table `content=` names, so a search runs whatever that is:
-/// only these exact items pass (review R2).
+/// only items from these lists pass, each trimmed of whitespace, in any
+/// column order (review R2).
 fn is_own_nodes_fts(sql: &str) -> bool {
     const COLUMNS: [&str; 8] = [
         "name",

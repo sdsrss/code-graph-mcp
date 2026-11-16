@@ -40,29 +40,29 @@ internal tables were edited trips an `assert` in sqlite-vec. Measured on
 Every open now checks the index's schema first, whatever bytes its names and
 SQL hold, and refuses the index if it holds a trigger, view or virtual table
 that is not one of this version's own. Two of the tool's own are also
-accepted in older forms: a `nodes_fts` in a form the tool has written (five
-columns before 0.4.0, no tokenizer option before 0.4.9), and a
-`node_vectors` of another dimension, as before. A `nodes_fts` in any other
-form is refused: FTS5 reads rows through a query on the table its `content=`
-option names, so a search ran whatever that named. On the same index, this
-version's `incremental-index`, `show`, `callgraph` and `health-check` exit
-1, the MCP server exits 1 before answering `initialize`, and `index.db` is
-byte for byte the same afterwards. Files beside it can change, for example:
-the commands' read-only check can create the `-wal` and `-shm` files SQLite
-keeps beside an index in WAL mode (an empty `-wal` and a 32 KB `-shm`), and
-the MCP server, which opens the index for writing before it refuses it,
-leaves an `index.lock` and folds a `-wal` supplied with the index into
-`index.db`. The check costs about 1 ms per command: `show
-reject_unowned_index` on an index of this repository took 1.57 → 2.69 ms
-and, in a second run, 1.54 → 2.64 ms (median wall time per process over 40
-interleaved runs, 0.194.0's source and this version's, both built without
-the embedding model).
+accepted in other forms, as before: a `nodes_fts` listing some of the tool's
+columns (versions before 0.4.0 wrote five, and versions before 0.4.9 no
+tokenizer option), and a `node_vectors` of another dimension. A `nodes_fts`
+with any `content=` but `nodes` or any tokenizer but the porter one is
+refused: FTS5 reads rows through a query on the table `content=` names, so a
+search ran whatever that named. On the same index, this version's
+`incremental-index`, `show`, `callgraph` and `health-check` exit 1, the MCP
+server exits 1 before answering `initialize`, and `index.db` is byte for
+byte the same afterwards; the commands' read-only check can create the
+`-wal` and `-shm` files SQLite keeps beside an index in WAL mode (an empty
+`-wal` and a 32 KB `-shm`), and the MCP server leaves an `index.lock`. With
+a `-wal` supplied beside the index, the MCP server, which opens the index
+for writing before it refuses it, folds that `-wal` into `index.db`. The
+check costs about 1 ms per command: `show reject_unowned_index` on an index
+of this repository took 1.53 → 2.66 ms and, in a second run, 1.56 → 2.70 ms
+(median wall time per process over 40 interleaved runs, 0.194.0's source and
+this version's, both built without the embedding model).
 
 ### Not covered
 
 - SQL in the tool's own tables still runs: a CHECK, DEFAULT, generated
-  column or index expression in a rewritten table runs on the tool's
-  writes, and can call SQLite's functions and sqlite-vec's scalar
+  column or index expression in a rewritten table runs when the tool writes
+  to it (a virtual generated column also when it reads it), and can call SQLite's functions and sqlite-vec's scalar
   functions. We know of no defect in sqlite-vec v0.1.9's scalar functions.
 - Forged rows in the tool's own tables, including the internal tables of
   the vector and full-text tables, are read as data: `health-check`'s
