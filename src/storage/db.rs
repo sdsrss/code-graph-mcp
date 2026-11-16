@@ -67,7 +67,39 @@ pub(crate) fn sqlite_file_name(path: &Path) -> std::path::PathBuf {
 /// its own; the one a killed creation leaves is let through, see
 /// [`rolls_back_only_an_empty_database`]. A `-wal` is not judged: the tool
 /// leaves one behind in normal use, and a crash leaves one SQLite must replay.
+///
+/// Then the schema (D#784, [`foreign_schema_objects`]), on a read-only
+/// connection of its own, for the callers that report a refusal before they
+/// open: `health-check`, `grep` and the CLI context.
 pub(crate) fn reject_unowned_index(db_path: &Path) -> std::io::Result<()> {
+    reject_unowned_files(db_path)?;
+    // A file it cannot read is left to the real open, which checks again on
+    // its own connection.
+    if db_path.is_file() {
+        let foreign = Connection::open_with_flags(
+            sqlite_file_name(db_path),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .and_then(|conn| {
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            foreign_schema_objects(&conn)
+        });
+        if let Ok(foreign) = foreign {
+            if !foreign.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    foreign_schema_message(db_path, &foreign),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The file half of [`reject_unowned_index`]: what SQLite would do to the
+/// file before any statement runs. The `Database` constructors call this one
+/// and check the schema on the connection they go on to use.
+fn reject_unowned_files(db_path: &Path) -> std::io::Result<()> {
     crate::utils::owned::reject_unowned_db(db_path)?;
     let mut journal = db_path.as_os_str().to_os_string();
     journal.push("-journal");
@@ -87,6 +119,143 @@ pub(crate) fn reject_unowned_index(db_path: &Path) -> std::io::Result<()> {
                 journal.display()
             ),
         ));
+    }
+    Ok(())
+}
+
+/// What SQLite writes for a plain table or index: it rebuilds this prefix
+/// itself, and a row whose SQL starts with it parses as nothing else.
+const PLAIN_SCHEMA_PREFIXES: [&str; 3] = ["CREATE TABLE ", "CREATE INDEX ", "CREATE UNIQUE INDEX "];
+
+/// SQL text with each run of SQLite's whitespace made one space. The tool's
+/// own schema SQL has no whitespace inside a literal or quoted name, so a row
+/// equal to it after this is the same statement.
+fn normalized_sql(sql: &str) -> String {
+    sql.split([' ', '\t', '\n', '\r', '\x0c'])
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// This version's triggers and virtual tables, as `(name, normalized_sql)`,
+/// read from its schema built in memory: exactly the rows SQLite stores for
+/// them, with the vector tables included (an index may be opened with or
+/// without them).
+fn own_executable_schema() -> rusqlite::Result<&'static std::collections::HashSet<(String, String)>>
+{
+    static OWN: std::sync::OnceLock<std::collections::HashSet<(String, String)>> =
+        std::sync::OnceLock::new();
+    if let Some(own) = OWN.get() {
+        return Ok(own);
+    }
+    register_sqlite_vec();
+    let conn = Connection::open_in_memory()?;
+    conn.execute_batch(&schema::create_tables_sql())?;
+    conn.execute_batch(&schema::create_vec_tables_sql())?;
+    let mut stmt = conn.prepare("SELECT name, sql FROM sqlite_schema WHERE sql IS NOT NULL")?;
+    let own = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, sql)| !PLAIN_SCHEMA_PREFIXES.iter().any(|p| sql.starts_with(p)))
+        .map(|(name, sql)| (name, normalized_sql(&sql)))
+        .collect();
+    Ok(OWN.get_or_init(|| own))
+}
+
+/// `sql` with the digits of its `float[N]` dimension dropped.
+fn without_vector_dim(sql: &str) -> String {
+    match sql.split_once("float[") {
+        Some((head, tail)) => format!(
+            "{head}float[{}",
+            tail.trim_start_matches(|c: char| c.is_ascii_digit())
+        ),
+        None => sql.to_string(),
+    }
+}
+
+/// Whether a schema row whose SQL is not a plain table or index is one of
+/// the tool's own, in this version's form or an earlier one the open still
+/// upgrades: `nodes_fts` had fewer columns before schema v10, which FTS5 —
+/// SQLite's own module — reads whatever they are, and `node_vectors` of
+/// another dimension is dropped and rebuilt
+/// (`ensure_embedding_dim_consistency`).
+fn is_own_schema_row(
+    own: &std::collections::HashSet<(String, String)>,
+    name: &str,
+    sql: &str,
+) -> bool {
+    if own.contains(&(name.to_string(), sql.to_string())) {
+        return true;
+    }
+    match name {
+        "nodes_fts" => sql.starts_with("CREATE VIRTUAL TABLE nodes_fts USING fts5("),
+        "node_vectors" => own
+            .iter()
+            .any(|(n, s)| n == name && without_vector_dim(s) == without_vector_dim(sql)),
+        _ => false,
+    }
+}
+
+/// D#784: the schema rows of an index that SQLite would run as code the tool
+/// did not write — a trigger, a view, a virtual table, or one of the tool's
+/// own names with other SQL — as `type "name"` labels. SQL stored in an index
+/// runs inside this process when the index is used: a trigger on the tool's
+/// writes, a view or virtual table when read, and with sqlite-vec loaded that
+/// reached memory errors in it (GHSA-q67h-24gq-4263, Not fixed). SQLite builds
+/// each object from its row's SQL text, so the text decides: a plain table or
+/// index passes, any other row must be one of the tool's own
+/// ([`is_own_schema_row`]). A missing one is not foreign; the open creates it.
+fn foreign_schema_objects(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let own = own_executable_schema()?;
+    let mut stmt = conn.prepare(
+        "SELECT coalesce(type, ''), coalesce(name, ''), CAST(sql AS TEXT) \
+         FROM sqlite_schema WHERE sql IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut foreign = Vec::new();
+    for row in rows {
+        let (kind, name, sql) = row?;
+        if PLAIN_SCHEMA_PREFIXES.iter().any(|p| sql.starts_with(p)) {
+            continue;
+        }
+        if !is_own_schema_row(own, &name, &normalized_sql(&sql)) {
+            // Debug-quoted: the name comes from the file, and the message goes
+            // to a terminal.
+            foreign.push(format!("{kind} {name:?}"));
+        }
+    }
+    Ok(foreign)
+}
+
+fn foreign_schema_message(db_path: &Path, foreign: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let mut listed = foreign[..foreign.len().min(SHOWN)].join(", ");
+    if foreign.len() > SHOWN {
+        listed.push_str(&format!(" and {} more", foreign.len() - SHOWN));
+    }
+    format!(
+        "refusing to open {}: it holds schema objects code-graph-mcp does not create \
+         ({listed}); SQL stored in an index runs when the index is used, and a repository \
+         can carry one — delete {}* and re-run to rebuild the index",
+        db_path.display(),
+        db_path.display()
+    )
+}
+
+/// The open-time half of [`foreign_schema_objects`], on the connection the
+/// caller goes on to use, before any statement that could fire a trigger.
+/// Fails closed: a schema it cannot read fails the open.
+fn refuse_foreign_schema(db_path: &Path, conn: &Connection) -> Result<()> {
+    let foreign = foreign_schema_objects(conn)?;
+    if !foreign.is_empty() {
+        anyhow::bail!("{}", foreign_schema_message(db_path, &foreign));
     }
     Ok(())
 }
@@ -237,7 +406,7 @@ impl Database {
         // Before SQLite sees the path: it follows a symlinked index.db to the
         // target, and a read-only open of a WAL database still writes its
         // -shm/-wal there (D#363; see `reject_unowned_db`).
-        reject_unowned_index(path)?;
+        reject_unowned_files(path)?;
         Self::open_readonly_named(path)
     }
 
@@ -267,6 +436,16 @@ impl Database {
             PRAGMA mmap_size = 0;
         ",
         )?;
+        // A user-named snapshot skips `reject_unowned_index`, and a view or a
+        // virtual table runs when read (D#784). A schema this connection
+        // cannot read is let through, as the probes below let it through: no
+        // statement can run against it, and the snapshot reader then
+        // answers it in its own words.
+        if let Ok(foreign) = foreign_schema_objects(&conn) {
+            if !foreign.is_empty() {
+                anyhow::bail!("{}", foreign_schema_message(&path, &foreign));
+            }
+        }
         // Future-schema refusal, same verdict the primary path gives. A secondary
         // never migrates (the primary owns bootstrap), so without this check a
         // mixed-version session — an updated binary indexing while the old one is
@@ -326,7 +505,7 @@ impl Database {
         // call follows links): a symlinked index.db is opened at its TARGET by
         // SQLite, and an indexer open then rewrites or creates a database
         // outside the project (D#363; see `reject_unowned_db`).
-        reject_unowned_index(path)?;
+        reject_unowned_files(path)?;
         // Proactive sub-header size guard: any pre-existing main file smaller
         // than the 100-byte SQLite database header cannot be a valid database.
         // Without this, post-crash residue (0-byte main + stale .wal/.shm,
@@ -463,6 +642,10 @@ impl Database {
         register_sqlite_vec();
 
         let conn = Connection::open(path).map_err(|e| Self::explain_open_error(path, e))?;
+        // Ahead of every statement below: migrations, table creation and the
+        // INDEX_VERSION sweep all write, and a write fires the index's triggers.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        refuse_foreign_schema(path, &conn)?;
 
         conn.execute_batch(
             "
@@ -2597,9 +2780,12 @@ mod tests {
     #[test]
     fn sql_stored_in_an_index_reaches_nothing_outside_it() {
         // D#772 (2026-11-10): a `.code-graph/` the repository supplies (a committed
-        // index.db or -wal) is used as the index, by decision. That holds only while
-        // SQL stored in such a file (its triggers and views) can touch nothing but
-        // the database: no function or module that reads or writes files, takes a
+        // index.db or -wal) is used as the index, by decision. Since D#784 an index
+        // holding a trigger, view or virtual table the tool does not create is
+        // refused (`schema_objects_the_tool_does_not_create_are_refused`), but SQL
+        // stored in the tool's own tables still runs: a CHECK, DEFAULT, generated
+        // column or index expression in a rewritten table. That stays safe only
+        // while no registered function or module reads or writes files, takes a
         // pointer, or loads code. Anything this test starts to see beyond the lists
         // below re-opens D#772 — check what it can reach before adding it here.
         use std::collections::BTreeSet;
@@ -3944,5 +4130,138 @@ mod tests {
             .expect_err("two 1,024-byte pages hold a table")
             .to_string();
         assert!(msg.contains("rollback journal"), "{msg}");
+    }
+
+    /// An index whose schema matches what this version creates, with the
+    /// vector tables (`open_with_vec`) and without them (`open`).
+    fn own_index(dir: &TempDir, with_vec: bool) -> std::path::PathBuf {
+        let db = dir.path().join("index.db");
+        if with_vec {
+            drop(Database::open_with_vec(&db).unwrap());
+        } else {
+            drop(Database::open(&db).unwrap());
+        }
+        db
+    }
+
+    /// D#784: SQL stored in an index runs inside this process — a trigger on
+    /// the tool's own writes, a view or a virtual table the tool never creates —
+    /// and with sqlite-vec loaded that still aborted the process (0.191.1's
+    /// GHSA, Not fixed). The tool creates exactly the triggers and virtual
+    /// tables of its own schema and no view, so an index holding anything else
+    /// was not written by it and every open refuses it, readers included.
+    #[test]
+    fn schema_objects_the_tool_does_not_create_are_refused() {
+        let plants: [(&str, &str); 7] = [
+            (
+                "nodes_fts on another module",
+                "DROP TABLE nodes_fts; \
+                 CREATE VIRTUAL TABLE nodes_fts USING vec0(embedding float[4]);",
+            ),
+            (
+                "a trigger",
+                "CREATE TRIGGER planted AFTER INSERT ON nodes BEGIN SELECT 1; END;",
+            ),
+            ("a view", "CREATE VIEW planted AS SELECT 1;"),
+            (
+                "one of the tool's trigger names with another body",
+                "DROP TRIGGER nodes_ai; \
+                 CREATE TRIGGER nodes_ai AFTER INSERT ON nodes BEGIN SELECT 1; END;",
+            ),
+            (
+                "a vec0 table",
+                "CREATE VIRTUAL TABLE planted USING vec0(embedding float[4]);",
+            ),
+            (
+                "an fts5 table",
+                "CREATE VIRTUAL TABLE planted USING fts5(body);",
+            ),
+            (
+                "node_vectors with another definition",
+                "DROP TABLE node_vectors; \
+                 CREATE VIRTUAL TABLE node_vectors USING vec0(\
+                 node_id INTEGER PRIMARY KEY, embedding float[384], n integer);",
+            ),
+        ];
+        for (shape, sql) in plants {
+            let dir = TempDir::new().unwrap();
+            let db = own_index(&dir, true);
+            {
+                let c = Connection::open(&db).unwrap();
+                register_sqlite_vec();
+                c.execute_batch(sql).unwrap();
+            }
+            let before = std::fs::read(&db).unwrap();
+            let msg = reject_unowned_index(&db).expect_err(shape).to_string();
+            assert!(
+                msg.contains("does not create"),
+                "{shape}: the refusal names the cause: {msg}"
+            );
+            for (open, result) in [
+                ("open", Database::open(&db).map(drop)),
+                ("open_with_vec", Database::open_with_vec(&db).map(drop)),
+                (
+                    "open_nondestructive",
+                    Database::open_nondestructive(&db).map(drop),
+                ),
+                ("open_readonly", Database::open_readonly(&db).map(drop)),
+                // The user-named snapshot path skips `reject_unowned_index`.
+                (
+                    "open_readonly_named",
+                    Database::open_readonly_named(&db).map(drop),
+                ),
+            ] {
+                let err = result.expect_err(&format!("{shape}: {open}")).to_string();
+                assert!(err.contains("does not create"), "{shape}: {open}: {err}");
+            }
+            assert!(
+                std::fs::read(&db).unwrap() == before,
+                "{shape}: a refused index is left as it was"
+            );
+        }
+    }
+
+    /// The refusal comes before the first write of an open. A stale
+    /// INDEX_VERSION makes an indexer's open clear the tables, which fires a
+    /// DELETE trigger on them: before D#784 a planted one ran there.
+    #[test]
+    fn a_planted_trigger_never_runs_on_open() {
+        let dir = TempDir::new().unwrap();
+        let db = own_index(&dir, false);
+        {
+            let c = Connection::open(&db).unwrap();
+            c.execute_batch(&format!(
+                "CREATE TABLE fired(n); \
+                 INSERT INTO files(path, blake3_hash, last_modified, indexed_at) \
+                     VALUES ('a.py', 'h', 0, 0); \
+                 CREATE TRIGGER planted AFTER DELETE ON files \
+                     BEGIN INSERT INTO fired VALUES (1); END; \
+                 PRAGMA application_id = {};",
+                crate::domain::INDEX_VERSION - 1
+            ))
+            .unwrap();
+        }
+        let _ = Database::open(&db);
+        let fired: i64 = Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT count(*) FROM fired", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fired, 0, "the planted trigger ran during open");
+    }
+
+    /// The control: the tool's own index opens through every constructor,
+    /// built with the vector tables or without them — a missing object of the
+    /// tool's schema is created later, it is not foreign.
+    #[test]
+    fn the_tools_own_schema_is_not_refused() {
+        for with_vec in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let db = own_index(&dir, with_vec);
+            reject_unowned_index(&db).unwrap();
+            drop(Database::open(&db).unwrap());
+            drop(Database::open_with_vec(&db).unwrap());
+            drop(Database::open_readonly(&db).unwrap());
+            drop(Database::open_readonly_named(&db).unwrap());
+        }
     }
 }

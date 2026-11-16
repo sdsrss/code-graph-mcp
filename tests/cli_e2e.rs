@@ -12130,6 +12130,10 @@ fn impact_stays_silent_when_the_traversal_was_complete() {
 /// `nodes` carries a `vec0` trigger (`nodes_vectors_ad`), so a bare rusqlite
 /// handle cannot ALTER the table at all — it fails with "no such module: vec0"
 /// before touching anything, which would have made this a test of the fixture.
+///
+/// The `nodes` triggers are dropped first: a rename rewrites them onto the
+/// moved table, and an index holding triggers in a form the tool does not
+/// create is refused at open (D#784) — a different failure than this one.
 fn break_node_lookup(project: &TempDir) {
     let db_path = project
         .path()
@@ -12138,7 +12142,9 @@ fn break_node_lookup(project: &TempDir) {
     let db = code_graph_mcp::storage::db::Database::open(&db_path).unwrap();
     db.conn()
         .execute_batch(
-            "ALTER TABLE nodes RENAME TO nodes_moved_by_test;\n\
+            "DROP TRIGGER nodes_ai; DROP TRIGGER nodes_ad; DROP TRIGGER nodes_au;\n\
+             DROP TRIGGER IF EXISTS nodes_vectors_ad;\n\
+             ALTER TABLE nodes RENAME TO nodes_moved_by_test;\n\
              CREATE TABLE nodes (\n\
                  id INTEGER PRIMARY KEY,\n\
                  file_id INTEGER NOT NULL,\n\
@@ -14358,27 +14364,34 @@ fn test_cli_refuses_a_hot_journal_beside_the_index() {
     assert!(stdout.contains("validateToken"), "{stdout}");
 }
 
-/// D#775: an index the repository supplies can carry SQL of its own, and a
-/// trigger in it runs whenever code-graph-mcp writes. With the vendored
-/// sqlite-vec 0.1.6 two such calls killed the process instead of failing: on
-/// 0.191.0 `incremental-index` ended with "double free or corruption" (SIGABRT,
-/// `vec_distance_l2` frees a stack address when its second vector is bad) and
-/// with SIGSEGV (`vec_each` closes a cursor through a NULL cleanup). Each must
-/// now end the way any failing trigger does: the control arm's RAISE shows that
-/// this write reaches the trigger and what a trigger error exits with.
+/// D#775: an index the repository supplies can carry SQL of its own. With the
+/// vendored sqlite-vec 0.1.6 two calls from a trigger in it killed the process
+/// instead of failing: on 0.191.0 `incremental-index` ended with "double free
+/// or corruption" (SIGABRT, `vec_distance_l2` frees a stack address when its
+/// second vector is bad) and with SIGSEGV (`vec_each` closes a cursor through
+/// a NULL cleanup).
+///
+/// D#784: such an index is now refused before its first write, so a planted
+/// trigger never runs, whatever it calls (the RAISE arm would show it). An
+/// expression index on one of the tool's tables is a plain index and still
+/// runs on the tool's writes (CHANGELOG, Not covered); `vec_distance_l2` there
+/// must end the way any failing expression does, which the json_extract arm
+/// shows. `vec_each` is a table-valued function, which an index expression
+/// cannot call.
 #[test]
 fn test_cli_survives_vec_calls_planted_in_an_index_trigger() {
-    let run_with_trigger = |body: &str| {
+    let run_with = |plant: &str| {
         let project = setup_indexed_project();
         let db = project
             .path()
             .join(code_graph_mcp::domain::CODE_GRAPH_DIR)
             .join("index.db");
-        rusqlite::Connection::open(&db)
+        // Through `Database`: an index expression is evaluated for the rows
+        // already there when it is created, which needs sqlite-vec loaded.
+        code_graph_mcp::storage::db::Database::open(&db)
             .unwrap()
-            .execute_batch(&format!(
-                "CREATE TRIGGER planted AFTER INSERT ON nodes BEGIN {body}; END;"
-            ))
+            .conn()
+            .execute_batch(plant)
             .unwrap();
         std::fs::write(
             project.path().join("src/extra.ts"),
@@ -14398,27 +14411,51 @@ fn test_cli_survives_vec_calls_planted_in_an_index_trigger() {
         (output.status, text)
     };
 
-    let (control, text) = run_with_trigger("SELECT RAISE(ABORT, 'planted trigger fired')");
-    assert!(
-        text.contains("planted trigger fired"),
-        "the write must reach the trigger, or the arms below test nothing: {control:?} {text}"
-    );
-    let expected = control.code();
-    assert!(expected.is_some(), "{control:?} {text}");
-
     for body in [
+        "SELECT RAISE(ABORT, 'planted trigger fired')",
         "SELECT vec_distance_l2('[1,2]', 'x')",
         "SELECT value FROM vec_each('x')",
     ] {
-        let (status, text) = run_with_trigger(body);
-        // Killed by a signal: `code()` is None on Unix; a Windows crash exits
-        // with an NTSTATUS, which differs from the control's code too.
-        assert_eq!(
-            status.code(),
-            expected,
-            "{body}: must fail like any trigger error, not crash: {status:?} {text}"
+        let (status, text) = run_with(&format!(
+            "CREATE TRIGGER planted AFTER INSERT ON nodes BEGIN {body}; END;"
+        ));
+        assert_eq!(status.code(), Some(1), "{body}: {status:?} {text}");
+        assert!(
+            text.contains("does not create") && text.contains("trigger \"planted\""),
+            "{body}: refused, naming the trigger: {text}"
+        );
+        assert!(
+            !text.contains("planted trigger fired"),
+            "{body}: the trigger ran: {text}"
         );
     }
+
+    // Only the new node's row takes the failing argument: the rows already
+    // indexed are evaluated when the index is created.
+    let bad_for_extra = |good: &str| format!("CASE WHEN name = 'extra' THEN 'x' ELSE '{good}' END");
+    let (control, text) = run_with(&format!(
+        "CREATE INDEX planted ON nodes(json_extract({}, '$'));",
+        bad_for_extra("1")
+    ));
+    assert!(
+        text.contains("malformed JSON"),
+        "the write must reach the index expression, or the arm below tests nothing: \
+         {control:?} {text}"
+    );
+    let expected = control.code();
+    assert!(expected.is_some(), "{control:?} {text}");
+    let (status, text) = run_with(&format!(
+        "CREATE INDEX planted ON nodes(vec_distance_l2('[1,2]', {}));",
+        bad_for_extra("[1,2]")
+    ));
+    // Killed by a signal: `code()` is None on Unix; a Windows crash exits with
+    // an NTSTATUS, which differs from the control's code too.
+    assert_eq!(
+        status.code(),
+        expected,
+        "vec_distance_l2 in an index expression must fail like any expression error, \
+         not crash: {status:?} {text}"
+    );
 }
 
 /// E2E 2026-10-16 (CLI-user QA, P0): on leveldb every `affected` answered
