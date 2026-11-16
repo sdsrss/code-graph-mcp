@@ -39,14 +39,17 @@ internal tables were edited trips an `assert` in sqlite-vec. Measured on
 
 Every open now checks the index's schema first and refuses the index if it
 holds a trigger, view or virtual table that is not one of this version's
-own (an older `nodes_fts` column set and a `node_vectors` of another
-dimension are still upgraded, as before). On the same index, this version's
-`incremental-index`, `show`, `callgraph` and `health-check` exit 1, the MCP
-server exits 1 before answering `initialize`, and the index files are byte
-for byte the same afterwards. Each command reads the schema once more:
-`show` 2.2 → 3.3 ms and `health-check --json` 74.8 → 78.4 ms (medians of 40
-interleaved runs on this repository, both arms built from source without
-the embedding model).
+own. Two of the tool's own are accepted in other forms, as before: a
+`nodes_fts` whatever its fts5 arguments (older versions created it with
+fewer columns), and a `node_vectors` of another dimension, which is dropped
+and rebuilt. On the same index, this version's `incremental-index`, `show`,
+`callgraph` and `health-check` exit 1, the MCP server exits 1 before
+answering `initialize`, and `index.db` is byte for byte the same
+afterwards. The check's read-only open can still create the `-wal` and
+`-shm` files SQLite keeps beside an index in WAL mode when they are absent
+(an empty `-wal` and a 32 KB `-shm`). Each command reads the schema once
+more: `show` 2.2 → 3.3 ms (medians of 40 interleaved runs on this
+repository, both arms built from source without the embedding model).
 
 ### Not covered
 
@@ -57,7 +60,14 @@ the embedding model).
 - Forged rows in the tool's own tables, including the internal tables of
   the vector and full-text tables, are read as data: `health-check`'s
   integrity check and vector search read them. We know of no path from
-  them to a crash (from reading sqlite-vec's code; not fuzzed).
+  them to a crash (from reading sqlite-vec's code; not fuzzed). A
+  `nodes_fts` with other fts5 arguments (another tokenizer, external
+  content) is used as it is; FTS5 is SQLite's own module.
+- A schema object whose name is not valid UTF-8 also stops
+  `incremental-index`, `show`, `health-check`, `snapshot inspect` and the MCP
+  server (exit 1, `index.db` unchanged), but with an `invalid utf-8 sequence`
+  error instead of the refusal message, and `health-check --json` answers
+  `"error"`, not `"reason": "refused"`.
 - Which `.code-graph` to trust is still not decided: an index that passes
   this check is used as it is, contents included (0.191.0, Not covered).
   Not running code-graph-mcp in a repository that commits `.code-graph/`
