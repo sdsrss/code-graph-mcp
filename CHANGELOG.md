@@ -1,5 +1,116 @@
 # Changelog
 
+## 0.194.0
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 140 → 141
+because the stored graph changes for unchanged source: Go call edges, and
+JavaScript/TypeScript `extends` / `implements` edges (below). The MCP
+server rebuilds the index when it starts. From the command line, a query
+answers from the old index with "This index was built by an older
+code-graph (index v140, this binary v141): answers come from it until it is
+rebuilt — run: code-graph-mcp reindex", and the first `incremental-index`
+prints "Index version mismatch (stored v140 ≠ binary v141): clearing +
+rebuilding". 0.193.0 answers queries from an index this version wrote but
+will not write to it: its `incremental-index` exits 1 and says to delete
+`.code-graph/index.db*` first. To pin the binary back:
+`npm i -g @sdsrs/code-graph@0.193.0` (or, from source, `cargo install
+--locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.193.0
+--features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The
+plugin's scripts are unchanged.
+
+Measured on six projects, each indexed by 0.193.0 and by this version from
+identical copies, edges compared by relation, caller and callee:
+
+- gin (75ccf94d, 101 files): call pairs 4,034 → 3,739 (337 removed, 34 of
+  them above the default `inferred` floor; 42 added, all `ambiguous`).
+- cobra (v1.8.1): call pairs 1,556 → 1,546 (10 removed, none above the
+  floor); 1 relabelled `ambiguous` → `inferred`.
+- BurntSushi/toml (v1.4.0): call pairs 1,394 → 1,387 (7 removed, 5 above
+  the floor); 5 relabelled `ambiguous` → `inferred`.
+- hono (4.6.14): `inherits` pairs 70 → 74 (4 added); no other pair changed.
+- flask (d086db85) and express (4.21.2): no edge changed.
+
+### fix: a Go call on a method's receiver binds its type's method
+
+Go method calls reached the resolver as bare names, so a call bound every
+same-named definition in the caller's file, then free functions of that name
+elsewhere. A call on the method's own receiver (`r.WriteContentType(w)` in
+`func (r IndentedJSON) Render(…)`) now binds a method of the receiver's type: its
+own, else one an embedded type promotes, never an override in a type that
+embeds it, since Go has no virtual dispatch. A call on any other value the
+function binds is a member call, which binds no free function. On gin,
+`callgraph --node-id` of `JSON.WriteContentType` listed five other JSON
+renderers' `Render` methods as callers above the floor; it now lists one,
+`AsciiJSON.Render` (Not covered, below). `Error.MarshalJSON`'s callees were `Error.JSON` and
+`errorMsgs.JSON`; now `Error.JSON` alone. `refs GET --file ginS/gins.go`
+answered 51 references, all calls from test files (`router.GET()`); it now finds none,
+and those calls bind `RouterGroup.GET`, which `Engine` embeds (20 of the 42
+added pairs). Calls in another file of the same package on the receiver are
+`inferred` where they were `ambiguous` (cobra 1, toml 5, above).
+
+### fix: a Go call on a value never binds a type
+
+A call on a value runs a method; a conversion names the type itself
+(`T(x)`, `pkg.T(x)`). Bound by name, gin's `c.Request.Context()` in five
+`Context` methods bound the struct `Context` at `extracted`, and test calls
+such as `w.Body.String()` the struct `String` of render/text.go. On gin,
+`refs String --file render/text.go` answered 88 references, 84 of them
+calls; it now answers 4, none of them calls. `callgraph Deadline --file
+context.go --direction callees` listed the struct `Context` and
+`hasRequestContext`; it now lists `hasRequestContext`. The type is dropped
+from what the call binds, not from the names it is chosen among, so a call
+whose nearest candidate was the type binds nothing rather than another
+directory's methods. gin's Go `calls` edges into structs, interfaces and
+named types went 178 → 39, none added; toml lost 2 (`rv.Type().Key()` → the
+type `Key`).
+
+### fix: a JS/TS class extending an imported alias extends the class
+
+hono's hono-base.ts declares `class Hono` and exports it as
+`export { Hono as HonoBase }`; hono.ts and preset/{quick,tiny}.ts import
+`HonoBase` and extend it. No node is named `HonoBase`, so the three classes
+had no `inherits` edge. A class or interface extending a name it imports
+from a relative path now extends what the import resolves to in the named
+file, whatever name it is exported under. `refs Hono --file
+src/hono-base.ts` answered 40 references with no `inherits` row; it now
+answers 43, the three subclasses among them. jsx/base.ts's `interface
+IntrinsicElements extends IntrinsicElementsDefined`, a renamed import, gains
+its edge too.
+
+### fix(deps): quinn-udp 0.5.16 (RUSTSEC-2026-0538)
+
+`Cargo.lock` moves quinn-udp 0.5.14 → 0.5.16 for "Receive loop can spin
+after a truncated datagram". `cargo tree -i quinn-udp --target all` prints
+nothing for either feature set: no released binary contains it. This
+repository's scheduled `cargo audit` had been failing on it since
+2026-11-14.
+
+### ci: softprops/action-gh-release 3.0.3 → 3.0.4
+
+The release workflow's GitHub Release step (dependabot PR #54). Nothing a
+user installs changes.
+
+### Not covered
+
+- A Go call on a value whose type the call site does not show still binds by
+  name among the methods of that name, at `ambiguous`: gin's
+  `w.Body.String()` (a `*bytes.Buffer`) binds five `String` methods, and
+  `c.Bind(obj)` in a function literal twelve `Bind` methods. Parameters'
+  declared types are not read: `remoteIP.String()` in `Context.ClientIP` (a
+  `net.IP`) binds `Context.String` at `extracted`.
+- A Go receiver redeclared by `range` or `:=` in any nested block makes the
+  whole method's calls on it untyped: gin's `AsciiJSON.Render` still binds
+  all six `WriteContentType` methods of render/json.go.
+- A Go call with no value at its root, such as one on a composite literal
+  (`(JSON{data}).Render(w)`), still binds by name, types included (gin: 25
+  edges to the interface `Render`).
+- `refs HonoBase` answers "Symbol not found": queries do not know export
+  aliases. A call or `new` through an export alias (`aliasHelper()` after
+  `import { aliasHelper }` of `export { helper as aliasHelper }`) binds
+  nothing (hono: 3 calls). CommonJS `require` bindings and default imports
+  are not followed for `extends`.
+
 ## 0.193.0
 
 **Upgrading: no index rebuild, and a CLI query can now wait up to 2
