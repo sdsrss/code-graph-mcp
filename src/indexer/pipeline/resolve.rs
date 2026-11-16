@@ -533,6 +533,7 @@ pub(super) fn resolve_pending_calls_touching(
                 match recv_type_targets(
                     &t,
                     dispatch,
+                    &row.source_language,
                     &candidates,
                     db,
                     &mut classes,
@@ -5596,6 +5597,7 @@ fn owner_path(qualified: &str) -> Vec<&str> {
 pub(super) fn recv_type_targets(
     ty: &str,
     dispatch: bool,
+    language: &str,
     candidates: &[i64],
     db: &crate::storage::db::Database,
     classes: &mut ProjectClassNames,
@@ -5645,6 +5647,20 @@ pub(super) fn recv_type_targets(
         } else {
             exact.push(id);
         }
+    }
+    // A Go method is declared in its type's package, one directory, and a
+    // receiver's type is the method's own: another package's same-named type
+    // is no owner (R12 review: `s.Start()` in `a.Server` bound `b.Server.Start`).
+    if language == "go" {
+        let dir = |p: &str| p.rsplit_once('/').map_or("", |(d, _)| d).to_string();
+        let caller_dir = dir(caller_path);
+        let in_package = |id: &i64| {
+            node_id_to_path
+                .get(id)
+                .is_some_and(|p| dir(p) == caller_dir)
+        };
+        exact.retain(in_package);
+        nested.retain(in_package);
     }
     let known = by_last.contains_key(last);
     let top_level = by_last

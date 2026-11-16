@@ -5129,6 +5129,7 @@ fn resolve_deferred_relations(
                         match recv_type_targets(
                             &recv_type,
                             dispatch,
+                            &d.language,
                             &same_lang,
                             db,
                             &mut classes,

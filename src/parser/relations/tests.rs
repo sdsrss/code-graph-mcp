@@ -777,8 +777,11 @@ fn test_go_package_call_operand_bound_anywhere_in_the_function_is_a_value() {
          func d() { log.Printf(\"x\") }\n",
         "go",
     );
+    // A `:=`-bound name shadowing a package is the package before the
+    // statement and the value after it; the function's names are collected
+    // blind to scope, so such a call binds by name, as before R11.
     for value_call in ["Infof", "Warnf", "Helper"] {
-        assert_eq!(meta_of(&calls, value_call), Some(MEMBER), "{value_call}");
+        assert_eq!(meta_of(&calls, value_call), None, "{value_call}");
     }
     assert_eq!(
         meta_of(&calls, "Printf"),

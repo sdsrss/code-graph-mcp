@@ -397,6 +397,10 @@ struct GoDecl {
     /// The bare names it assigns with `=`. Such a name is a variable, but
     /// assigning keeps its type (`r.f = x` and `*p = x` assign neither).
     assigned: HashSet<String>,
+    /// Its parameters' own names (not names inside a function-typed
+    /// parameter's signature): bound in the whole body, unlike a `:=` name,
+    /// whose scope starts at the next statement.
+    params: HashSet<String>,
 }
 
 impl GoDecl {
@@ -412,6 +416,21 @@ impl GoDecl {
             });
         let mut declared = HashSet::new();
         let mut assigned = HashSet::new();
+        let mut params = HashSet::new();
+        if let Some(list) = decl.child_by_field_name("parameters") {
+            let mut cursor = list.walk();
+            for p in list.named_children(&mut cursor).filter(|p| {
+                matches!(
+                    p.kind(),
+                    "parameter_declaration" | "variadic_parameter_declaration"
+                )
+            }) {
+                let mut names = p.walk();
+                for name in p.children_by_field_name("name", &mut names) {
+                    params.insert(node_text(&name, source).to_string());
+                }
+            }
+        }
         for field in ["parameters", "result"] {
             if let Some(p) = decl.child_by_field_name(field) {
                 collect_go_idents(&p, source, &mut declared, 0);
@@ -425,6 +444,7 @@ impl GoDecl {
             receiver,
             declared,
             assigned,
+            params,
         }
     }
 }
@@ -498,7 +518,8 @@ fn collect_go_body_names(
 ///
 /// None for a name nothing in the function binds: a package the imports
 /// spell another way, a package-level value, or a package call
-/// ([`go_package_call`]); those bind by name, as before.
+/// ([`go_package_call`]); and for a name the file imports a package under,
+/// unless it is the receiver or a parameter. Those bind by name, as before.
 pub(super) enum GoValueCall {
     Typed(String),
     Member,
@@ -540,6 +561,16 @@ pub(super) fn go_value_call(call: &tree_sitter::Node, source: &str) -> Option<Go
                 Some(GoValueCall::Typed(ty.clone()))
             }
             Some(_) => Some(GoValueCall::Member),
+            // `declared` and `assigned` are the whole function's, blind to
+            // scope, so a name the file also imports a package under may be
+            // the package at this call: `config := config.Load()` runs
+            // package `config`'s `Load` (R12 review). Bound by name, as before
+            // R11, unless a parameter binds it in the whole body.
+            None if !decl.params.contains(name)
+                && GO_IMPORTS.with(|m| m.borrow().contains_key(name)) =>
+            {
+                None
+            }
             None if decl.declared.contains(name) || decl.assigned.contains(name) => {
                 Some(GoValueCall::Member)
             }

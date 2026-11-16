@@ -1961,6 +1961,110 @@ fn test_go_call_on_a_value_never_binds_a_type() {
     assert_incremental_matches_rebuild(&files, &[("types.go", None)]);
 }
 
+/// R12 review: a Go function that binds a variable named like a package the
+/// file imports may still call the package: Go scopes `config` in
+/// `config := config.Load()` from the next statement on, and the function's
+/// bound names are collected blind to scope. Such a call binds by name, as
+/// before R11, instead of as a member call, which bound nothing.
+#[test]
+fn test_go_package_call_through_a_name_a_local_shadows() {
+    let (_p, _d, db) = fresh_index_of(&[
+        ("go.mod", "module example.com/app\n"),
+        (
+            "config/config.go",
+            "package config\n\ntype Config struct{}\n\n\
+             func Load() *Config { return nil }\n\
+             func (c *Config) Validate() error { return nil }\n",
+        ),
+        (
+            "user/user.go",
+            "package user\n\nfunc Get(id int) (int, error) { return 0, nil }\n",
+        ),
+        (
+            "main.go",
+            "package main\n\nimport (\n\t\"example.com/app/config\"\n\t\"example.com/app/user\"\n)\n\n\
+             func run() error {\n\tconfig := config.Load()\n\treturn config.Validate()\n}\n\n\
+             func lookup(id int) error {\n\tuser, err := user.Get(id)\n\t_ = user\n\treturn err\n}\n",
+        ),
+    ]);
+    assert_eq!(go_callees_of(&db, "run"), ["Config.Validate", "Load"]);
+    assert_eq!(go_callees_of(&db, "lookup"), ["Get"]);
+}
+
+/// R12 review: a Go method is declared in its type's package, so a call on a
+/// method's receiver binds a method of that name in the caller's package
+/// directory only: another package's same-named type (`b.Server`, `b.Client`)
+/// is no candidate. Matched by bare type name, `s.Start()` in `a.Server`
+/// bound `b.Server.Start` at `inferred` instead of `a.Base.Start`, and
+/// `c.Do()` in `a.Client` bound `b.Client.Do` beside `a.Client.Do`.
+#[test]
+fn test_go_receiver_call_binds_its_own_packages_type() {
+    let (_p, _d, db) = fresh_index_of(&[
+        ("go.mod", "module example.com/app\n"),
+        (
+            "a/server.go",
+            "package a\n\ntype Base struct{}\n\nfunc (b *Base) Start() {}\n\n\
+             type Server struct{ Base }\n",
+        ),
+        (
+            "a/run.go",
+            "package a\n\nfunc (s *Server) Run() { s.Start() }\n",
+        ),
+        (
+            "b/server.go",
+            "package b\n\ntype Server struct{}\n\nfunc (s *Server) Start() {}\n",
+        ),
+        (
+            "a/client.go",
+            "package a\n\ntype Client struct{}\n\nfunc (c *Client) Do() {}\n",
+        ),
+        (
+            "a/use.go",
+            "package a\n\nfunc (c *Client) Run() { c.Do() }\n",
+        ),
+        (
+            "b/client.go",
+            "package b\n\ntype Client struct{}\n\nfunc (c *Client) Do() {}\n",
+        ),
+    ]);
+    let callees = |caller: &str| -> Vec<String> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT ft.path || ':' || nt.qualified_name FROM edges e \
+                 JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON nt.id = e.target_id \
+                 JOIN files fs ON fs.id = ns.file_id JOIN files ft ON ft.id = nt.file_id \
+                 WHERE e.relation = 'calls' AND fs.path || ':' || ns.qualified_name = ?1 \
+                 ORDER BY 1",
+            )
+            .unwrap();
+        let rows = stmt.query_map([caller], |r| r.get::<_, String>(0)).unwrap();
+        rows.filter_map(Result::ok).collect()
+    };
+    assert_eq!(callees("a/run.go:Server.Run"), ["a/server.go:Base.Start"]);
+    assert_eq!(callees("a/use.go:Client.Run"), ["a/client.go:Client.Do"]);
+    // The call buffered while no `Start` exists; the other package's arrives:
+    // the pending sweep decides it as a rebuild does.
+    assert_incremental_matches_rebuild(
+        &[
+            ("go.mod", "module example.com/app\n"),
+            (
+                "a/server.go",
+                "package a\n\ntype Base struct{}\n\ntype Server struct{ Base }\n",
+            ),
+            (
+                "a/run.go",
+                "package a\n\nfunc (s *Server) Run() { s.Start() }\n",
+            ),
+            ("b/doc.go", "package b\n"),
+        ],
+        &[(
+            "b/server.go",
+            Some("package b\n\ntype Server struct{}\n\nfunc (s *Server) Start() {}\n"),
+        )],
+    );
+}
+
 /// R11: a JS/TS class extending a name it imports extends what that import
 /// binds, through the export walk: hono's `export { Hono as HonoBase }` gave
 /// `extends HonoBase` in hono.ts and the presets no edge, no node being named
