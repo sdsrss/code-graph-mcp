@@ -1889,6 +1889,8 @@ fn resolve_batch_relations(
         }
         record_js_export_entries(db, pf)?;
         let local_ids: HashSet<i64> = pf.node_ids.iter().copied().collect();
+        // This file's functions and methods, for a Go call's same-file tier.
+        let mut local_callables: Option<HashSet<i64>> = None;
         // Node indexes by name and by qualified name, ascending, each node at
         // most once per key: a relation's scope is looked up here instead of
         // by a scan of the file per relation (50,000 calls in a file of
@@ -2709,6 +2711,33 @@ fn resolve_batch_relations(
                 {
                     continue;
                 }
+                // A Go call on a value never runs a type (R12,
+                // `go_value_call_never`): dropped from this tier's result,
+                // which this file's nodes alone decide, not passed to the next.
+                let same_file_targets = if rel.relation == REL_CALLS && pf.language == "go" {
+                    let callables = local_callables.get_or_insert_with(|| {
+                        pf.node_ids
+                            .iter()
+                            .zip(&pf.node_types)
+                            .filter(|(_, t)| matches!(t.as_str(), "function" | "method"))
+                            .map(|(id, _)| *id)
+                            .collect()
+                    });
+                    let never = super::resolve::go_value_call_never_of(
+                        rel.metadata.as_deref(),
+                        &same_file_targets,
+                        callables,
+                    );
+                    if !never.is_empty() && same_file_targets.iter().all(|id| never.contains(id)) {
+                        continue;
+                    }
+                    same_file_targets
+                        .into_iter()
+                        .filter(|id| !never.contains(id))
+                        .collect()
+                } else {
+                    same_file_targets
+                };
                 cpp_implicit_this_members(&pf.language, rel, same_file_targets, &local_qualified)
             } else if rel.relation == REL_CALLS
                 && is_cross_file_call_noise(&rel.target_name, source_lang)
@@ -4909,15 +4938,19 @@ fn resolve_deferred_relations(
             let all = classes.member_call_candidates(db, d.metadata.as_deref(), all)?;
             // What the receiver's type rules out: dropped from what is bound
             // below, never from the pool it is chosen from.
-            let never = classes.rust_receiver_never(
-                db,
-                &d.language,
-                &d.target_name,
-                d.metadata.as_deref(),
-                crate_roots,
-                &d.rel_path,
-                &all,
-            )?;
+            let never = if d.language == "go" {
+                classes.go_value_call_never(db, d.metadata.as_deref(), &all)?
+            } else {
+                classes.rust_receiver_never(
+                    db,
+                    &d.language,
+                    &d.target_name,
+                    d.metadata.as_deref(),
+                    crate_roots,
+                    &d.rel_path,
+                    &all,
+                )?
+            };
             let all = classes.rust_receiver_candidates(
                 db,
                 &d.language,

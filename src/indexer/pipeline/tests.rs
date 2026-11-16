@@ -1886,6 +1886,81 @@ fn test_go_call_on_the_receiver_binds_its_types_method() {
     );
 }
 
+/// R12: a Go call on a value runs a method of the value's type, never a type
+/// (a conversion names the type itself, `T(x)` or `pkg.T(x)`). gin's
+/// `c.Request.Context()` bound the struct `Context` at `extracted`, and
+/// `err.Error()` / `w.Body.String()` the structs `Error` and `String`. Each
+/// resolution path: the batch's same-file tier (`Deadline`), the deferred
+/// pass's cross-file pool (`Use`) and its typed-receiver fallback (`Wait`),
+/// and the pending sweep when the type arrives in a later run. The type is
+/// dropped from what the call binds, not from the pool it is chosen from:
+/// render/'s struct `String` is the path-closest candidate of
+/// `TestRender`'s `w.String()`, which binds nothing rather than another
+/// directory's method (gin's 39 `w.Body.String()` calls).
+#[test]
+fn test_go_call_on_a_value_never_binds_a_type() {
+    const CONTEXT: &str = "package app\n\ntype Request struct{}\n\
+                           type Context struct{ Request *Request }\n\n\
+                           func (c *Context) Deadline() { c.Request.Context() }\n\
+                           func (c *Context) Wait() { c.Done() }\n";
+    const USE: &str = "package app\n\nfunc newBuilder() *Builder { return nil }\n\
+                       func Use() string { b := newBuilder(); return b.String() }\n";
+    const TYPES: &str = "package app\n\ntype Done struct{}\ntype String struct{}\n";
+    // The same-file tier holds a type and a method: the method stays.
+    const ERRS: &str = "package app\n\ntype Error struct{}\ntype Errs struct{}\n\n\
+                        func (e Errs) Error() string { return \"\" }\n\
+                        func Collect() { e := Errs{}; _ = e.Error() }\n";
+    const RENDER_TEST: &str = "package render\n\n\
+                               func TestRender() { w := new(Recorder); _ = w.Error() }\n";
+    const RENDER_TYPE: &str = "package render\n\ntype Error struct{}\n";
+    // Python's member call constructs a nested class; same name, same run.
+    const PY: &str = "class Context:\n    pass\n\ndef use(app):\n    return app.Context()\n";
+    let files = [
+        ("go.mod", "module example.com/app\n"),
+        ("a_ctx.py", PY),
+        ("context.go", CONTEXT),
+        ("use.go", USE),
+        ("errs.go", ERRS),
+        ("render/render_test.go", RENDER_TEST),
+        ("types.go", TYPES),
+        ("render/error.go", RENDER_TYPE),
+    ];
+    let none = Vec::<String>::new();
+    let assert_no_type_bound = |db: &Database, run: &str| {
+        assert_eq!(go_callees_of(db, "Context.Deadline"), none, "{run}");
+        assert_eq!(go_callees_of(db, "Context.Wait"), none, "{run}");
+        assert_eq!(go_callees_of(db, "Use"), ["newBuilder"], "{run}");
+        assert_eq!(go_callees_of(db, "TestRender"), none, "{run}");
+        assert_eq!(go_callees_of(db, "Collect"), ["Errs.Error"], "{run}");
+        assert_eq!(go_callees_of(db, "use"), ["Context"], "{run}");
+    };
+    let (_p, _d, db) = fresh_index_of(&files);
+    assert_no_type_bound(&db, "rebuild");
+
+    // The types arrive after the calls: the pending sweep decides them.
+    let (project, _d, db) = fresh_index_of(&files[..6]);
+    assert_eq!(go_callees_of(&db, "TestRender"), ["Errs.Error"]);
+    fs::write(project.path().join("types.go"), TYPES).unwrap();
+    fs::write(project.path().join("render/error.go"), RENDER_TYPE).unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert_no_type_bound(&db, "incremental");
+
+    // A method of the name arriving later is what the call can reach, and so
+    // is the other directory's method once the closer type is gone.
+    assert_incremental_matches_rebuild(
+        &files,
+        &[(
+            "builder.go",
+            Some(
+                "package app\n\ntype Builder struct{}\n\n\
+                  func (b *Builder) String() string { return \"\" }\n",
+            ),
+        )],
+    );
+    assert_incremental_matches_rebuild(&files, &[("render/error.go", None)]);
+    assert_incremental_matches_rebuild(&files, &[("types.go", None)]);
+}
+
 /// R11: a JS/TS class extending a name it imports extends what that import
 /// binds, through the export walk: hono's `export { Hono as HonoBase }` gave
 /// `extends HonoBase` in hono.ts and the presets no edge, no node being named

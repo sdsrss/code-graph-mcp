@@ -429,18 +429,22 @@ pub(super) fn resolve_pending_calls_touching(
             );
         }
         let no_files = HashSet::new();
-        let never = classes.rust_receiver_never(
-            db,
-            &row.source_language,
-            &row.target_name,
-            row.metadata.as_deref(),
-            crate_roots,
-            source_id_to_path
-                .get(&row.source_id)
-                .map(String::as_str)
-                .unwrap_or_default(),
-            &candidates,
-        )?;
+        let never = if row.source_language == "go" {
+            classes.go_value_call_never(db, row.metadata.as_deref(), &candidates)?
+        } else {
+            classes.rust_receiver_never(
+                db,
+                &row.source_language,
+                &row.target_name,
+                row.metadata.as_deref(),
+                crate_roots,
+                source_id_to_path
+                    .get(&row.source_id)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                &candidates,
+            )?
+        };
         let candidates = classes.rust_receiver_candidates(
             db,
             &row.source_language,
@@ -4748,6 +4752,27 @@ pub(super) fn ambiguous_meta(metadata: &str) -> String {
     }
 }
 
+/// [`ProjectClassNames::go_value_call_never`] over a set holding every
+/// function and method among `candidates`: the project's, or for the batch's
+/// same-file tier, whose candidates are the file's own nodes, the file's.
+pub(super) fn go_value_call_never_of(
+    metadata: Option<&str>,
+    candidates: &[i64],
+    callables: &HashSet<i64>,
+) -> HashSet<i64> {
+    if !matches!(
+        parse_callee_metadata(metadata),
+        Some(CalleeMeta::Member | CalleeMeta::RecvType(_))
+    ) {
+        return HashSet::new();
+    }
+    candidates
+        .iter()
+        .copied()
+        .filter(|id| !callables.contains(id))
+        .collect()
+}
+
 /// Whether a call on a receiver of known type (`CalleeMeta::RecvType`) also
 /// runs its subclasses' overrides. Not in Go: the receiver's static type fixes
 /// its method set, and a type embedding it (an `inherits` edge) that declares
@@ -4820,6 +4845,9 @@ pub(super) struct ProjectClassNames {
     /// Free functions no member call reaches (`filter_out_function_ids`'s
     /// complement); None until loaded.
     free_functions: Option<HashSet<i64>>,
+    /// Every `function` and `method` node ([`Self::go_value_call_never`]);
+    /// None until loaded.
+    callables: Option<HashSet<i64>>,
     /// Every `method` node and every Python `def` nested in a function or
     /// method ([`Self::python_import_candidates`]); None until loaded.
     methods: Option<HashSet<i64>>,
@@ -5154,6 +5182,36 @@ impl ProjectClassNames {
                     .collect())
             }
         }
+    }
+
+    /// Of a Go call on a value's candidates (`CalleeMeta::Member`, and
+    /// `RecvType` where its type's methods fall back to the member chain), those
+    /// that are no function or method: a value's call never runs a type, as a
+    /// conversion names the type itself (`T(x)`, `pkg.T(x)`), and Go marks only
+    /// calls rooted at a value (R12: gin's `c.Request.Context()` bound the
+    /// struct `Context`). Dropped from the result like
+    /// [`Self::rust_receiver_never`]'s, never from the pool: the struct `String`
+    /// was the path-closest of six candidates of 39 `w.Body.String()` calls,
+    /// and without it each fanned out to five methods. Which candidate wins
+    /// depends on other files, so a call this leaves with nothing is buffered.
+    pub(super) fn go_value_call_never(
+        &mut self,
+        db: &crate::storage::db::Database,
+        metadata: Option<&str>,
+        candidates: &[i64],
+    ) -> anyhow::Result<RecvNever> {
+        if self.callables.is_none() {
+            self.callables = Some(crate::storage::queries::callable_node_ids(db.conn())?);
+        }
+        let ids = go_value_call_never_of(
+            metadata,
+            candidates,
+            self.callables.as_ref().expect("loaded above"),
+        );
+        Ok(RecvNever {
+            read_elsewhere: !ids.is_empty(),
+            ids,
+        })
     }
 
     /// Of a typed Rust call's candidates, those the language rules out, to be
