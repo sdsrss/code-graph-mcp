@@ -176,10 +176,9 @@ fn without_vector_dim(sql: &str) -> String {
 
 /// Whether a schema row whose SQL is not a plain table or index is one of
 /// the tool's own, in this version's form or an earlier one the open still
-/// upgrades: `nodes_fts` had fewer columns before schema v10, which FTS5 —
-/// SQLite's own module — reads whatever they are, and `node_vectors` of
-/// another dimension is dropped and rebuilt
-/// (`ensure_embedding_dim_consistency`).
+/// accepts: a `nodes_fts` the tool wrote before schema v4 ([`is_own_nodes_fts`]),
+/// and a `node_vectors` of another dimension, which
+/// `ensure_embedding_dim_consistency` handles.
 fn is_own_schema_row(
     own: &std::collections::HashSet<(String, String)>,
     name: &str,
@@ -189,12 +188,60 @@ fn is_own_schema_row(
         return true;
     }
     match name {
-        "nodes_fts" => sql.starts_with("CREATE VIRTUAL TABLE nodes_fts USING fts5("),
+        "nodes_fts" => is_own_nodes_fts(sql),
         "node_vectors" => own
             .iter()
             .any(|(n, s)| n == name && without_vector_dim(s) == without_vector_dim(sql)),
         _ => false,
     }
+}
+
+/// Whether a failed schema read means the connection cannot load the schema
+/// at all, so that no statement on it can run: not a database, a corrupt
+/// one, or a hot rollback journal a read-only connection may not roll back
+/// (every read on it fails the same way).
+fn schema_cannot_load(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt)
+    ) || e.sqlite_extended_error_code() == Some(rusqlite::ffi::SQLITE_READONLY_ROLLBACK)
+}
+
+/// The `nodes_fts` forms the tool has written, as normalized SQL: some of its
+/// columns (schema v1 had five, the v1 -> v2 migration rebuilt it with
+/// eight), then `content='nodes', content_rowid='id'`, then from schema v4
+/// the porter tokenizer. FTS5 reads an external-content table's rows with a
+/// query on the table `content=` names, so a search runs whatever that is:
+/// only these exact items pass (review R2).
+fn is_own_nodes_fts(sql: &str) -> bool {
+    const COLUMNS: [&str; 8] = [
+        "name",
+        "qualified_name",
+        "code_content",
+        "context_string",
+        "doc_comment",
+        "name_tokens",
+        "return_type",
+        "param_types",
+    ];
+    let Some(args) = sql
+        .strip_prefix("CREATE VIRTUAL TABLE nodes_fts USING fts5(")
+        .and_then(|s| s.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let items: Vec<&str> = args.split(',').map(str::trim).collect();
+    let options = match items.as_slice() {
+        [.., "content='nodes'", "content_rowid='id'"] => 2,
+        [.., "content='nodes'", "content_rowid='id'", "tokenize='porter unicode61'"] => 3,
+        _ => return false,
+    };
+    let columns = &items[..items.len() - options];
+    !columns.is_empty()
+        && columns
+            .iter()
+            .enumerate()
+            .all(|(i, c)| COLUMNS.contains(c) && !columns[..i].contains(c))
 }
 
 /// D#784: the schema rows of an index that SQLite would run as code the tool
@@ -212,13 +259,21 @@ fn foreign_schema_objects(conn: &Connection) -> rusqlite::Result<Vec<String>> {
         "SELECT coalesce(type, ''), coalesce(name, ''), CAST(sql AS TEXT) \
          FROM sqlite_schema WHERE sql IS NOT NULL",
     )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })?;
+    // Read as bytes: SQLite loads and runs a schema whatever its bytes, so a
+    // row that is not valid UTF-8 must be judged, not fail the read (review
+    // R2: on the user-named and secondary-mode open that read error let the
+    // planted objects through). Replacement characters never match an own
+    // row, and a row is plain only if its first bytes are the ASCII prefix.
+    fn lossy(r: &rusqlite::Row<'_>, i: usize) -> rusqlite::Result<String> {
+        use rusqlite::types::ValueRef;
+        Ok(match r.get_ref(i)? {
+            ValueRef::Text(b) | ValueRef::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+            ValueRef::Null => String::new(),
+            ValueRef::Integer(n) => n.to_string(),
+            ValueRef::Real(f) => f.to_string(),
+        })
+    }
+    let rows = stmt.query_map([], |r| Ok((lossy(r, 0)?, lossy(r, 1)?, lossy(r, 2)?)))?;
     let mut foreign = Vec::new();
     for row in rows {
         let (kind, name, sql) = row?;
@@ -438,13 +493,18 @@ impl Database {
         )?;
         // A user-named snapshot skips `reject_unowned_index`, and a view or a
         // virtual table runs when read (D#784). A schema this connection
-        // cannot read is let through, as the probes below let it through: no
-        // statement can run against it, and the snapshot reader then
-        // answers it in its own words.
-        if let Ok(foreign) = foreign_schema_objects(&conn) {
-            if !foreign.is_empty() {
+        // cannot load at all is let through, as the probes below let it
+        // through: no statement can run on it, and the snapshot reader then
+        // answers in its own words or reads a copy, which `open_nondestructive`
+        // checks. Any other failure of the read fails the open: a schema
+        // SQLite loads is a schema it runs (review R2).
+        match foreign_schema_objects(&conn) {
+            Ok(foreign) if !foreign.is_empty() => {
                 anyhow::bail!("{}", foreign_schema_message(&path, &foreign));
             }
+            Ok(_) => {}
+            Err(e) if schema_cannot_load(&e) => {}
+            Err(e) => return Err(e.into()),
         }
         // Future-schema refusal, same verdict the primary path gives. A secondary
         // never migrates (the primary owns bootstrap), so without this check a
@@ -4152,11 +4212,19 @@ mod tests {
     /// was not written by it and every open refuses it, readers included.
     #[test]
     fn schema_objects_the_tool_does_not_create_are_refused() {
-        let plants: [(&str, &str); 7] = [
+        let plants: [(&str, &str); 8] = [
             (
                 "nodes_fts on another module",
                 "DROP TABLE nodes_fts; \
                  CREATE VIRTUAL TABLE nodes_fts USING vec0(embedding float[4]);",
+            ),
+            (
+                // FTS5 reads an external-content table's rows through a query
+                // on it, so `content=` names what a search runs (review R2).
+                "nodes_fts reading another content table",
+                "DROP TABLE nodes_fts; \
+                 CREATE VIRTUAL TABLE nodes_fts USING fts5(name, \
+                 content='files', content_rowid='id');",
             ),
             (
                 "a trigger",
@@ -4218,6 +4286,100 @@ mod tests {
                 std::fs::read(&db).unwrap() == before,
                 "{shape}: a refused index is left as it was"
             );
+        }
+    }
+
+    /// Review R2: the schema read decoded `name` and `sql` as UTF-8 strings,
+    /// and the user-named and secondary-mode open let a schema it could not
+    /// read through. SQLite loads and runs a schema whatever its bytes, so one
+    /// row that was not valid UTF-8 switched the check off there: a planted
+    /// view beside it ran in the MCP server's secondary mode.
+    #[test]
+    fn a_schema_row_that_is_not_utf8_does_not_switch_the_check_off() {
+        // (shape, SQL creating the planted object and a marker table, the
+        // marker's replacement name, its replacement SQL)
+        let bad_name: &[u8] = b"zz\xba\xdb\xad";
+        let bad_table_sql: &[u8] = b"CREATE TABLE zz\xba\xdb\xad(z)";
+        let bad_trigger_sql: &[u8] =
+            b"CREATE TRIGGER planted AFTER INSERT ON nodes BEGIN SELECT 1 /* \xff */; END";
+        let shapes: [(&str, &str, &[u8], &[u8]); 2] = [
+            (
+                "a planted view beside a table whose name is not UTF-8",
+                "CREATE VIEW planted AS SELECT 1; CREATE TABLE zz(z);",
+                bad_name,
+                bad_table_sql,
+            ),
+            (
+                "a planted trigger whose SQL is not UTF-8",
+                "CREATE TRIGGER planted AFTER INSERT ON nodes BEGIN SELECT 1; END; \
+                 CREATE TABLE zz(z);",
+                b"zz",
+                b"CREATE TABLE zz(z)",
+            ),
+        ];
+        for (shape, plant, marker_name, marker_sql) in shapes {
+            let dir = TempDir::new().unwrap();
+            let db = own_index(&dir, true);
+            {
+                let c = Connection::open(&db).unwrap();
+                c.execute_batch(plant).unwrap();
+                c.execute_batch("PRAGMA writable_schema = ON;").unwrap();
+                c.execute(
+                    "UPDATE sqlite_schema SET name = CAST(?1 AS TEXT), \
+                     tbl_name = CAST(?1 AS TEXT), sql = CAST(?2 AS TEXT) WHERE name = 'zz'",
+                    rusqlite::params![marker_name, marker_sql],
+                )
+                .unwrap();
+                if shape.contains("trigger") {
+                    c.execute(
+                        "UPDATE sqlite_schema SET sql = CAST(?1 AS TEXT) WHERE name = 'planted'",
+                        [bad_trigger_sql],
+                    )
+                    .unwrap();
+                }
+                c.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
+            }
+            // SQLite itself still loads this schema.
+            Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT count(*) FROM sqlite_schema", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap();
+            let probe = reject_unowned_index(&db)
+                .map(drop)
+                .map_err(|e| e.to_string());
+            for (open, result) in [
+                ("reject_unowned_index", probe),
+                (
+                    "open",
+                    Database::open(&db).map(drop).map_err(|e| e.to_string()),
+                ),
+                (
+                    "open_with_vec",
+                    Database::open_with_vec(&db)
+                        .map(drop)
+                        .map_err(|e| e.to_string()),
+                ),
+                (
+                    "open_readonly",
+                    Database::open_readonly(&db)
+                        .map(drop)
+                        .map_err(|e| e.to_string()),
+                ),
+                (
+                    "open_readonly_named",
+                    Database::open_readonly_named(&db)
+                        .map(drop)
+                        .map_err(|e| e.to_string()),
+                ),
+            ] {
+                let err = result.expect_err(&format!("{shape}: {open} opened it"));
+                assert!(
+                    err.contains("does not create") && err.contains("\"planted\""),
+                    "{shape}: {open}: {err}"
+                );
+            }
         }
     }
 

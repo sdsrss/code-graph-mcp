@@ -37,19 +37,26 @@ internal tables were edited trips an `assert` in sqlite-vec. Measured on
   aborted when its input closed.
 - `health-check --json`, `show` and `callgraph` exited 0.
 
-Every open now checks the index's schema first and refuses the index if it
-holds a trigger, view or virtual table that is not one of this version's
-own. Two of the tool's own are accepted in other forms, as before: a
-`nodes_fts` whatever its fts5 arguments (older versions created it with
-fewer columns), and a `node_vectors` of another dimension, which is dropped
-and rebuilt. On the same index, this version's `incremental-index`, `show`,
-`callgraph` and `health-check` exit 1, the MCP server exits 1 before
-answering `initialize`, and `index.db` is byte for byte the same
-afterwards. The check's read-only open can still create the `-wal` and
-`-shm` files SQLite keeps beside an index in WAL mode when they are absent
-(an empty `-wal` and a 32 KB `-shm`). Each command reads the schema once
-more: `show` 2.2 → 3.3 ms (medians of 40 interleaved runs on this
-repository, both arms built from source without the embedding model).
+Every open now checks the index's schema first, whatever bytes its names and
+SQL hold, and refuses the index if it holds a trigger, view or virtual table
+that is not one of this version's own. Two of the tool's own are also
+accepted in older forms: a `nodes_fts` in a form the tool has written (five
+columns before 0.4.0, no tokenizer option before 0.4.9), and a
+`node_vectors` of another dimension, as before. A `nodes_fts` in any other
+form is refused: FTS5 reads rows through a query on the table its `content=`
+option names, so a search ran whatever that named. On the same index, this
+version's `incremental-index`, `show`, `callgraph` and `health-check` exit
+1, the MCP server exits 1 before answering `initialize`, and `index.db` is
+byte for byte the same afterwards. Files beside it can change, for example:
+the commands' read-only check can create the `-wal` and `-shm` files SQLite
+keeps beside an index in WAL mode (an empty `-wal` and a 32 KB `-shm`), and
+the MCP server, which opens the index for writing before it refuses it,
+leaves an `index.lock` and folds a `-wal` supplied with the index into
+`index.db`. The check costs about 1 ms per command: `show
+reject_unowned_index` on an index of this repository took 1.57 → 2.69 ms
+and, in a second run, 1.54 → 2.64 ms (median wall time per process over 40
+interleaved runs, 0.194.0's source and this version's, both built without
+the embedding model).
 
 ### Not covered
 
@@ -60,14 +67,7 @@ repository, both arms built from source without the embedding model).
 - Forged rows in the tool's own tables, including the internal tables of
   the vector and full-text tables, are read as data: `health-check`'s
   integrity check and vector search read them. We know of no path from
-  them to a crash (from reading sqlite-vec's code; not fuzzed). A
-  `nodes_fts` with other fts5 arguments (another tokenizer, external
-  content) is used as it is; FTS5 is SQLite's own module.
-- A schema object whose name is not valid UTF-8 also stops
-  `incremental-index`, `show`, `health-check`, `snapshot inspect` and the MCP
-  server (exit 1, `index.db` unchanged), but with an `invalid utf-8 sequence`
-  error instead of the refusal message, and `health-check --json` answers
-  `"error"`, not `"reason": "refused"`.
+  them to a crash (from reading sqlite-vec's code; not fuzzed).
 - Which `.code-graph` to trust is still not decided: an index that passes
   this check is used as it is, contents included (0.191.0, Not covered).
   Not running code-graph-mcp in a repository that commits `.code-graph/`
