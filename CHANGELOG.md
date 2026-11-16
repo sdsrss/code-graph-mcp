@@ -19,7 +19,7 @@ will not write to it: its `incremental-index` exits 1 and says to delete
 and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The
 plugin's scripts are unchanged.
 
-Measured on six projects, each indexed by 0.193.0 and by this version from
+Measured on seven projects, each indexed by 0.193.0 and by this version from
 identical copies, edges compared by relation, caller and callee:
 
 - gin (75ccf94d, 101 files): call pairs 4,034 → 3,739 (337 removed, 34 of
@@ -41,9 +41,10 @@ same-named definition in the caller's file, then free functions of that name
 elsewhere. A call on the method's own receiver (`r.WriteContentType(w)` in
 `func (r IndentedJSON) Render(…)`) now binds a method of the receiver's type: its
 own, else one an embedded type promotes, never an override in a type that
-embeds it, since Go has no virtual dispatch. The receiver's type is the one
-in the caller's package directory, where Go declares a method's type; another
-package's type of the same name is no candidate. A call on any other value the
+embeds it, since Go has no virtual dispatch. The type's own methods are
+looked for in the caller's package directory, where Go declares them; when
+the type declares none there, the call falls back to choosing by name, as
+in 0.193.0 (Not covered, below). A call on any other value the
 function binds is a member call, which binds no free function. On gin,
 `callgraph --node-id` of `JSON.WriteContentType` listed five other JSON
 renderers' `Render` methods as callers above the floor; it now lists one,
@@ -53,7 +54,9 @@ answered 51 references, all calls from test files (`router.GET()`); it now finds
 and those calls bind `RouterGroup.GET`, which `Engine` embeds (20 of the 42
 added pairs). A call through a name the function declares in its body while
 the file also imports a package under it (`config := config.Load()`, where
-the right side is still the package) binds by name, as in 0.193.0. Calls in another file of the same package on the receiver are
+the right side is still the package) binds by name, as in 0.193.0, wrong
+guesses included: on prometheus 15 such calls bind an interface or a struct
+and 5 a free function, all `ambiguous`. Calls in another file of the same package on the receiver are
 `inferred` where they were `ambiguous` (cobra 1, toml 5, above).
 
 ### fix: a Go call on a value never binds a type
@@ -123,10 +126,20 @@ user installs changes.
   is rebuilt (`code-graph-mcp reindex`). 0.193.0 already did so for
   JavaScript, TypeScript and Python member calls and for a Go type's
   `inherits` edge; Go calls now do too.
-- Indexing time: on prometheus v2.53.0 a full index took 3.18 s (0.193.0:
-  3.23 s) and a one-file edit 0.56 s (0.48 s), means of 3 runs; on a
-  synthetic tree of 11,040 Go files (gin copied 120 times) a one-file edit
-  took 1.91 s (1.51 s), means of 2.
+- A Go receiver call whose type gets the method from an embedded type of
+  another package or of the standard library falls back to choosing by
+  name, and can bind another package's type of the same name: on a
+  `Server` embedding `*http.Server`, `s.Shutdown()` binds another package's
+  `Server.Shutdown` at `inferred`, as 0.193.0 does. A named result
+  (`func f() (config *config.Config)`) is not read as a binding of its name:
+  `config.Validate()` there binds package `config`'s `Validate`, as 0.193.0
+  does.
+- Indexing time on large Go trees: on a synthetic tree of 11,040 Go files
+  (gin copied 120 times) a full index took 39.8 s against 0.193.0's 33.7 s
+  (+18%) and a one-file edit 1.68 s against 1.30 s (+29%), means of 3
+  interleaved runs. On prometheus v2.53.0 (515 Go files) both moved within
+  run-to-run noise: two series gave a full index of 2.22 → 2.26 s and
+  3.23 → 3.18 s, and a one-file edit of 0.39 → 0.39 s and 0.48 → 0.56 s.
 - `refs HonoBase` answers "Symbol not found": queries do not know export
   aliases. A call or `new` through an export alias (`aliasHelper()` after
   `import { aliasHelper }` of `export { helper as aliasHelper }`) binds
