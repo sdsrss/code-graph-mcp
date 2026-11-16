@@ -28,6 +28,9 @@ identical copies, edges compared by relation, caller and callee:
   floor); 1 relabelled `ambiguous` → `inferred`.
 - BurntSushi/toml (v1.4.0): call pairs 1,394 → 1,387 (7 removed, 5 above
   the floor); 5 relabelled `ambiguous` → `inferred`.
+- prometheus (v2.53.0, 515 Go files): call pairs 59,245 → 55,617 (3,673
+  removed, 2,645 of them above the floor; 45 added, 3 of them `inferred`);
+  20 relabelled `ambiguous` → `inferred`.
 - hono (4.6.14): `inherits` pairs 70 → 74 (4 added); no other pair changed.
 - flask (d086db85) and express (4.21.2): no edge changed.
 
@@ -38,7 +41,9 @@ same-named definition in the caller's file, then free functions of that name
 elsewhere. A call on the method's own receiver (`r.WriteContentType(w)` in
 `func (r IndentedJSON) Render(…)`) now binds a method of the receiver's type: its
 own, else one an embedded type promotes, never an override in a type that
-embeds it, since Go has no virtual dispatch. A call on any other value the
+embeds it, since Go has no virtual dispatch. The receiver's type is the one
+in the caller's package directory, where Go declares a method's type; another
+package's type of the same name is no candidate. A call on any other value the
 function binds is a member call, which binds no free function. On gin,
 `callgraph --node-id` of `JSON.WriteContentType` listed five other JSON
 renderers' `Render` methods as callers above the floor; it now lists one,
@@ -46,7 +51,9 @@ renderers' `Render` methods as callers above the floor; it now lists one,
 `errorMsgs.JSON`; now `Error.JSON` alone. `refs GET --file ginS/gins.go`
 answered 51 references, all calls from test files (`router.GET()`); it now finds none,
 and those calls bind `RouterGroup.GET`, which `Engine` embeds (20 of the 42
-added pairs). Calls in another file of the same package on the receiver are
+added pairs). A call through a name the function declares in its body while
+the file also imports a package under it (`config := config.Load()`, where
+the right side is still the package) binds by name, as in 0.193.0. Calls in another file of the same package on the receiver are
 `inferred` where they were `ambiguous` (cobra 1, toml 5, above).
 
 ### fix: a Go call on a value never binds a type
@@ -76,7 +83,9 @@ file, whatever name it is exported under. `refs Hono --file
 src/hono-base.ts` answered 40 references with no `inherits` row; it now
 answers 43, the three subclasses among them. jsx/base.ts's `interface
 IntrinsicElements extends IntrinsicElementsDefined`, a renamed import, gains
-its edge too.
+two edges: to the interface intrinsic-elements.ts exports, and to the
+`IntrinsicElements` that file nests in `namespace JSX`, which it does not
+extend.
 
 ### fix(deps): quinn-udp 0.5.16 (RUSTSEC-2026-0538)
 
@@ -96,20 +105,34 @@ user installs changes.
 - A Go call on a value whose type the call site does not show still binds by
   name among the methods of that name, at `ambiguous`: gin's
   `w.Body.String()` (a `*bytes.Buffer`) binds five `String` methods, and
-  `c.Bind(obj)` in a function literal twelve `Bind` methods. Parameters'
-  declared types are not read: `remoteIP.String()` in `Context.ClientIP` (a
-  `net.IP`) binds `Context.String` at `extracted`.
+  `c.Bind(obj)` in a function literal twelve `Bind` methods. A local's or a
+  parameter's declared type is not read: `remoteIP.String()` in
+  `Context.ClientIP`, where `remoteIP := net.ParseIP(…)` is a `net.IP`, binds
+  `Context.String` at `extracted`.
 - A Go receiver redeclared by `range` or `:=` in any nested block makes the
   whole method's calls on it untyped: gin's `AsciiJSON.Render` still binds
   all six `WriteContentType` methods of render/json.go.
 - A Go call with no value at its root, such as one on a composite literal
   (`(JSON{data}).Render(w)`), still binds by name, types included (gin: 25
   edges to the interface `Render`).
+- An incremental run can end with other call edges than a rebuild when an
+  edit changes what kind of definition a name is in a file the caller does
+  not touch (a free function becomes a method or a type of the same name),
+  or when an embedded type's declaration arrives in a later run: the
+  caller's calls are not resolved again until its file changes or the index
+  is rebuilt (`code-graph-mcp reindex`). 0.193.0 already did so for
+  JavaScript, TypeScript and Python member calls and for a Go type's
+  `inherits` edge; Go calls now do too.
+- Indexing time: on prometheus v2.53.0 a full index took 3.18 s (0.193.0:
+  3.23 s) and a one-file edit 0.56 s (0.48 s), means of 3 runs; on a
+  synthetic tree of 11,040 Go files (gin copied 120 times) a one-file edit
+  took 1.91 s (1.51 s), means of 2.
 - `refs HonoBase` answers "Symbol not found": queries do not know export
   aliases. A call or `new` through an export alias (`aliasHelper()` after
   `import { aliasHelper }` of `export { helper as aliasHelper }`) binds
-  nothing (hono: 3 calls). CommonJS `require` bindings and default imports
-  are not followed for `extends`.
+  nothing. CommonJS `require` bindings, default imports and
+  a specifier spelled with the compiled extension (`./base.js` for base.ts)
+  are not followed for `extends`: those bind by name, as before.
 
 ## 0.193.0
 
