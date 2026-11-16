@@ -1,0 +1,13 @@
+import subprocess, json, time, os, sys
+env = dict(os.environ, CODE_GRAPH_NO_AUTO_UPDATE='1')
+p = subprocess.Popen([sys.argv[1], 'serve'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=sys.argv[2])
+def send(o): p.stdin.write((json.dumps(o) + '\n').encode()); p.stdin.flush()
+send({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"},"rootUri":"file://"+sys.argv[2]}})
+print(p.stdout.readline()[:200])
+send({"jsonrpc":"2.0","method":"notifications/initialized"})
+time.sleep(12)
+send({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"find_references","arguments":{"symbol_name":"MarkFlagRequired"}}})
+print(p.stdout.readline()[:600])
+p.stdin.close(); time.sleep(1); p.terminate()
+err = p.stderr.read().decode()
+print('STDERR:', err[-1500:])
