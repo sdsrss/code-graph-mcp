@@ -524,6 +524,17 @@ pub struct McpServer {
     pub(super) result_refresh_budget: usize,
 }
 
+/// Ends the read on the server's `self.db` when dropped (D#883, see
+/// `Database::end_message`): a drop guard, so a panicking handler does not
+/// leave a snapshot open for the rest of the session.
+struct EndMessage<'a>(&'a Database);
+
+impl Drop for EndMessage<'_> {
+    fn drop(&mut self) {
+        self.0.end_message();
+    }
+}
+
 /// A database handle valid for WRITES.
 ///
 /// For an instance that was primary from the start this is just `&self.db`. An
@@ -868,6 +879,9 @@ impl McpServer {
     /// (non-blocking) and starts watcher/embedding once indexing completes.
     /// Secondary instances (no index lock) skip indexing and watcher entirely.
     pub fn run_startup_tasks(&self) {
+        // `main` runs these after a message, outside it: their reads end here,
+        // not with the next message (D#883 review R1).
+        let _end_message = EndMessage(&self.db);
         // Phase 1: On notifications/initialized, spawn background indexing
         let pending = {
             let mut guard = lock_or_recover(
@@ -2029,15 +2043,8 @@ impl McpServer {
 
     pub fn handle_message(&self, line: &str) -> Result<Option<String>> {
         // D#883: a message's reads share one checked snapshot; the next
-        // message checks a fresh one. A drop guard, so a panicking handler
-        // does not leave the snapshot pinned for the rest of the session.
-        struct EndRead<'a>(&'a Database);
-        impl Drop for EndRead<'_> {
-            fn drop(&mut self) {
-                self.0.end_read();
-            }
-        }
-        let _end_read = EndRead(&self.db);
+        // message checks a fresh one.
+        let _end_message = EndMessage(&self.db);
         let req: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(req) => req,
             // Deserialization failed. Fall back to a loose re-parse so we can tell
@@ -6634,6 +6641,43 @@ app.post('/api/login', handleLogin);
         planter.execute_batch("DROP VIEW planted;").unwrap();
         let (text, is_error) = tool_text(&status().unwrap());
         assert!(!is_error, "a clean index is read again: {text}");
+    }
+
+    /// Review R1: the startup tasks `main` runs after a message read the index
+    /// outside any message, and that read's snapshot stayed open until the
+    /// next message ended — the first call answered from before what another
+    /// process committed in between, and a primary's checkpoint waited on it.
+    #[cfg(unix)]
+    #[test]
+    fn test_secondary_startup_read_ends_with_the_startup_tasks() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("alpha.rs"), "fn alpha_fn() {}\n").unwrap();
+        McpServer::new_test_with_project(project.path())
+            .ensure_indexed()
+            .unwrap();
+        let _holder = hold_index_lock(project.path());
+        let server = McpServer::from_project_root(project.path()).unwrap();
+        assert!(!server.is_primary(), "precondition: secondary");
+        server
+            .handle_message(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .unwrap();
+        server.run_startup_tasks();
+        rusqlite::Connection::open(project.path().join(CODE_GRAPH_DIR).join("index.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) \
+                 VALUES ('later.rs', 'b', 0, 'rust', 0)",
+                [],
+            )
+            .unwrap();
+        let (text, is_error) = tool_text(
+            &server
+                .handle_message(&tool_call_json("get_index_status", json!({})))
+                .unwrap(),
+        );
+        assert!(!is_error, "{text}");
+        let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(status["files_count"], 2, "{text}");
     }
 
     // ---------------------------------------------------------------------
