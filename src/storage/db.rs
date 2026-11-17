@@ -257,9 +257,13 @@ fn is_own_nodes_fts(sql: &str) -> bool {
 /// ([`is_own_schema_row`]). A missing one is not foreign; the open creates it.
 fn foreign_schema_objects(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let own = own_executable_schema()?;
+    // `NOT INDEXED`: the rows SQLite builds the schema from are the table's
+    // own (`sqlite3InitOne` scans it), and the planner would otherwise read
+    // this query through an index on it, whose b-tree the file's author
+    // filled (D#883 review R2).
     let mut stmt = conn.prepare(
-        "SELECT coalesce(type, ''), coalesce(name, ''), CAST(sql AS TEXT) \
-         FROM sqlite_schema WHERE sql IS NOT NULL",
+        "SELECT coalesce(type, ''), coalesce(name, ''), CAST(sql AS TEXT), \
+         coalesce(tbl_name, '') FROM sqlite_schema NOT INDEXED WHERE sql IS NOT NULL",
     )?;
     // Read as bytes: SQLite loads and runs a schema whatever its bytes, so a
     // row that is not valid UTF-8 must be judged, not fail the read (review
@@ -275,11 +279,21 @@ fn foreign_schema_objects(conn: &Connection) -> rusqlite::Result<Vec<String>> {
             ValueRef::Real(f) => f.to_string(),
         })
     }
-    let rows = stmt.query_map([], |r| Ok((lossy(r, 0)?, lossy(r, 1)?, lossy(r, 2)?)))?;
+    let rows = stmt.query_map([], |r| {
+        Ok((lossy(r, 0)?, lossy(r, 1)?, lossy(r, 2)?, lossy(r, 3)?))
+    })?;
     let mut foreign = Vec::new();
     for row in rows {
-        let (kind, name, sql) = row?;
-        if PLAIN_SCHEMA_PREFIXES.iter().any(|p| sql.starts_with(p)) {
+        let (kind, name, sql, table) = row?;
+        // SQLite refuses to index its own tables (its `sqlite_stat` tables
+        // are tables), and it checks a row's `type` and `tbl_name` against
+        // the SQL: an index row on one was written by hand, whatever its
+        // plain prefix.
+        let indexes_sqlite_table = kind.eq_ignore_ascii_case("index")
+            && table
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sqlite_"));
+        if !indexes_sqlite_table && PLAIN_SCHEMA_PREFIXES.iter().any(|p| sql.starts_with(p)) {
             continue;
         }
         if !is_own_schema_row(own, &name, &normalized_sql(&sql)) {
@@ -4956,6 +4970,52 @@ mod tests {
                 && !refusal.contains("delete"),
             "{refusal}"
         );
+    }
+
+    /// D#883 review R2 (in the check since D#784): the check read
+    /// `sqlite_schema` through the query planner, and an index on that table
+    /// — SQLite refuses to create one, a file can still hold one — answered
+    /// from a b-tree the file's author filled, while SQLite builds the schema
+    /// from the table itself. Every open refused nothing and the view ran.
+    #[test]
+    fn an_index_on_the_schema_table_does_not_answer_the_check() {
+        let dir = TempDir::new().unwrap();
+        let db = own_index(&dir, false);
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                // Every column the check reads, so the index covers it.
+                "CREATE TABLE shadow(sql, type, name, tbl_name); \
+                 INSERT INTO shadow SELECT sql, type, name, tbl_name FROM sqlite_schema; \
+                 CREATE INDEX shadow_idx ON shadow(sql, type, name, tbl_name); \
+                 PRAGMA writable_schema = ON; \
+                 UPDATE sqlite_schema SET tbl_name = 'sqlite_master', \
+                   sql = 'CREATE INDEX shadow_idx ON sqlite_master(sql, type, name, tbl_name)' \
+                   WHERE name = 'shadow_idx'; \
+                 UPDATE sqlite_schema SET type = 'view', rootpage = 0, \
+                   sql = 'CREATE VIEW files AS SELECT 4242 AS id' WHERE name = 'files'; \
+                 DELETE FROM sqlite_schema WHERE name = 'sqlite_autoindex_files_1'; \
+                 PRAGMA writable_schema = OFF;",
+            )
+            .unwrap();
+        let msg = reject_unowned_index(&db)
+            .expect_err("the index answered the check")
+            .to_string();
+        assert!(
+            msg.contains("view \"files\"") && msg.contains("index \"shadow_idx\""),
+            "{msg}"
+        );
+        for (open, result) in [
+            ("open", Database::open(&db).map(drop)),
+            ("open_readonly", Database::open_readonly(&db).map(drop)),
+            (
+                "open_readonly_named",
+                Database::open_readonly_named(&db).map(drop),
+            ),
+        ] {
+            let err = result.expect_err(open).to_string();
+            assert!(err.contains("view \"files\""), "{open}: {err}");
+        }
     }
 
     /// The control: the tool's own index opens through every constructor,
