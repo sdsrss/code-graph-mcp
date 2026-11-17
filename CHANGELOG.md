@@ -18,19 +18,84 @@ other files, such as `snapshot.db.zst` beside `snapshot.db`. The refusal now
 ends with its reason, that SQL stored in a database runs when the database
 is used. A refusal of `.code-graph/index.db` keeps the remedy.
 
-### Not covered: wider than 0.195.0 said
+### fix: an MCP server reading the index as a secondary checks it at every call, not once
 
-0.195.0's Not covered says that an MCP server running as a secondary reader
-of the index checks the index once, when it opens it, and that index files
-that change beside it while it runs are not checked again. A secondary
-server that starts after a `git pull` changed the index files is exposed
-too, while another process that opened the earlier files keeps writing to
-them: the processes share the index's `-shm`, and the newer server can then
-read pages its check did not read. Measured on 0.195.0 with a second process
-writing to the index the way a first server does: a view in a pulled `-wal`,
-and one in a pulled `index.db`, ran in a secondary server that started
-after the pull. Not running code-graph-mcp in a repository that commits
-`.code-graph/` remains the workaround.
+When another process holds the index lock, an MCP server reads the index as
+a secondary, through one read-only connection it keeps for the session.
+0.195.0 checked that connection's schema once, when the server opened it
+(its Not covered says so), and SQL that reached the index later was loaded
+and ran in the server. That includes a secondary that starts after a
+`git pull` changed the index files while another process that opened the
+earlier files keeps writing to them: the processes share the index's `-shm`,
+and the newer server can then read pages its check did not read.
+
+Now each message the server handles reads inside one transaction that
+first reads the index's header, which opens the snapshot, and then checks
+the schema of that snapshot; SQLite parses the schema the message uses from
+that same snapshot (it otherwise keeps a schema it parsed while the schema
+cookie stays the same, whatever the rows say). Nothing compiles on that
+connection outside such a transaction, so a statement after the transaction
+ended under the call (SQLite rolls one back by itself on an I/O or memory
+error) is refused. A call that meets SQL code-graph-mcp does not write
+answers `refusing to read <index>: …`, naming the objects, and the next call
+checks again; an index a newer code-graph migrated under the server answers
+that its schema is newer than this version supports, instead of naming its
+objects as planted. A call's reads see
+one snapshot, and what another process commits shows from the next call on;
+a server that took over the index lock mid-session starts a new snapshot
+after it writes, so it reads its own writes.
+
+Measured with four ways the index can change under a running secondary,
+among them a view in a pulled `-wal` and one in a pulled `index.db` with
+another process writing the index the way a first server does: on 0.195.0
+the planted view ran in every one, and in this version every call after the
+change was refused. With another process rewriting the schema row of a
+table into a view and back under an unchanged schema cookie, the view ran
+in none of 3,000 calls at about 150,000 rewrites a second, nor in any of
+20,000 calls at about 930 a second. Each call in a
+secondary pays for the check and the parse: `get_ast_node` on an index of
+4,448 symbols took 0.065–0.073 ms built from the commit before this fix and
+0.342–0.351 ms with it (medians of 100 calls, three interleaved rounds, both
+built from source).
+
+### fix: the schema check reads the schema table itself
+
+0.195.0's check read the index's schema table through SQLite's query
+planner. An index file can hold an index on that table (SQLite refuses to
+create one, but does not refuse to load one), and the planner then answered
+the check from that index's own pages, which whoever wrote the file filled,
+while SQLite builds the schema it runs from the table. Such a file passed
+the check at every open, and its planted SQL ran: on 0.195.0 a crafted `index.db` whose view replaced the `files`
+table made `health-check --json` report 4,242 files, and a secondary MCP
+server's `get_index_status` answered the same. The check now reads the
+table, and an index on one of SQLite's own tables is refused as SQL
+code-graph-mcp does not write: on the same file `health-check --json`
+reports `reason: refused` and the server exits before it answers.
+
+### Not covered: connections other than a secondary's reads
+
+Only the read-only connection of a secondary is checked at every call. The
+first MCP server, its background workers (a secondary's embedding worker
+too), a server that took over the index lock (its writes), CLI commands that
+index, and CLI commands that read (`health-check`, which the statusline runs,
+`show`, `grep` and the rest) use connections that span several transactions
+and are checked when they open; after a pull changes the index files while
+another process writes them, they could read schema their check did not see.
+Their open-time check can also read its rows from a later snapshot than the
+schema SQLite parsed for them, the same split this version closes on a
+secondary (both derived, not measured).
+
+On a secondary:
+- A statement SQLite already compiled when it rolls the transaction back
+  keeps the plan it compiled from the checked schema and reads the tool's
+  own tables in a later snapshot as data, as 0.195.0's Not covered says of
+  forged rows (derived from SQLite's source, not measured).
+- A generated column in a table's definition still runs when SQLite reads
+  the table, as 0.195.0's Not covered says, and SQLite reads `sqlite_stat1`
+  each time it parses the schema, which is now once per call.
+
+Not running code-graph-mcp in a repository that commits `.code-graph/`
+remains the workaround.
 
 ## 0.195.0
 
