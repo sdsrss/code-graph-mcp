@@ -68,6 +68,12 @@ this version's, both built without the embedding model).
   the vector and full-text tables, are read as data: `health-check`'s
   integrity check and vector search read them. We know of no path from
   them to a crash (from reading sqlite-vec's code; not fuzzed).
+- An MCP server that runs as a secondary reader of the index (another
+  process holds its lock) checks the index once, when it opens it. Index
+  files that change beside it while it runs, as a pull can change them, are
+  not checked again before it reads them, and SQL they add can run in it
+  (found by the pre-release review and reproduced; not fixed in this
+  release).
 - Which `.code-graph` to trust is still not decided: an index that passes
   this check is used as it is, contents included (0.191.0, Not covered).
   Not running code-graph-mcp in a repository that commits `.code-graph/`
