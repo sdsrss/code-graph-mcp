@@ -341,8 +341,15 @@ pub(crate) fn inspect_with_cap(file: &Path, cap: u64) -> Result<SnapshotMeta> {
             opened_in_place = true;
             // The user named this file, so no planted-file refusal: a link to
             // it, or odd side files beside it, read as they did on 0.179.4
-            // (D#363 review M-1/R2; see `open_readonly_named`).
-            Database::open_readonly_named(file)?
+            // (D#363 review M-1/R2; see `open_readonly_named`). Its refusal
+            // of SQL the tool does not write is worded for the tool's own
+            // index, which the same open serves; this is the user's file.
+            Database::open_readonly_named(file).map_err(|e| match e
+                .downcast::<crate::storage::db::ForeignSchema>(
+            ) {
+                Ok(refusal) => refusal.of_users_file(file).into(),
+                Err(e) => e,
+            })?
         }
     } else {
         anyhow::bail!(
@@ -546,11 +553,12 @@ fn side_file_of(file: &Path, suffix: &str) -> std::path::PathBuf {
 /// `inspect`'s own words: it names `rebuild-index` and the temp copy's path,
 /// and neither is anything a user inspecting a snapshot can act on. Its
 /// refusal of SQL the tool does not write names the user's file, as the
-/// in-place arm does, not the temp copy (D#878).
+/// in-place arm does, not the temp copy (D#878), and is put in a user's
+/// file's words, as there.
 fn open_staged(staged: &Path, file: &Path) -> Result<crate::storage::db::Database> {
     use crate::storage::db::{Database, ForeignSchema};
     Database::open_nondestructive(staged).map_err(|e| match e.downcast::<ForeignSchema>() {
-        Ok(refusal) => refusal.naming(file).into(),
+        Ok(refusal) => refusal.of_users_file(file).into(),
         Err(e) if Database::is_corrupt_index_error(&e) => invalid_snapshot(file),
         Err(e) => e,
     })

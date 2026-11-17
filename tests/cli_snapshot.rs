@@ -455,8 +455,11 @@ fn cli_snapshot_inspect_error_quotes_a_relative_name_with_dot_slash() {
 
 /// D#878: a snapshot holding SQL code-graph-mcp does not write is refused,
 /// and the refusal names the file as the user typed it, `./` in front as the
-/// in-place read quotes it (D#666), on the arm that reads a copy too: that arm
-/// named the temporary copy.
+/// in-place read quotes it (D#666), on the arms that read a copy too: those
+/// named the temporary copy. Nor does it say what the tool's own index refusal
+/// says, "delete <file>* and re-run to rebuild the index" (D#878 review F5):
+/// nothing rebuilds a file the user named, and `<file>*` matches the user's
+/// other files, a `.db.zst` beside a `.db` for one.
 #[test]
 fn cli_snapshot_inspect_refusal_names_a_relative_file_as_typed() {
     let dir = TempDir::new().unwrap();
@@ -464,11 +467,28 @@ fn cli_snapshot_inspect_refusal_names_a_relative_file_as_typed() {
         ("planted-copy.db", "WAL"),
         ("planted-in-place.db", "DELETE"),
     ] {
-        {
-            let c = rusqlite::Connection::open(dir.path().join(name)).unwrap();
-            c.pragma_update(None, "journal_mode", mode).unwrap();
-            c.execute_batch("CREATE VIEW planted AS SELECT 1;").unwrap();
-        }
+        let c = rusqlite::Connection::open(dir.path().join(name)).unwrap();
+        c.pragma_update(None, "journal_mode", mode).unwrap();
+        c.execute_batch("CREATE VIEW planted AS SELECT 1;").unwrap();
+    }
+    let raw = std::fs::read(dir.path().join("planted-in-place.db")).unwrap();
+    std::fs::write(
+        dir.path().join("planted.db.zst"),
+        zstd::encode_all(&raw[..], 3).unwrap(),
+    )
+    .unwrap();
+    // A journal SQLite calls hot fails the in-place read, and inspect reads
+    // a copy instead: the fourth arm.
+    std::fs::write(dir.path().join("planted-fallback.db"), &raw).unwrap();
+    let mut journal = vec![0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+    journal.resize(512, 0);
+    std::fs::write(dir.path().join("planted-fallback.db-journal"), journal).unwrap();
+    for (name, mode) in [
+        ("planted-copy.db", "WAL"),
+        ("planted-in-place.db", "DELETE"),
+        ("planted.db.zst", "zstd"),
+        ("planted-fallback.db", "hot journal"),
+    ] {
         let out = Command::new(cli_bin())
             .current_dir(dir.path())
             .args(["snapshot", "inspect", name])
@@ -486,6 +506,10 @@ fn cli_snapshot_inspect_refusal_names_a_relative_file_as_typed() {
         assert!(
             stderr.contains(&quoted) && !stderr.contains("snapshot.db"),
             "{mode}: the refusal names {quoted}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("delete") && !stderr.contains("rebuild"),
+            "{mode}: the refusal tells the user to delete their file to rebuild an index: {stderr}"
         );
     }
 }

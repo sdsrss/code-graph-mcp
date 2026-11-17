@@ -291,34 +291,46 @@ fn foreign_schema_objects(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     Ok(foreign)
 }
 
-fn foreign_schema_message(db_path: &Path, foreign: &[String]) -> String {
+fn listed_objects(foreign: &[String]) -> String {
     const SHOWN: usize = 5;
     let mut listed = foreign[..foreign.len().min(SHOWN)].join(", ");
     if foreign.len() > SHOWN {
         listed.push_str(&format!(" and {} more", foreign.len() - SHOWN));
     }
+    listed
+}
+
+fn foreign_schema_message(db_path: &Path, foreign: &[String]) -> String {
     format!(
         "refusing to open {}: it holds schema objects code-graph-mcp does not create \
-         ({listed}); SQL stored in an index runs when the index is used, and a repository \
+         ({}); SQL stored in an index runs when the index is used, and a repository \
          can carry one — delete {}* and re-run to rebuild the index",
         db_path.display(),
+        listed_objects(foreign),
         db_path.display()
     )
 }
 
-/// The D#784 refusal of an open, as an error a caller that opened a copy can
-/// re-address to the file the user named (`snapshot inspect`, D#878).
+/// The D#784 refusal of an open, as an error a caller can re-address to a
+/// file the user named (`snapshot inspect`, D#878).
 #[derive(Debug)]
 pub(crate) struct ForeignSchema {
     path: std::path::PathBuf,
     objects: Vec<String>,
+    /// Set by [`ForeignSchema::of_users_file`], and then the refusal names no
+    /// remedy: the index's, deleting `<path>*` to rebuild it, rebuilds nothing
+    /// for a file the user named and matches their other files (D#878 review
+    /// F5).
+    users_file: bool,
 }
 
 impl ForeignSchema {
-    /// The same refusal, naming `path` as an open of it would.
-    pub(crate) fn naming(self, path: &Path) -> Self {
+    /// The same refusal of `path`, a file the user named, naming it as an
+    /// open of it would.
+    pub(crate) fn of_users_file(self, path: &Path) -> Self {
         Self {
             path: sqlite_file_name(path),
+            users_file: true,
             ..self
         }
     }
@@ -326,7 +338,17 @@ impl ForeignSchema {
 
 impl std::fmt::Display for ForeignSchema {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&foreign_schema_message(&self.path, &self.objects))
+        if self.users_file {
+            write!(
+                f,
+                "refusing to open {}: it holds schema objects code-graph-mcp does not \
+                 create ({}); SQL stored in a database runs when the database is used",
+                self.path.display(),
+                listed_objects(&self.objects)
+            )
+        } else {
+            f.write_str(&foreign_schema_message(&self.path, &self.objects))
+        }
     }
 }
 
@@ -341,6 +363,7 @@ fn refuse_foreign_schema(db_path: &Path, conn: &Connection) -> Result<()> {
         return Err(ForeignSchema {
             path: db_path.to_path_buf(),
             objects,
+            users_file: false,
         }
         .into());
     }
@@ -532,7 +555,12 @@ impl Database {
         // SQLite loads is a schema it runs (review R2).
         match foreign_schema_objects(&conn) {
             Ok(objects) if !objects.is_empty() => {
-                return Err(ForeignSchema { path, objects }.into());
+                return Err(ForeignSchema {
+                    path,
+                    objects,
+                    users_file: false,
+                }
+                .into());
             }
             Ok(_) => {}
             Err(e) if schema_cannot_load(&e) => {}
@@ -4309,6 +4337,10 @@ mod tests {
                 msg.contains("does not create"),
                 "{shape}: the refusal names the cause: {msg}"
             );
+            // The index's remedy stays on every open of the index, the
+            // user-named one too: `snapshot inspect` words its own (F5).
+            let remedy = format!("delete {}* and re-run to rebuild the index", db.display());
+            assert!(msg.contains(&remedy), "{shape}: {msg}");
             for (open, result) in [
                 ("open", Database::open(&db).map(drop)),
                 ("open_with_vec", Database::open_with_vec(&db).map(drop)),
@@ -4325,6 +4357,7 @@ mod tests {
             ] {
                 let err = result.expect_err(&format!("{shape}: {open}")).to_string();
                 assert!(err.contains("does not create"), "{shape}: {open}: {err}");
+                assert!(err.contains(&remedy), "{shape}: {open}: {err}");
             }
             assert!(
                 std::fs::read(&db).unwrap() == before,

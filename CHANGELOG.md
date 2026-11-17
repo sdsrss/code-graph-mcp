@@ -2,14 +2,21 @@
 
 ## Unreleased
 
-### fix: `snapshot inspect` names your file when it refuses planted SQL
+### fix: `snapshot inspect` names your file when it refuses planted SQL, and does not tell you to delete it
 
-`snapshot inspect` reads a WAL-mode snapshot, or one beside a hot journal,
-through a copy in a temporary directory. When the copy held SQL
-code-graph-mcp does not write, 0.195.0's refusal named the copy (for example
-`/tmp/.tmpaoiSY9/snapshot.db`) as the file to delete. It now names the file
-you gave, as the refusal of a snapshot read in place does (a relative name
-with `./` in front).
+`snapshot inspect` reads a `.db.zst` snapshot, a WAL-mode one, or one beside
+a hot journal through a copy in a temporary directory. When the copy held
+SQL code-graph-mcp does not write, 0.195.0's refusal named the copy (for
+example `/tmp/.tmpaoiSY9/snapshot.db`) as the file to delete. It now names
+the file you gave, as the refusal of a snapshot read in place does (a
+relative name with `./` in front).
+
+On all four of these reads, in place too, 0.195.0's refusal ended with the
+remedy for the tool's own index: `delete <file>* and re-run to rebuild the
+index`. Nothing rebuilds a file you named, and `<file>*` also matches your
+other files, such as `snapshot.db.zst` beside `snapshot.db`. The refusal now
+ends with its reason, that SQL stored in a database runs when the database
+is used. A refusal of `.code-graph/index.db` keeps the remedy.
 
 ### Not covered: wider than 0.195.0 said
 
