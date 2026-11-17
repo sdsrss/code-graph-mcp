@@ -2580,29 +2580,13 @@ fn ci_schedule_runs_only_the_audit_job() {
 
 /// The advisories ci.yml tells `cargo audit` to ignore: (id, crate, first fixed
 /// major, the one package allowed to depend on that crate, and its version).
-/// The version too: the source read is that release's (pre-tag review). An ignore is a
-/// claim that the vulnerable code is unreachable from here, and the claim is
-/// about one dependent: the zip advisories hold for candle-core 0.9.2, which
-/// depends on zip with its default features off, only opens archives by name
-/// and writes `.npz` files (`ZipArchive::new` and `ZipWriter`; no `extract` or
-/// `ZipStreamReader` in its source), and which this crate uses for safetensors
-/// alone. 0367/0368/0369/0429/0546 are in `ZipArchive::extract` (0429 is its
-/// symlink-target allocation), 0548 in `ZipStreamReader`, 0545 needs zip's
-/// `aes-crypto` feature and 0547 its `legacy-zip` feature. No 7.x or 8.x
-/// release carries the fixes; candle-core 0.11.1 is the first candle on zip 9
-/// (`^9.1.3`), a production dependency upgrade of its own (D#884). 0548's
-/// patched range starts at 9.0.5, so at 9.0.0–9.0.4 this test asks to drop an
-/// ignore the audit then still reports.
-const AUDIT_IGNORES: &[(&str, &str, u64, &str, &str)] = &[
-    ("RUSTSEC-2026-0367", "zip", 9, "candle-core", "0.9.2"),
-    ("RUSTSEC-2026-0368", "zip", 9, "candle-core", "0.9.2"),
-    ("RUSTSEC-2026-0369", "zip", 9, "candle-core", "0.9.2"),
-    ("RUSTSEC-2026-0429", "zip", 9, "candle-core", "0.9.2"),
-    ("RUSTSEC-2026-0545", "zip", 9, "candle-core", "0.9.2"),
-    ("RUSTSEC-2026-0546", "zip", 9, "candle-core", "0.9.2"),
-    ("RUSTSEC-2026-0547", "zip", 9, "candle-core", "0.9.2"),
-    ("RUSTSEC-2026-0548", "zip", 9, "candle-core", "0.9.2"),
-];
+/// The version too: the reason is a reading of that release's source. An
+/// ignore is a claim that the vulnerable code is unreachable from here, and
+/// the claim is about one dependent. None today: the eight zip 7.2.0
+/// advisories ignored for candle-core 0.9.2 (RUSTSEC-2026-0367/0368/0369/0429/
+/// 0545/0546/0547/0548) went with candle-core 0.11.1, which takes zip 9.6.1
+/// (D#884).
+const AUDIT_IGNORES: &[(&str, &str, u64, &str, &str)] = &[];
 
 /// An audit ignore stays only while its reason does. The ignore cannot go
 /// stale loudly by itself: once candle moves to zip 9, `cargo audit` would
