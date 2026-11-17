@@ -6576,6 +6576,7 @@ app.post('/api/login', handleLogin);
         holder
     }
 
+    #[cfg(unix)]
     fn tool_text(response: &Option<String>) -> (String, bool) {
         let resp: serde_json::Value = serde_json::from_str(response.as_ref().unwrap()).unwrap();
         (
