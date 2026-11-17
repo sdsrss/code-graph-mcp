@@ -914,6 +914,27 @@ fn extract_python_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
     // Undefined callees (print, os.path.join, …) drop at Phase-2 same-language
     // resolution, so this only adds edges to defined same-project functions.
     let scope = ctx.scope_or_module();
+    // `b()` through `from m import a as b` calls `a` of module `m` (D#726,
+    // `python.rs`): bound in `m`'s files, never by name.
+    if let Some((export, module)) = super::python::python_renamed_import_call(node) {
+        results.push(ParsedRelation {
+            source_name: scope.to_string(),
+            target_name: export.clone(),
+            relation: REL_CALLS.into(),
+            metadata: Some(
+                serde_json::json!({
+                    "q": crate::domain::CALL_Q_PY_IMPORT,
+                    "py_module": module,
+                    "v": export,
+                })
+                .to_string(),
+            ),
+            source_language: String::new(),
+            source_line: None,
+            call_at: None,
+        });
+        return;
+    }
     if let Some(callee) = helpers::extract_callee_name(&node, source) {
         // Receiver-type propagation (issue #32 cause 2): when the call is
         // `recv.method()` and `recv`'s type is fixed by a single local

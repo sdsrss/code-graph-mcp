@@ -12268,6 +12268,189 @@ fn test_js_renamed_import_binds_the_export() {
     );
 }
 
+/// D#726 fixture: a Python module reaching every accepted and every refused
+/// shape of a call through `from m import a as b`, one caller per shape.
+const D726_TREE: &[(&str, &str)] = &[
+    ("app/__init__.py", ""),
+    (
+        "app/dates.py",
+        "def parse_date_param(v):\n    return v\n\n\nclass Model:\n    def parse_date_param(self):\n        return 1\n",
+    ),
+    ("app/stats.py", "def wilson_ci(n):\n    return n\n"),
+    ("app/other.py", "def parse_date_param(v):\n    return 2\n"),
+    ("app/pkg/__init__.py", "from .impl import helper\n"),
+    ("app/pkg/impl.py", "def helper():\n    return 3\n"),
+    (
+        "app/views.py",
+        "from app.dates import parse_date_param as _parse_date_param\n\
+from .stats import wilson_ci as ci\n\
+from app.pkg import helper as h\n\
+from json import loads as jl\n\
+from app.stats import wilson_ci as shadowed\n\
+from app.stats import wilson_ci as param_named\n\
+from app.stats import wilson_ci as gl\n\
+try:\n    from app.stats import wilson_ci as either\n\
+except ImportError:\n    from app.dates import parse_date_param as either\n\
+\n\
+\n\
+def wilson_ci(n):\n    return 0\n\n\n\
+def shadowed():\n    return 0\n\n\n\
+def go_date():\n    return _parse_date_param(1)\n\n\n\
+def go_ci():\n    return ci(2)\n\n\n\
+def go_h():\n    return h()\n\n\n\
+def go_jl():\n    return jl('x')\n\n\n\
+def go_shadowed():\n    return shadowed()\n\n\n\
+def go_param(param_named):\n    return param_named()\n\n\n\
+def go_either():\n    return either()\n\n\n\
+def rebinder():\n    global gl\n    gl = None\n\n\n\
+def go_gl():\n    return gl()\n\n\n\
+def go_comp(xs):\n    return [ci() for ci in xs]\n\n\n\
+def go_lambda():\n    return lambda ci: ci()\n\n\n\
+def go_nested():\n    ci = None\n\n    def inner():\n        return ci()\n\n    return inner\n",
+    ),
+];
+
+/// The `calls` edges of `caller` in `path`, as `file:type:qualified name`.
+fn py_calls_from(db: &Database, path: &str, caller: &str) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT ft.path || ':' || nt.type || ':' || COALESCE(nt.qualified_name, nt.name) \
+             FROM edges e \
+             JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id \
+             JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id \
+             WHERE e.relation = 'calls' AND fs.path = ?1 AND ns.name = ?2 ORDER BY 1",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([path, caller], |r| r.get::<_, String>(0))
+        .unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+/// The callees D726_TREE's `app/views.py` callers must have, each exactly.
+fn check_d726_calls(db: &Database, when: &str) {
+    let want: &[(&str, &[&str])] = &[
+        ("go_date", &["app/dates.py:function:parse_date_param"]),
+        ("go_ci", &["app/stats.py:function:wilson_ci"]),
+        // Through the package's re-export.
+        ("go_h", &["app/pkg/impl.py:function:helper"]),
+        // A library's function runs no project code.
+        ("go_jl", &[]),
+        // The module also defines the name: the call is not the import's.
+        ("go_shadowed", &["app/views.py:function:shadowed"]),
+        // A parameter, two imports of the name, a function's `global`, a
+        // comprehension variable, a lambda parameter and an enclosing
+        // function's local all rebind it.
+        ("go_param", &[]),
+        ("go_either", &[]),
+        ("go_gl", &[]),
+        ("go_comp", &[]),
+        ("go_lambda", &[]),
+        ("inner", &[]),
+    ];
+    let wrong: Vec<String> = want
+        .iter()
+        .filter_map(|(caller, callees)| {
+            let got = py_calls_from(db, "app/views.py", caller);
+            (got != *callees).then(|| format!("{caller}: {got:?} (want {callees:?})"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{when}: {wrong:#?}");
+}
+
+/// D#726: a Python call through `from m import a as b` binds `a` in the files
+/// the module names — on a full index and after every file is touched in turn,
+/// equal to a rebuild.
+#[test]
+fn test_python_renamed_import_binds_the_export() {
+    let (project, _d, db) = fresh_index_of(D726_TREE);
+    check_d726_calls(&db, "full index");
+    for (f, _) in D726_TREE {
+        let body = fs::read_to_string(project.path().join(f)).unwrap();
+        fs::write(project.path().join(f), format!("{body}\n")).unwrap();
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+        check_d726_calls(&db, &format!("after {f} changed"));
+    }
+    let files: Vec<(&str, String)> = D726_TREE
+        .iter()
+        .map(|(f, _)| (*f, fs::read_to_string(project.path().join(f)).unwrap()))
+        .collect();
+    let files: Vec<(&str, &str)> = files.iter().map(|(f, b)| (*f, b.as_str())).collect();
+    let (_p2, _d2, control) = fresh_index_of(&files);
+    assert_eq!(
+        call_edges_with_confidence(&db),
+        call_edges_with_confidence(&control),
+        "every file touched must equal a rebuild"
+    );
+}
+
+/// D#726: the export renamed away, removed, added later, its module deleted,
+/// the re-export dropped — each incremental run equals a rebuild, and the
+/// renamed-away export is not bound by name in another file.
+#[test]
+fn test_python_renamed_import_changes_match_rebuild() {
+    let caller = (
+        "app/use.py",
+        "from app.x import load as m\nfrom app.pkg import load as viapkg\n\n\ndef go():\n    m()\n    viapkg()\n",
+    );
+    let before: &[(&str, &str)] = &[
+        ("app/__init__.py", ""),
+        ("app/x.py", "def load():\n    return 1\n"),
+        ("app/y.py", "def load():\n    return 2\n"),
+        ("app/pkg/__init__.py", "from .impl import load\n"),
+        ("app/pkg/impl.py", "def load():\n    return 3\n"),
+        caller,
+    ];
+    assert_incremental_matches_rebuild(
+        before,
+        &[("app/x.py", Some("def load2():\n    return 1\n"))],
+    );
+    assert_incremental_matches_rebuild(before, &[("app/x.py", None)]);
+    assert_incremental_matches_rebuild(before, &[("app/pkg/__init__.py", Some("\n"))]);
+    let without: Vec<(&str, &str)> = before
+        .iter()
+        .map(|&(f, b)| {
+            if f == "app/x.py" {
+                (f, "def other():\n    return 1\n")
+            } else {
+                (f, b)
+            }
+        })
+        .collect();
+    assert_incremental_matches_rebuild(
+        &without,
+        &[("app/x.py", Some("def load():\n    return 1\n"))],
+    );
+    // Not vacuous: bound on a full index, and bound again once the export
+    // returns; never to app/y.py's namesake.
+    let (project, _d, db) = fresh_index_of(&without);
+    assert_eq!(
+        py_calls_from(&db, "app/use.py", "go"),
+        ["app/pkg/impl.py:function:load"]
+    );
+    fs::write(
+        project.path().join("app/x.py"),
+        "def load():\n    return 1\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert_eq!(
+        py_calls_from(&db, "app/use.py", "go"),
+        ["app/pkg/impl.py:function:load", "app/x.py:function:load"]
+    );
+    fs::write(
+        project.path().join("app/x.py"),
+        "def load2():\n    return 1\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert_eq!(
+        py_calls_from(&db, "app/use.py", "go"),
+        ["app/pkg/impl.py:function:load"]
+    );
+}
+
 /// D#120 F1: the export renamed away. The requeued edge must not be bound by
 /// name in another file (`y.js:load`), and a later sweep must not either.
 #[test]

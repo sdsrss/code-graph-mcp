@@ -2424,7 +2424,8 @@ fn resolve_batch_relations(
                     // `b()` through a renamed import (D#120) binds by the
                     // exporting file's nodes and export map, which a later batch
                     // may hold: decided in the deferred pass, from the database.
-                    Some(CalleeMeta::Import { .. }) => {
+                    // A Python one (D#726) by its module's files, likewise.
+                    Some(CalleeMeta::Import { .. } | CalleeMeta::PyImport { .. }) => {
                         deferred.push(DeferredRelation::of(
                             &source_ids,
                             rel,
@@ -4024,11 +4025,15 @@ fn restore_inbound_edges(
                 .clone();
             // A call through a renamed import (D#120) is decided by the file's
             // export map, not by the name its old target had: re-resolved from
-            // the pending buffer, never restored onto a same-named node.
+            // the pending buffer, never restored onto a same-named node. A
+            // Python one (D#726) is decided by its module's files, likewise.
             let renamed_import = relation.as_str() == REL_CALLS
                 && matches!(
                     super::resolve::parse_callee_metadata(metadata.as_deref()),
-                    Some(super::resolve::CalleeMeta::Import { .. })
+                    Some(
+                        super::resolve::CalleeMeta::Import { .. }
+                            | super::resolve::CalleeMeta::PyImport { .. }
+                    )
                 );
             // A Rust call typed by its receiver (D#112) is decided by what the
             // target's impl can run on, which an edit of the target's file can
@@ -4331,6 +4336,7 @@ fn resolve_deferred_relations(
     let mut py_modules = super::resolve::ProjectPythonModules::new(python_module_map);
     let mut callable_ids: Option<HashSet<i64>> = None;
     let mut js_exports = super::js_exports::JsExports::default();
+    let mut py_reexports = super::python_modules::ReexportEdges::default();
 
     // Containment layer for dead ids (audit 2026-08-16 P0-1). Both id sources
     // this pass inserts from are SNAPSHOTS taken earlier in the run: the name map
@@ -4510,6 +4516,51 @@ fn resolve_deferred_relations(
         } else {
             d
         };
+
+        // A call through a Python renamed import (D#726): what the module's
+        // files define or re-export under the name, else buffered while they
+        // answer with nothing, else (a library) nothing.
+        if d.relation == REL_CALLS {
+            if let Some(CalleeMeta::PyImport { module, export }) =
+                parse_callee_metadata(d.metadata.as_deref())
+            {
+                match super::python_modules::py_import_call_targets(
+                    db.conn(),
+                    &mut py_reexports,
+                    &d.rel_path,
+                    &module,
+                    &export,
+                    python_module_map,
+                )? {
+                    Some(ids) if ids.is_empty() => {
+                        let pending_name =
+                            super::resolve::js_import_pending_name(d.metadata.as_deref(), &export);
+                        for source_id in &source_ids {
+                            crate::storage::queries::insert_pending_unresolved_call(
+                                db.conn(),
+                                *source_id,
+                                &pending_name,
+                                &d.language,
+                                d.metadata.as_deref(),
+                            )?;
+                        }
+                    }
+                    Some(ids) => {
+                        edges_created += insert_relation_edges(
+                            db,
+                            &mut written,
+                            &source_ids,
+                            &ids,
+                            &d.relation,
+                            d.metadata.as_deref(),
+                            false,
+                        )?;
+                    }
+                    None => {}
+                }
+                continue;
+            }
+        }
 
         // A call through a renamed import (D#120): the export in the file its
         // specifier names, else buffered while that file lacks it, else nothing.

@@ -249,6 +249,43 @@ pub(super) fn module_attribute_ids(
     Ok(kept)
 }
 
+/// What a call through `from m import a as b` binds (D#726): the module-level
+/// `def`s and classes named `a` in the files `m` names, else what those files
+/// re-export as `a` — never a method, never a `def` nested in another. `None`
+/// when `m` names no project module (a library runs no project code);
+/// `Some(empty)` while the module answers with nothing, which the caller
+/// buffers like an unresolved call. One answer on every path (batch-deferred,
+/// pending sweep), read from the database.
+pub(super) fn py_import_call_targets(
+    conn: &rusqlite::Connection,
+    reexports: &mut ReexportEdges,
+    caller_path: &str,
+    module: &str,
+    export: &str,
+    python_module_map: &HashMap<String, Vec<String>>,
+) -> anyhow::Result<Option<Vec<i64>>> {
+    let Some(files) = project_module_files_from(module, caller_path, python_module_map) else {
+        return Ok(None);
+    };
+    let mut stmt = conn.prepare_cached(
+        "SELECT n.id FROM nodes n JOIN files f ON f.id = n.file_id
+         WHERE f.path = ?1 AND n.name = ?2 AND n.type IN ('function', 'class')
+           AND COALESCE(n.qualified_name, n.name) = n.name
+         ORDER BY n.id",
+    )?;
+    let mut ids = Vec::new();
+    for file in &files {
+        let rows = stmt.query_map(rusqlite::params![file, export], |r| r.get::<_, i64>(0))?;
+        ids.extend(rows.collect::<rusqlite::Result<Vec<i64>>>()?);
+    }
+    if ids.is_empty() {
+        let reexported =
+            python_reexport_targets(conn, reexports, &files, export, python_module_map)?;
+        ids = module_attribute_ids(conn, reexported)?;
+    }
+    Ok(Some(ids))
+}
+
 /// How deep a re-export chain is followed: `pkg/__init__.py` re-exporting from
 /// `pkg/sub/__init__.py`, which re-exports from `pkg/sub/impl.py`, is two.
 const REEXPORT_MAX_DEPTH: usize = 8;

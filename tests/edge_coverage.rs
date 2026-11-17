@@ -1181,6 +1181,10 @@ fn python_resolution_tier_inventory_is_pinned() {
         "calls inferred child.py:Child.run -> base.py:Base.helper",
         "calls inferred dotted.py:run -> pkg/models.py:load",
         "calls inferred dotted.py:run -> pkg/views.py:render",
+        // `NewCache()` through `from cache import Cache as NewCache` runs the
+        // class it imports (D#726); no node is named `NewCache`, so by name it
+        // bound nothing.
+        "calls inferred use_alias.py:build -> cache.py:Cache",
         "imports extracted app.py:<module> -> builder.py:<module>",
         "imports extracted app.py:<module> -> builder.py:make_builder",
         "imports extracted child.py:<module> -> base.py:<module>",
@@ -1229,16 +1233,15 @@ fn python_resolution_tier_inventory_is_pinned() {
 
     // The backlog is the other half of the picture: an edge missing from the
     // histogram was either dropped or is still buffered, and those two call for
-    // opposite responses. The one row here is `build -> NewCache`, the aliased
-    // class import (`from cache import Cache as NewCache`), which this extractor
-    // never binds back to `Cache`. Teaching it to resolve aliases takes this to 0
-    // and adds one `calls` edge above — both numbers move together, which is the
-    // point of pinning them in one test.
+    // opposite responses. Its one row was `build -> NewCache`, the aliased
+    // class import (`from cache import Cache as NewCache`), until D#726 bound
+    // it to `Cache`: this went to 0 and one `calls` edge was added above — both
+    // numbers moved together, which is the point of pinning them in one test.
     assert_eq!(
         queries::resolution_stats(db.conn())
             .unwrap()
             .pending_unresolved_calls,
-        1,
+        0,
         "the pending-call backlog moved"
     );
 }

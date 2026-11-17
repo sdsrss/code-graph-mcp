@@ -68,6 +68,14 @@ pub(super) enum CalleeMeta {
         module: String,
         export: String,
     },
+    /// Python `b()` through `from m import a as b` (D#726, parser
+    /// `python::python_renamed_import_call`), recorded as a call of `a`. Binds
+    /// only what [`super::python_modules::py_import_call_targets`] finds for
+    /// module `m`, on every path, like [`Self::Import`].
+    PyImport {
+        module: String,
+        export: String,
+    },
     /// Python `m.f()` where `m` is bound by an absolute import of module `v`
     /// (`relations/member.rs`): no project code runs unless `v` is a project
     /// module ([`ProjectPythonModules`]); resolves like a bare call otherwise.
@@ -125,6 +133,10 @@ pub(super) fn parse_callee_metadata(s: Option<&str>) -> Option<CalleeMeta> {
             .map(|r| CalleeMeta::Receiver(r.to_string())),
         crate::domain::CALL_Q_IMPORT => Some(CalleeMeta::Import {
             module: v.get("js_module")?.as_str()?.to_string(),
+            export: v.get("v")?.as_str()?.to_string(),
+        }),
+        crate::domain::CALL_Q_PY_IMPORT => Some(CalleeMeta::PyImport {
+            module: v.get("py_module")?.as_str()?.to_string(),
             export: v.get("v")?.as_str()?.to_string(),
         }),
         _ => None,
@@ -249,7 +261,9 @@ pub(super) fn python_attr_of(metadata: Option<&str>) -> Option<String> {
 /// so this name only has to be distinct per (specifier, export).
 pub(super) fn js_import_pending_name(metadata: Option<&str>, target_name: &str) -> String {
     match parse_callee_metadata(metadata) {
-        Some(CalleeMeta::Import { module, export }) => format!("{export}\u{1f}{module}"),
+        Some(CalleeMeta::Import { module, export } | CalleeMeta::PyImport { module, export }) => {
+            format!("{export}\u{1f}{module}")
+        }
         _ => target_name.to_string(),
     }
 }
@@ -345,8 +359,65 @@ pub(super) fn resolve_pending_calls_touching(
     // Every file path, read at the first call a `use` anchors in a crate.
     let mut all_file_paths: Option<HashSet<String>> = None;
     let mut js_exports = super::js_exports::JsExports::default();
+    let mut py_reexports = super::python_modules::ReexportEdges::default();
+    let mut python_module_map: Option<HashMap<String, Vec<String>>> = None;
 
     for row in &pending {
+        // A call through a Python renamed import (D#726): what the module
+        // answers, as in the deferred pass; nothing by name.
+        if let Some(CalleeMeta::PyImport { module, export }) =
+            parse_callee_metadata(row.metadata.as_deref())
+        {
+            if all_file_paths.is_none() {
+                all_file_paths = Some(
+                    db.conn()
+                        .prepare("SELECT path FROM files")?
+                        .query_map([], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<_>>()?,
+                );
+            }
+            let files = all_file_paths.as_ref().expect("loaded above");
+            let map = python_module_map.get_or_insert_with(|| {
+                let python: HashSet<String> = files
+                    .iter()
+                    .filter(|p| p.ends_with(".py"))
+                    .cloned()
+                    .collect();
+                super::python_modules::build_python_module_map(&python)
+            });
+            let caller_path = source_id_to_path
+                .get(&row.source_id)
+                .map(String::as_str)
+                .unwrap_or_default();
+            match super::python_modules::py_import_call_targets(
+                db.conn(),
+                &mut py_reexports,
+                caller_path,
+                &module,
+                &export,
+                map,
+            )? {
+                Some(ids) if ids.is_empty() => continue,
+                Some(ids) => {
+                    for tgt_id in ids.iter().filter(|id| **id != row.source_id) {
+                        if insert_edge_cached(
+                            db.conn(),
+                            row.source_id,
+                            *tgt_id,
+                            REL_CALLS,
+                            row.metadata.as_deref(),
+                        )? {
+                            edges_added += 1;
+                            touched.insert(caller_path.to_string());
+                            ends.extend([row.source_id, *tgt_id]);
+                        }
+                    }
+                }
+                None => {}
+            }
+            to_delete.push(row.id);
+            continue;
+        }
         // A call through a renamed import (D#120) binds what the file its
         // specifier names exports, and nothing by name: a requeue after the
         // export was renamed must bind what a rebuild binds, which is nothing.
@@ -2625,7 +2696,8 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                       -- ... and UNLESS the edge was resolved by a TYPE/PATH callee
                       -- qualifier (self / stype / rtype / super / path), or through a
                       -- renamed JS import to the file its specifier names (imp,
-                      -- D#120), or through a Go import to its package's
+                      -- D#120) or a renamed Python import to its module's files
+                      -- (pyimp, D#726), or through a Go import to its package's
                       -- directory (gopkg, D#789). Those bind the call
                       -- by a structural signal (the receiver's impl type, or the
                       -- module path), not by a bare-name guess among same-name
@@ -2637,7 +2709,7 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                       -- A typed call its class did not decide carries `amb`
                       -- (`ambiguous_meta`) and is classified like a bare one.
                       AND (json_extract(e.metadata, '$.q') IS NULL
-                           OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'super', 'path', 'imp', 'gopkg')
+                           OR json_extract(e.metadata, '$.q') NOT IN ('self', 'stype', 'rtype', 'super', 'path', 'imp', 'pyimp', 'gopkg')
                            OR json_extract(e.metadata, '$.amb') IS NOT NULL)
                  THEN ?3 ELSE ?4 END"
     );
