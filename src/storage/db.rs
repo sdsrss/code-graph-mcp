@@ -301,8 +301,14 @@ fn listed_objects(foreign: &[String]) -> String {
 }
 
 fn foreign_schema_message(db_path: &Path, foreign: &[String]) -> String {
+    foreign_schema_refusal("open", db_path, foreign)
+}
+
+/// The refusal of an index, `verb` naming what was refused: an open, or a
+/// read on a connection opened earlier (D#883).
+fn foreign_schema_refusal(verb: &str, db_path: &Path, foreign: &[String]) -> String {
     format!(
-        "refusing to open {}: it holds schema objects code-graph-mcp does not create \
+        "refusing to {verb} {}: it holds schema objects code-graph-mcp does not create \
          ({}); SQL stored in an index runs when the index is used, and a repository \
          can carry one — delete {}* and re-run to rebuild the index",
         db_path.display(),
@@ -467,6 +473,118 @@ pub struct Database {
     /// intact and a rebuild is owed. `None` when fresh, current, or already
     /// revalidated (wiped) by an indexer open. See [`Database::index_version_stale`].
     index_version_stale: Option<i32>,
+    /// Set on the MCP server's read-only connection (D#883); see [`ReadGuard`].
+    read_guard: Option<ReadGuard>,
+}
+
+/// No transaction is open; the next [`Database::conn`] opens a checked one.
+const READ_IDLE: u8 = 0;
+/// The guard's own statements are running.
+const READ_CHECKING: u8 = 1;
+/// Inside a transaction whose first statement checked its snapshot.
+const READ_CHECKED: u8 = 2;
+/// The check refused or failed, or the transaction ended under the reader:
+/// nothing compiles until [`Database::end_read`].
+const READ_CLOSED: u8 = 3;
+
+/// D#883: every read on a connection that outlives one transaction must see
+/// a snapshot whose schema was checked. The open-time check covered only the
+/// snapshot it read; each later read transaction can see another schema, and
+/// SQLite loads and runs it.
+///
+/// The first [`Database::conn`] of a message discards the parsed schema
+/// (`PRAGMA writable_schema=RESET`; SQLite otherwise keeps it while the
+/// schema cookie is unchanged, whatever the rows now say), opens a
+/// transaction and checks the schema inside it, so the check and every read
+/// after it share one snapshot. [`Database::end_read`] commits at the end of
+/// the message. The authorizer lets a statement compile only while the
+/// guard runs its own statements, or inside that checked transaction while
+/// it is still open: SQLite rolls a transaction back by itself when a
+/// statement meets an I/O or memory error and returns to autocommit, and
+/// any statement after that would read a snapshot nobody checked.
+///
+/// Not a rollback hook: rusqlite 0.41 keeps hook closures as SQLite client
+/// data, which `sqlite3_close` frees before it rolls back a transaction
+/// still open and calls the hook — dropping a connection mid-read crashed.
+struct ReadGuard {
+    path: std::path::PathBuf,
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    refusal: std::cell::RefCell<Option<anyhow::Error>>,
+}
+
+impl ReadGuard {
+    fn install(conn: &mut Connection, path: &Path) -> Result<Self> {
+        use rusqlite::hooks::{AuthContext, Authorization};
+        use std::sync::atomic::{AtomicU8, Ordering};
+        let state = std::sync::Arc::new(AtomicU8::new(READ_IDLE));
+        let authorized = std::sync::Arc::clone(&state);
+        // SAFETY: SQLite calls the authorizer on the connection's own thread
+        // while it compiles a statement, and frees the closure when the
+        // connection closes; the handle is valid for as long as the closure
+        // can run. `sqlite3_get_autocommit` only reads a flag.
+        let handle = unsafe { conn.handle() } as usize;
+        conn.authorizer(Some(move |_: AuthContext<'_>| {
+            let open = || unsafe { rusqlite::ffi::sqlite3_get_autocommit(handle as *mut _) } == 0;
+            match authorized.load(Ordering::Acquire) {
+                READ_CHECKING => Authorization::Allow,
+                READ_CHECKED if open() => Authorization::Allow,
+                _ => Authorization::Deny,
+            }
+        }))?;
+        Ok(Self {
+            path: sqlite_file_name(path),
+            state,
+            refusal: std::cell::RefCell::new(None),
+        })
+    }
+
+    fn begin(&self, conn: &Connection) {
+        use std::sync::atomic::Ordering;
+        if self
+            .state
+            .compare_exchange(
+                READ_IDLE,
+                READ_CHECKING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let checked = conn
+            .execute_batch("PRAGMA writable_schema = RESET; BEGIN;")
+            .and_then(|()| foreign_schema_objects(conn));
+        let next = match checked {
+            Ok(objects) if objects.is_empty() => READ_CHECKED,
+            Ok(objects) => {
+                *self.refusal.borrow_mut() = Some(anyhow::anyhow!(
+                    "{}",
+                    foreign_schema_refusal("read", &self.path, &objects)
+                ));
+                READ_CLOSED
+            }
+            Err(e) => {
+                *self.refusal.borrow_mut() = Some(anyhow::anyhow!(
+                    "could not check the schema of {} before reading it: {e}",
+                    self.path.display()
+                ));
+                READ_CLOSED
+            }
+        };
+        self.state.store(next, Ordering::Release);
+    }
+
+    fn end(&self, conn: &Connection) {
+        use std::sync::atomic::Ordering;
+        self.state.store(READ_CHECKING, Ordering::Release);
+        if !conn.is_autocommit() && conn.execute_batch("COMMIT").is_err() {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        // A refusal nobody reported belongs to this message only.
+        self.refusal.borrow_mut().take();
+        self.state.store(READ_IDLE, Ordering::Release);
+    }
 }
 
 impl Database {
@@ -517,7 +635,11 @@ impl Database {
         // target, and a read-only open of a WAL database still writes its
         // -shm/-wal there (D#363; see `reject_unowned_db`).
         reject_unowned_files(path)?;
-        Self::open_readonly_named(path)
+        let mut db = Self::open_readonly_named(path)?;
+        // The server keeps this connection for the session: every later read
+        // checks the snapshot it reads (D#883).
+        db.read_guard = Some(ReadGuard::install(&mut db.conn, path)?);
+        Ok(db)
     }
 
     /// [`Database::open_readonly`] without the planted-file refusal, for a file
@@ -600,6 +722,7 @@ impl Database {
             conn,
             vec_enabled,
             index_version_stale: None,
+            read_guard: None,
         })
     }
 
@@ -997,6 +1120,7 @@ If you see this repeatedly, another code-graph server of a different version is 
             conn,
             vec_enabled: enable_vec,
             index_version_stale,
+            read_guard: None,
         })
     }
 
@@ -1024,7 +1148,7 @@ If you see this repeatedly, another code-graph server of a different version is 
     /// own.
     pub fn newer_index_version(&self) -> Option<i32> {
         let stored: i32 = self
-            .conn
+            .conn()
             .pragma_query_value(None, "application_id", |row| row.get(0))
             .ok()?;
         (stored > crate::domain::INDEX_VERSION).then_some(stored)
@@ -1241,7 +1365,27 @@ If you see this repeatedly, another code-graph server of a different version is 
     }
 
     pub fn conn(&self) -> &Connection {
+        if let Some(guard) = &self.read_guard {
+            guard.begin(&self.conn);
+        }
         &self.conn
+    }
+
+    /// Ends the read transaction this message's reads share on a guarded
+    /// connection (D#883, see [`ReadGuard`]); the next [`Database::conn`]
+    /// checks a fresh snapshot. A no-op on any other connection.
+    pub(crate) fn end_read(&self) {
+        if let Some(guard) = &self.read_guard {
+            guard.end(&self.conn);
+        }
+    }
+
+    /// Why this message's reads were refused, if they were: the schema
+    /// objects the check found, or why it could not run. Taken once.
+    pub(crate) fn take_read_refusal(&self) -> Option<anyhow::Error> {
+        self.read_guard
+            .as_ref()
+            .and_then(|guard| guard.refusal.borrow_mut().take())
     }
 
     /// For tests that install a trace: rusqlite's `trace_v2` takes
@@ -4509,6 +4653,141 @@ mod tests {
             .expect_err("a schema the read fails on")
             .to_string();
         assert!(err.contains("unsupported file format"), "{err}");
+    }
+
+    fn count_files(db: &Database) -> i64 {
+        db.conn()
+            .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// D#883: the MCP server's read-only connection lives for the session,
+    /// and it checked the schema only when it opened: SQL that reached the
+    /// index later ran on it. Its reads now happen inside a transaction whose
+    /// first statement checked that same snapshot.
+    #[test]
+    fn schema_that_arrives_after_a_read_only_open_is_refused_at_the_next_read() {
+        let dir = TempDir::new().unwrap();
+        let db = own_index(&dir, true);
+        let ro = Database::open_readonly(&db).unwrap();
+        assert_eq!(count_files(&ro), 0);
+        ro.end_read();
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE VIEW planted AS SELECT 'ran' AS v;")
+            .unwrap();
+        let read = ro
+            .conn()
+            .query_row("SELECT v FROM planted", [], |r| r.get::<_, String>(0));
+        assert!(read.is_err(), "the planted view ran: {read:?}");
+        let refusal = ro
+            .take_read_refusal()
+            .expect("a read that met planted SQL says why it was refused")
+            .to_string();
+        assert!(
+            refusal.starts_with("refusing to read ")
+                && refusal.contains("does not create")
+                && refusal.contains("view \"planted\""),
+            "{refusal}"
+        );
+        // The tool's own reads in that message are refused too.
+        assert!(ro
+            .conn()
+            .query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+            .is_err());
+        ro.end_read();
+        // Refused again, and nobody asks why: the reason ends with the message.
+        assert!(ro
+            .conn()
+            .query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+            .is_err());
+        ro.end_read();
+        // The next message checks again: a clean index is read.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("DROP VIEW planted;")
+            .unwrap();
+        assert_eq!(count_files(&ro), 0);
+        assert!(ro.take_read_refusal().is_none());
+    }
+
+    /// The check and the reads it vouches for see one snapshot; another
+    /// connection's commit shows from the next message on.
+    #[test]
+    fn reads_in_one_message_share_the_snapshot_their_check_read() {
+        let dir = TempDir::new().unwrap();
+        let db = own_index(&dir, false);
+        let ro = Database::open_readonly(&db).unwrap();
+        assert_eq!(count_files(&ro), 0);
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) \
+                 VALUES ('a.rs', 'b', 0, 'rust', 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(count_files(&ro), 0, "a later read in the same message");
+        ro.end_read();
+        assert_eq!(count_files(&ro), 1, "the next message");
+    }
+
+    /// SQLite rolls a transaction back by itself when a statement in it meets
+    /// an I/O or memory error, and every statement after that reads a snapshot
+    /// of its own — one nobody checked. Nothing compiles again until the next
+    /// message opens a checked transaction.
+    #[test]
+    fn nothing_compiles_after_the_checked_transaction_ends_until_the_next_message() {
+        let dir = TempDir::new().unwrap();
+        let db = own_index(&dir, false);
+        let ro = Database::open_readonly(&db).unwrap();
+        assert_eq!(count_files(&ro), 0);
+        let _ = ro.conn().execute_batch("ROLLBACK");
+        let err = ro
+            .conn()
+            .query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+            .expect_err("a read after the transaction ended under it");
+        assert!(err.to_string().contains("not authorized"), "{err}");
+        ro.end_read();
+        assert_eq!(count_files(&ro), 0);
+    }
+
+    /// SQLite keeps a parsed schema between transactions and reloads it only
+    /// when the schema cookie changes. A write compiled outside a checked
+    /// transaction loads the schema of whatever snapshot it reads before the
+    /// authorizer is asked; that schema must not outlive the message, even
+    /// when the next snapshot is clean under the same cookie.
+    #[test]
+    fn each_message_parses_the_schema_of_the_snapshot_it_checked() {
+        let dir = TempDir::new().unwrap();
+        let db = own_index(&dir, false);
+        let ro = Database::open_readonly(&db).unwrap();
+        assert_eq!(count_files(&ro), 0);
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch("CREATE VIEW planted AS SELECT 'ran' AS v;")
+            .unwrap();
+        let _ = ro.conn().execute_batch("ROLLBACK");
+        let _ = ro.conn().execute("DELETE FROM planted", []);
+        // The planted row goes; the schema cookie stays.
+        writer
+            .execute_batch(
+                "PRAGMA writable_schema = ON; \
+                 DELETE FROM sqlite_schema WHERE name = 'planted'; \
+                 PRAGMA writable_schema = OFF;",
+            )
+            .unwrap();
+        drop(writer);
+        ro.end_read();
+        let read = ro
+            .conn()
+            .query_row("SELECT v FROM planted", [], |r| r.get::<_, String>(0));
+        assert!(
+            read.is_err(),
+            "the view ran from a schema parsed outside a check: {read:?}"
+        );
+        assert!(ro.take_read_refusal().is_none(), "the index is clean");
+        assert_eq!(count_files(&ro), 0);
     }
 
     /// The control: the tool's own index opens through every constructor,

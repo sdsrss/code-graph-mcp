@@ -661,6 +661,10 @@ impl McpServer {
     pub(super) fn write_db(&self) -> WriteDb<'_> {
         let guard = lock_or_recover(&self.promoted_db, "promoted_db");
         if guard.is_some() {
+            // Reads stay on the read-only `self.db`, whose reads in a message
+            // share one snapshot (D#883): end it, so reads after these writes
+            // see them.
+            self.db.end_read();
             WriteDb::Promoted(guard)
         } else {
             drop(guard);
@@ -2024,6 +2028,16 @@ impl McpServer {
     }
 
     pub fn handle_message(&self, line: &str) -> Result<Option<String>> {
+        // D#883: a message's reads share one checked snapshot; the next
+        // message checks a fresh one. A drop guard, so a panicking handler
+        // does not leave the snapshot pinned for the rest of the session.
+        struct EndRead<'a>(&'a Database);
+        impl Drop for EndRead<'_> {
+            fn drop(&mut self) {
+                self.0.end_read();
+            }
+        }
+        let _end_read = EndRead(&self.db);
         let req: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(req) => req,
             // Deserialization failed. Fall back to a loose re-parse so we can tell
@@ -2229,7 +2243,14 @@ impl McpServer {
             );
         }
 
-        match self.handle_tool(tool_name, arguments) {
+        let outcome = self.handle_tool(tool_name, arguments);
+        // D#883: reads refused for SQL the tool does not create answer with
+        // that refusal, whatever the tool made of the statements it was denied.
+        let outcome = match self.db.take_read_refusal() {
+            Some(refusal) => Err(refusal),
+            None => outcome,
+        };
+        match outcome {
             Ok(result) => {
                 let text = serde_json::to_string(&result)
                     .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
@@ -2304,11 +2325,12 @@ impl McpServer {
                 let status = match queries::get_index_status(self.db.conn(), self.is_watching()) {
                     Ok(s) => s,
                     Err(e) => {
+                        let e = self.db.take_read_refusal().unwrap_or(e);
                         return JsonRpcResponse::error(
                             id,
                             super::protocol::JSONRPC_INTERNAL_ERROR,
                             format!("Failed to get index status: {}", e),
-                        )
+                        );
                     }
                 };
 
@@ -6527,6 +6549,74 @@ app.post('/api/login', handleLogin);
             !caller_nodes.is_empty(),
             "snapshot_caller must be present after drift-check"
         );
+    }
+
+    /// Holds the index lock from a separate open file description, standing in
+    /// for a live primary, so the server under test opens as a secondary.
+    #[cfg(unix)]
+    fn hold_index_lock(project: &Path) -> std::fs::File {
+        use std::os::unix::io::AsRawFd;
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(project.join(CODE_GRAPH_DIR).join("index.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        holder
+    }
+
+    fn tool_text(response: &Option<String>) -> (String, bool) {
+        let resp: serde_json::Value = serde_json::from_str(response.as_ref().unwrap()).unwrap();
+        (
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            resp["result"]["isError"].as_bool().unwrap_or(false),
+        )
+    }
+
+    /// D#883: a secondary reads through one connection for the whole session.
+    /// SQL that reaches the index after the server opened it is refused at the
+    /// next tool call, by name, and a later call reads the index again once it
+    /// is clean.
+    #[cfg(unix)]
+    #[test]
+    fn test_secondary_refuses_schema_that_arrives_after_it_opened() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("alpha.rs"), "fn alpha_fn() {}\n").unwrap();
+        McpServer::new_test_with_project(project.path())
+            .ensure_indexed()
+            .unwrap();
+        let _holder = hold_index_lock(project.path());
+        let server = McpServer::from_project_root(project.path()).unwrap();
+        assert!(!server.is_primary(), "precondition: secondary");
+        let status = || server.handle_message(&tool_call_json("get_index_status", json!({})));
+
+        let (text, is_error) = tool_text(&status().unwrap());
+        assert!(!is_error, "{text}");
+
+        let index = project.path().join(CODE_GRAPH_DIR).join("index.db");
+        let planter = rusqlite::Connection::open(&index).unwrap();
+        planter
+            .execute_batch("CREATE VIEW planted AS SELECT 1;")
+            .unwrap();
+        let (text, is_error) = tool_text(&status().unwrap());
+        assert!(is_error, "the call after the plant answered: {text}");
+        assert!(
+            text.starts_with("Error: refusing to read ")
+                && text.contains("does not create")
+                && text.contains("view \"planted\""),
+            "{text}"
+        );
+
+        planter.execute_batch("DROP VIEW planted;").unwrap();
+        let (text, is_error) = tool_text(&status().unwrap());
+        assert!(!is_error, "a clean index is read again: {text}");
     }
 
     // ---------------------------------------------------------------------
