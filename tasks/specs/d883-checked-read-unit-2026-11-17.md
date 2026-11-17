@@ -80,6 +80,31 @@ R1 的 #1、#2、#4、#5 在增量里确认关闭（评审独立重跑：4f48c0c
 
 F1 的修复没有经过独立评审（再起一轮即第三轮，按停止线交用户决定是否在发版前评审）。
 
+## 评审 R3 与发版（2026-11-17，用户："按你的建议执行"）
+
+- 决定：再起一轮盲审，范围只到没人审过的 20e1caea、3329e646 和整段 `## 0.196.0` 发版说明；审完作为 0.196.0（minor）发版。理由：3329e646 改的是 0.195.0 安全修复的核心检查，0.195.0 用户在新版本发出前一直暴露于 F1；发版和推送一起做，缩短手法公开而修复未发的窗口。
+- 事先定下 R3 结论的处理（第三轮，不再打开放式补丁）：
+  - 3329e646 或 20e1caea 相对 0.195.0 引入的回归（误拒合法索引、崩溃、措辞写错文件）→ 修，先写失败测试；修法不是只减不增或超出原提交的行 → 撤回该提交里出问题的部分。
+  - 0.195.0 同样存在的另一种绕过检查的方式 → 本版不补，CHANGELOG Not covered 与 GHSA Not fixed 写明（不写手法），记延期条目；手法只进 gitignore 的 `docs/`。
+  - 只涉及说法的 → 改说法。
+  - 不属于以上的 → 停下问用户。
+- R3 结果：子代理工作约 29 分钟后被 API 的安全策略（safeguards）终止，没有最终报告。只收到它的变异中间结果：M3（`type` 区分大小写比较）、M4（规则收窄为字面 `sqlite_master`）存活，lib 1649/1649 通过；M5（`&&`→`||`）被杀，lib 78 失败；M6（`of_users_file` 不去掉删除提示）只被 cli_snapshot 杀（1 失败）；M8 被杀；M7b 没跑完。问题 1、2 与 C1–C8 没有结论。
+- M3/M4 是测试缺口：代码两处都用 `eq_ignore_ascii_case`，原测试只用小写 `sqlite_master`。补 `an_index_row_on_any_sqlite_table_is_refused_in_any_case`（`index`/`SQLITE_MASTER`、`INDEX`/`sqlite_master`、`index`/`sqlite_stat1`，不带植入视图），两个变异各自让它失败，代码不改。
+- R3 的发布前检查另发现（我，不是评审）：`tool_text` 只被 `cfg(unix)` 测试调用，Windows 下 `warnings = "deny"` 会让测试构建失败；在 git archive 副本里把三个 unix 项翻成 `cfg(windows)` 复现（"function `tool_text` is never used"），a0386127 修。
+- R4：按安全策略提示收窄范围另起一轮——只查回归、发版说明的说法与测试覆盖，不构造绕过检查的文件。R4 也被终止 → 评审在本环境无法运行，停下问用户。
+- R4（新起的子代理，收窄简报，对 a1694c01；未被终止，完整报告）：HIGH 0 / MEDIUM 0 / LOW 2 / NOTE 3，没有回归。本机九个索引（INDEX_VERSION 71、92、124、139、140 写的，都有 `sqlite_stat1/4`、`sqlite_sequence`、autoindex、FTS5 与 vec0 影子表）在 0.195.0 与本版 `health-check --json` 整段 JSON 相同；HEAD 新建与 0.195.0 新建的索引、ANALYZE + `PRAGMA optimize` 后的副本都健康且计数相同；两个版本各做的 8 个快照 `snapshot inspect` 输出 md5 相同；二级服务三次调用两版都正常。变异 14 个被杀、3 个存活。
+
+| # | 结论 | 处理 |
+|---|------|------|
+| F1 LOW（实测） | CHANGELOG "A refusal of `.code-graph/index.db` keeps the remedy" 对 `snapshot inspect .code-graph/index.db` 不成立：inspect 对任何文件都按用户文件措辞（WAL 索引走副本，`open_staged` 套 `of_users_file`） | 改说法：inspect 给任何文件（含 `.code-graph/index.db`）都这样措辞；把它当索引打开的命令（`health-check`、`show`、`incremental-index`、MCP 服务等，R4 实测）保留删除重建提示 |
+| F2 LOW（变异 M14 存活） | 用户文件拒绝里的对象列表没有测试 | 610a4b9d：cli_snapshot 四条读法都断言 `view "planted"`；M14 现在失败（cli 1/14） |
+| F3 NOTE（M16 存活） | "and N more" 截断无测试 | 不改：0.195.0 前就有的逻辑，20e1caea 只是挪进 `listed_objects` |
+| F4 NOTE（M20 存活，4f48c0c0） | 二级每次调用的拒绝带删除提示，但没测试钉住 | 610a4b9d：二级测试断言提示（只比路径尾部，macOS 的临时目录经符号链接）；M20 现在失败 |
+| F5 NOTE | CHANGELOG 的每次调用耗时是 3329e646 之前测的 | 重测（两边源码 release 构建：6ac9b552 对 a1694c01，本仓库 `src/` 副本 4,460 个节点，二级模式，`get_ast_node`，3 轮×100 次交替）：0.060/0.067/0.115 → 0.338/0.356/0.358 ms，每轮差 0.278/0.289/0.243 ms；CHANGELOG 换成这组数字 |
+
+- 发版说明里"四种变化之后的调用都被拒""3,000 次 / 20,000 次竞态 0 次执行"是在 9315eda4 上测的，3329e646 之后没有重跑：3329e646 只增加拒绝（新规则）并把检查改读表本身，R4 用 `EXPLAIN QUERY PLAN` 看到改前改后都是 `SCAN sqlite_schema`，这些变体里没有建在 `sqlite_schema` 上的索引。所以这几条数字沿用 9315eda4 的实测结果，"本版同样成立"是推导，没有重测。
+- 升级说明的实测：本机九个索引（`~/dev/*/.code-graph/index.db`）在 0.195.0 发布版和 3329e646 构建上 `health-check --json` 的 `healthy` 与文件数逐个相同（9/9）；系统 sqlite3 3.46.1 对 `sqlite_master`、`sqlite_schema`、`sqlite_stat1`、`sqlite_sequence` 建索引都报 "may not be indexed"。
+
 ## 验证记录
 
 - RED（实现前，接口先写成空实现）：4 个 `storage::db` 新测试全部失败——植入视图执行了；同一消息里第二次读看到了别的连接的提交（left 1, right 0）；事务回滚后语句照样编译执行；**cookie 不变时 SQLite 用缓存里的植入 schema 执行了视图**（证明 RESET 是必需的，不是多余防线）。服务层新测试 `test_secondary_refuses_schema_that_arrives_after_it_opened` 失败于"第二次调用正常回答"（读事务没有在消息结束时关闭，读的还是植入前的快照）。GREEN：64/64（`storage::db` + `mcp::server::tests::test_secondary*`）。

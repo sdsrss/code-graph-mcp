@@ -34,7 +34,10 @@ remedy for the tool's own index: `delete <file>* and re-run to rebuild the
 index`. Nothing rebuilds a file you named, and `<file>*` also matches your
 other files, such as `snapshot.db.zst` beside `snapshot.db`. The refusal now
 ends with its reason, that SQL stored in a database runs when the database
-is used. A refusal of `.code-graph/index.db` keeps the remedy.
+is used, whatever file you give `snapshot inspect`, `.code-graph/index.db`
+too. Commands that open `.code-graph/index.db` as the index, such as
+`health-check`, `show`, `incremental-index` and the MCP server, keep the
+remedy in their refusal.
 
 ### fix: an MCP server reading the index as a secondary checks it at every call, not once
 
@@ -66,15 +69,17 @@ after it writes, so it reads its own writes.
 Measured with four ways the index can change under a running secondary,
 among them a view in a pulled `-wal` and one in a pulled `index.db` with
 another process writing the index the way a first server does: on 0.195.0
-the planted view ran in every one, and in this version every call after the
-change was refused. With another process rewriting the schema row of a
+the planted view ran in every one, and built with this fix every call after
+the change was refused. With another process rewriting the schema row of a
 table into a view and back under an unchanged schema cookie, the view ran
 in none of 3,000 calls at about 150,000 rewrites a second, nor in any of
-20,000 calls at about 930 a second. Each call in a
+20,000 calls at about 930 a second. These runs predate the next section's
+fix, which only adds refusals and leaves the check's query plan a scan of
+the same table. Each call in a
 secondary pays for the check and the parse: `get_ast_node` on an index of
-4,448 symbols took 0.065–0.073 ms built from the commit before this fix and
-0.342–0.351 ms with it (medians of 100 calls, three interleaved rounds, both
-built from source).
+4,460 symbols took 0.060–0.115 ms built from the commit before this fix and
+0.338–0.358 ms built from this release (medians of 100 calls, three
+interleaved rounds, both built from source).
 
 ### fix: the schema check reads the schema table itself
 
