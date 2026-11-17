@@ -1,6 +1,6 @@
 # 2026-11-17 D#883 剩余：索引文件在打开期间被替换后，本工具的连接不再读写它们
 
-状态：**已实现（cb8b7096），待评审与发版 0.197.0**（L3：跨 storage、mcp/server、cli 三个模块，且改变用户可见行为——文件被替换后服务改为拒绝）。授权：用户 2026-11-17“把剩余工作都做了，授权清理和发版”。仓库公开：**复现手法只在本地 gitignore 的 `docs/`（`docs/d883b-notes.md`、`docs/d883b-scripts/`），本文件和测试不写手法。**
+状态：**已实现（cb8b7096），评审 R1 修复见下，待 R2 与发版 0.197.0**（L3：跨 storage、mcp/server、cli 三个模块，且改变用户可见行为——文件被替换后服务改为拒绝）。授权：用户 2026-11-17“把剩余工作都做了，授权清理和发版”。仓库公开：**复现手法只在本地 gitignore 的 `docs/`（`docs/d883b-notes.md`、`docs/d883b-scripts/`），本文件和测试不写手法。**
 
 ## 背景
 
@@ -33,13 +33,13 @@
 | 项 | 决定 | 依据 |
 |----|------|------|
 | 方向 | 修触发条件，而不是给每条连接的每个事务加 schema 检查：**本工具的任何连接，只要它打开的 `index.db` 或 `-wal` 已不是路径上的那个文件，就不再写、不再 checkpoint、关闭时不 checkpoint；服务进程在每条消息开始时发现这一点就拒绝（直到重启）** | M1–M3 的混读需要"旧文件上的进程继续写或 checkpoint"；它停下后，新打开的进程只看到彼此一致的新文件。每事务检查要改动所有读写路径（17 个 CLI 读命令、索引器、回填），代价和回归面都大得多 |
-| 判定 | 主库：`SQLITE_FCNTL_HAS_MOVED`（F1）。`-wal`：打开结束时记录路径的 (dev, ino)，之后比较路径当前的 (dev, ino)；打开时不存在则不比较 | F2：SQLite 不给 `-wal` 的身份 |
-| 写 | 所有读写连接装 commit hook：判定为已替换 → 否决提交，并置粘滞标记 | F3：单一卡点，覆盖索引器、CLI 新鲜度写入、回填、晋升写连接 |
+| 判定 | 主库：`SQLITE_FCNTL_HAS_MOVED`（F1）。`-wal`：打开结束时记录（打开路径取绝对路径）的 (dev, ino)，之后比较路径当前的 (dev, ino)；路径上没有 `-wal` 而连接仍写着打开时那个 WAL（`SQLITE_FCNTL_JOURNAL_POINTER` 指针相同）也算；打开时不存在则不比较 | F2：SQLite 不给 `-wal` 的身份 |
+| 写 | 所有读写连接装 commit hook：判定为已替换 → 否决提交，并置粘滞标记 | F3：覆盖索引器、CLI 新鲜度写入、回填、晋升写连接的提交；例外见评审 R1（大事务溢出、VACUUM） |
 | checkpoint | `run_optimize` 的 TRUNCATE checkpoint 前先判定 | 唯一的显式 checkpoint（live 索引上） |
 | 关闭 | `Database` 析构时若已替换，先设 `NO_CKPT_ON_CLOSE` | F4：只靠 SQLite 自己的判定会在 `-wal` 被替换时照常 checkpoint |
 | 服务 | 主进程、晋升后、二级：每条消息开始时判定；已替换 → 本条及以后的工具调用都报拒绝（说明原因与"重启会话"），不再读 | 二级本来每条消息查 schema，这里统一行为；粘滞避免一半旧一半新的状态 |
 | `rebuild-index --force` 提示 | 改为"那个进程会拒绝使用索引直到重启" | F6 的旧说法在本改动后不成立 |
-| Windows | 不做（`cfg(unix)`） | SQLite 在 Windows 打开文件不带 FILE_SHARE_DELETE，打开期间无法被替换；std 稳定版也拿不到 Windows 的文件 ID |
+| Windows | `-wal` 身份只在 unix 记录（`cfg(unix)`）；钩子在 Windows 也装，但 Windows 的文件层不回答 HAS_MOVED，等于不起作用 | SQLite 在 Windows 打开文件不带 FILE_SHARE_DELETE，打开期间无法被替换；std 稳定版也拿不到 Windows 的文件 ID |
 | 版本 | minor（用户可见：替换后从"继续用旧文件/混读"改为拒绝） | 发版手册"Choices" |
 
 ## 不覆盖（计划写进 CHANGELOG）
@@ -64,6 +64,24 @@
 - **缺失的 `-wal` 不算替换**：第一版把“路径上没有 `-wal`”也算替换，snapshot 的测试夹具在打开的连接上执行 `PRAGMA journal_mode = DELETE`（SQLite 删掉自己的 `-wal`），之后写入被拒，6 个 snapshot 测试失败。产品代码只在打开时设一次 `journal_mode = WAL`（记录身份之前），其余都在测试里。改为路径上有另一个文件才算；被删除的 `-wal` 要等下一个进程在原路径建出新文件才判得出（写进 Not covered）。
 - **去掉 `check_files` 里的语句缓存清空**：它没有可观察的效果（服务的回答无论如何都换成拒绝），变异测不出，按“只写守卫能验证的代码”删掉。
 - **`run_optimize` 的检查**：变异 M4（去掉这条检查）第一次存活——替换之后 `PRAGMA optimize` 总会开写事务（没有统计的空表每次都重新分析），被 commit hook 否决，报的是 SQLite 的 "constraint failed"。这条检查实际起作用的是给出原因；测试改为钉住拒绝信息，M4 被杀。
+
+## 评审 R1（新起的子代理，盲审收窄简报，对 385b1d9c）：HIGH 0 / MEDIUM 2 / LOW 3 / NOTE 6
+
+没有发现合法流程被误判为替换（只有 N1 的 WAL→DELETE→WAL 来回）；端到端六种替换情形 20/20 拒绝；评审自造 17 个变异，杀 14、存活 3；Windows cfg 翻转后 check 与 clippy 干净。
+
+| # | 结论 | 处理 |
+|---|------|------|
+| M1（实测） | 大于页缓存（64 MB）的事务在 COMMIT 之前就把页溢出写进 WAL（评审：替换后的 2 万行事务，WAL 0 → 119,405,872 字节，随后提交被拒）；“写 WAL 之前就拒绝”不成立。MCP `rebuild_index` 整个索引一个事务 | 改说法（CHANGELOG、代码注释），写进 Not covered：未提交的页在拒绝后回滚，其他进程只读到最后一次提交（从 SQLite 源码推导，未实测） |
+| M2（实测） | 把“路径上没有 `-wal`”当作未替换：只删 `-wal` 后放行的一次提交让下一个打开者报 disk I/O error | 修：路径上没有 `-wal` 且连接仍写着打开时那个 WAL（`JOURNAL_POINTER` 指针相同）算替换。第一版读数据库文件头判 WAL 模式，snapshot 夹具的 `journal_mode = DELETE` 在同一语句里先删 `-wal` 后改文件头、提交钩子在中间被调用，误拒 12 个测试，改为指针判据。RED：主测试加“deleted index.db-wal”一例，修前写入放行 |
+| L1（实测） | `VACUUM` 提交不经过 commit hook | 不改代码（LOW 的修复是一次发版里风险最高的代码）：产品里只有启动时的向量压缩在一次通过检查的提交之后紧接着 VACUUM，写进 Not covered |
+| L2（实测） | 项目路径不是 UTF-8 时 `conn.path()` 为 None，`-wal` 检查失效 | 修：`-wal` 路径由打开路径取绝对路径后拼出。RED：`a_wal_replaced_under_a_non_utf8_path_is_noticed` 修前写入放行 |
+| L3（实测） | 缓存的语句在替换后照样执行；二级的提前返回在 RESET 之前，丢掉了 0.196.0 让缓存语句重编译的效果 | 二级：先 RESET 再判定，缓存语句重编译时被拒。RED：`a_cached_read_on_a_secondary_is_refused_after_a_replacement` 修前读到 `Ok(1)`。主进程：说法改为“之后编译的语句被拒，之前编译的照样执行，回答一律是拒绝” |
+| N1 | WAL→DELETE→WAL 来回后下一次提交被拒 | 产品代码不这样做，写进 Not covered |
+| N2 | CLI 与后台的提交被拒只报 `constraint failed` | CHANGELOG 写明 |
+| N3 | 3875a878 的提交说明说“`check_files` 不再清缓存”，但那个清空在 cb8b7096 之前就去掉了 | 不改写未推送的提交说明（保留评审轨迹），以本 spec 为准 |
+| N4 | 决定表“Windows 不做”与钩子在 Windows 也装不符 | 决定表已改 |
+| N5 | 变异存活：拒绝 savepoint（R7）、`-wal` 路径取调用方路径（R8）、`run_startup_tasks` 去掉检查（R15） | R7：事务控制一段加 `SAVEPOINT s; RELEASE s;`；R8：L2 的修复后 `-wal` 路径就是调用方路径的绝对形式，不再有两种来源；R15：去掉 `run_startup_tasks` 里的检查（消息开始时已查，二级的读在 `ReadGuard` 里查，主进程的写由 commit hook 查，没有可观察的效果） |
+| N6 | 每次调用 3–7 µs 未被确认：评审在高负载下测得中位 +9.6 µs、最小值 +3.4 µs | CHANGELOG 两次测量都写上，“3 到 10 µs” |
 
 ## 验证记录
 

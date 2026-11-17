@@ -882,7 +882,6 @@ impl McpServer {
         // `main` runs these after a message, outside it: their reads end here,
         // not with the next message (D#883 review R1).
         let _end_message = EndMessage(&self.db);
-        self.db.check_files();
         // Phase 1: On notifications/initialized, spawn background indexing
         let pending = {
             let mut guard = lock_or_recover(

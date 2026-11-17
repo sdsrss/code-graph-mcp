@@ -594,18 +594,20 @@ impl ReadGuard {
 
     /// Opens the transaction and checks its snapshot; `Err` is the refusal.
     fn check(&self, conn: &Connection, files: Option<&OpenedFiles>) -> Result<()> {
-        // Before any read: replaced files are not read at all.
-        if let Some(files) = files.filter(|files| files.replaced()) {
-            return Err(files.refusal());
-        }
         let failed = |e: rusqlite::Error| {
             anyhow::anyhow!(
                 "could not check the schema of {} before reading it: {e}",
                 self.path.display()
             )
         };
-        conn.execute_batch("PRAGMA writable_schema = RESET; BEGIN;")
+        conn.execute_batch("PRAGMA writable_schema = RESET;")
             .map_err(failed)?;
+        // After the reset, which makes every statement compile again (and be
+        // refused), even one compiled in an earlier message.
+        if let Some(files) = files.filter(|files| files.replaced()) {
+            return Err(files.refusal());
+        }
+        conn.execute_batch("BEGIN;").map_err(failed)?;
         // A deferred BEGIN takes no snapshot, and SQLite parses a schema it
         // does not hold inside a read transaction of its own
         // (`sqlite3InitOne`): read first, so the schema is parsed from the
@@ -645,24 +647,31 @@ impl ReadGuard {
 /// `rebuild-index --force` replaces `index.db` or its `-wal`, a process still
 /// holding the earlier files writes and checkpoints them through the `-shm`
 /// that every process opening the new files reads through, and those read
-/// pages their checks never saw. Such a connection now commits nothing
-/// (commit hook: SQLite calls it before any frame is written), compiles
-/// nothing but transaction control, skips the checkpoint after an index run
-/// and closes without checkpointing.
+/// pages their checks never saw. Such a connection now commits nothing (the
+/// commit hook, which SQLite calls before it commits; a transaction larger
+/// than the page cache has already spilled uncommitted pages to the WAL by
+/// then, and the refusal rolls them back), compiles nothing but transaction
+/// control once the replacement was seen (statements compiled earlier still
+/// run), skips the checkpoint after an index run and closes without
+/// checkpointing. `VACUUM` commits without the commit hook.
 ///
 /// The main file's identity is SQLite's own (`SQLITE_FCNTL_HAS_MOVED`). The
 /// `-wal` has none — SQLite opens it without locks — so its device and inode
-/// are recorded when the open finishes. No process deletes a `-wal` while
-/// another connection holds the database (that takes an exclusive lock), so a
-/// different file there is a replacement. A missing one is not counted: a
-/// connection leaving WAL mode deletes its own, and the next process to open
-/// the database creates one, which is then a different file.
+/// are recorded when the open finishes, at the open's path made absolute (a
+/// path need not be UTF-8, which is all rusqlite names). No process deletes a
+/// `-wal` while another connection holds the database (that takes an
+/// exclusive lock), so a different file there is a replacement, and so is
+/// none while this connection still journals to the WAL it opened (SQLite's
+/// `SQLITE_FCNTL_JOURNAL_POINTER`, compared as a pointer): a commit then made
+/// the next process's open fail. A connection leaving WAL mode deletes its
+/// own `-wal` and journals elsewhere.
 #[derive(Clone)]
 struct OpenedFiles {
     path: std::path::PathBuf,
     /// The connection handle, for `SQLITE_FCNTL_HAS_MOVED`.
     handle: usize,
-    wal: Option<(std::path::PathBuf, FileId)>,
+    /// The `-wal`'s path and identity, and the journal SQLite used then.
+    wal: Option<(std::path::PathBuf, FileId, usize)>,
     /// Set once a replacement is seen; the files do not come back.
     replaced: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -684,19 +693,38 @@ fn file_id(_: &Path) -> Option<FileId> {
     None
 }
 
+/// The file the connection journals to now, as an opaque pointer: in WAL
+/// mode, its WAL. Only compared, never followed.
+fn journal_of(handle: usize) -> usize {
+    let mut journal: *mut rusqlite::ffi::sqlite3_file = std::ptr::null_mut();
+    // SAFETY: a live handle (see `OpenedFiles::record`); the op writes one
+    // pointer and reads nothing from the file.
+    unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            handle as *mut rusqlite::ffi::sqlite3,
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_JOURNAL_POINTER,
+            (&mut journal as *mut *mut rusqlite::ffi::sqlite3_file).cast(),
+        );
+    }
+    journal as usize
+}
+
 impl OpenedFiles {
     fn record(conn: &Connection, path: &Path) -> Self {
-        // SQLite's own name for the file (absolute), not the caller's.
-        let wal = conn
-            .path()
-            .filter(|p| !p.is_empty())
-            .map(|p| std::path::PathBuf::from(format!("{p}-wal")))
-            .and_then(|wal| file_id(&wal).map(|id| (wal, id)));
+        let named = sqlite_file_name(path);
+        let mut wal = std::path::absolute(&named)
+            .unwrap_or_else(|_| named.clone())
+            .into_os_string();
+        wal.push("-wal");
+        let wal = std::path::PathBuf::from(wal);
+        // SAFETY: only passed back to SQLite while the connection is open
+        // (the hooks holding it are freed when it closes).
+        let handle = unsafe { conn.handle() } as usize;
+        let wal = file_id(&wal).map(|id| (wal, id, journal_of(handle)));
         Self {
-            path: sqlite_file_name(path),
-            // SAFETY: only passed back to SQLite while the connection is open
-            // (the hooks holding it are freed when it closes).
-            handle: unsafe { conn.handle() } as usize,
+            path: named,
+            handle,
             wal,
             replaced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -723,7 +751,10 @@ impl OpenedFiles {
             || self
                 .wal
                 .as_ref()
-                .is_some_and(|(wal, id)| file_id(wal).is_some_and(|now| now != *id));
+                .is_some_and(|(wal, id, journal)| match file_id(wal) {
+                    Some(now) => now != *id,
+                    None => journal_of(self.handle) == *journal,
+                });
         if replaced {
             self.replaced.store(true, Ordering::Release);
         }
@@ -4957,12 +4988,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_connection_whose_index_files_were_replaced_writes_nothing_more() {
-        for replaced in ["index.db", "index.db-wal"] {
+        // A `-wal` deleted while the database stays in WAL mode counts too: a
+        // commit let through then made the next process's open fail with a
+        // disk I/O error (review R1, M2).
+        for replaced in ["index.db", "index.db-wal", "deleted index.db-wal"] {
             let dir = TempDir::new().unwrap();
             let db = own_index(&dir, false);
             let w = Database::open(&db).unwrap();
             insert_file(&w, "before.rs").unwrap();
-            replace_with_copy(&dir.path().join(replaced));
+            match replaced.strip_prefix("deleted ") {
+                Some(file) => {
+                    w.run_optimize().unwrap();
+                    std::fs::remove_file(dir.path().join(file)).unwrap();
+                }
+                None => replace_with_copy(&dir.path().join(replaced)),
+            }
             assert!(
                 insert_file(&w, "after.rs").is_err(),
                 "{replaced}: the write reached the replaced files"
@@ -4996,7 +5036,9 @@ mod tests {
                 "{replaced}: a read compiled after the replacement ran"
             );
             // A transaction can still end, so that it holds no snapshot.
-            w.conn().execute_batch("BEGIN; ROLLBACK;").unwrap();
+            w.conn()
+                .execute_batch("BEGIN; SAVEPOINT s; RELEASE s; ROLLBACK;")
+                .unwrap();
             // The reason stays: the files do not come back.
             assert!(w.take_read_refusal().is_some(), "{replaced}");
         }
@@ -5076,6 +5118,51 @@ mod tests {
             ro.end_message();
             drop(w);
         }
+    }
+
+    /// The `-wal`'s identity comes from the path the open was given, made
+    /// absolute: rusqlite names the database file only when its path is UTF-8,
+    /// and a project directory need not be (review R1, L2).
+    #[cfg(unix)]
+    #[test]
+    fn a_wal_replaced_under_a_non_utf8_path_is_noticed() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = TempDir::new().unwrap();
+        let project = dir.path().join(std::ffi::OsStr::from_bytes(b"proj\xff"));
+        std::fs::create_dir(&project).unwrap();
+        let db = project.join("index.db");
+        let w = Database::open(&db).unwrap();
+        insert_file(&w, "before.rs").unwrap();
+        replace_with_copy(&project.join("index.db-wal"));
+        assert!(
+            insert_file(&w, "after.rs").is_err(),
+            "the write went through"
+        );
+    }
+
+    /// A statement a secondary compiled in an earlier message does not read
+    /// replaced files either: the schema is discarded before the files are
+    /// judged, so it compiles again and the refusal stops it (review R1, L3).
+    #[cfg(unix)]
+    #[test]
+    fn a_cached_read_on_a_secondary_is_refused_after_a_replacement() {
+        let dir = TempDir::new().unwrap();
+        let db = own_index(&dir, false);
+        let w = Database::open(&db).unwrap();
+        insert_file(&w, "a.rs").unwrap();
+        let ro = Database::open_readonly(&db).unwrap();
+        let cached = |ro: &Database| {
+            ro.conn()
+                .prepare_cached("SELECT count(*) FROM files WHERE path <> ''")
+                .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+        };
+        assert_eq!(cached(&ro).unwrap(), 1);
+        ro.end_message();
+        replace_with_copy(&db);
+        let read = cached(&ro);
+        assert!(read.is_err(), "the cached statement read {read:?}");
+        ro.end_message();
+        drop(w);
     }
 
     /// What the tool does to its own files is not a replacement: checkpoints
