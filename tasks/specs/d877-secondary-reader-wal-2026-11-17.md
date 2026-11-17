@@ -21,7 +21,7 @@
 ## 不覆盖
 
 - D#877 本身：见 CHANGELOG `## Unreleased` 的 "Not covered: wider than 0.195.0 said"。
-- R1 的 F5（LOW）：`snapshot inspect` 拒绝快照时仍说 "delete … and re-run to rebuild the index"，这是写给索引的话；原地读那一支在 0.195.0 就这样说，本次不改。
+- R1 的 F5（LOW）：`snapshot inspect` 拒绝快照时仍说 "delete … and re-run to rebuild the index"，这是写给索引的话；原地读那一支在 0.195.0 就这样说。本提交不改；之后在 20e1caea 里四种读法都改了。
 
 ## 验证记录
 
