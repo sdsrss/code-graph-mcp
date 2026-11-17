@@ -1,5 +1,92 @@
 # Changelog
 
+## 0.197.0
+
+**Upgrading: no index rebuild; restart a session after its index files are replaced.** `INDEX_VERSION` stays 141.
+When a `git pull`, `rebuild-index --force` or anything else replaces
+`.code-graph/index.db` or `.code-graph/index.db-wal` while a code-graph-mcp
+process has the index open, that process now stops using the files it opened:
+an MCP server answers every tool call and resource read with `refusing to use
+<index>: its files were replaced on disk …` until it is restarted, and a
+connection a CLI command or background worker holds refuses its next commit
+(tested on the database layer, not run as a command). 0.196.0 kept reading
+and writing the earlier files (first section). A moved project directory counts as replaced too. Each commit
+and each MCP message checks two files (cost measured below). To pin the binary
+back, which brings back the gap: `npm i -g @sdsrs/code-graph@0.196.0` (or,
+from source, `cargo install --locked --git
+https://github.com/sdsrss/code-graph-mcp --tag v0.196.0 --features
+embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The plugin's
+scripts are unchanged.
+
+### fix: a process whose index files were replaced stops reading and writing them
+
+SQLite finds the `-shm` of a WAL database by its path. When a pull replaces
+`index.db` or `index.db-wal` while a code-graph-mcp process has the index
+open, that process keeps the files it opened and keeps writing them, and each
+write moves the `-shm` that every process opening the new files reads
+through. Those processes then read pages their open-time check did not read,
+and SQL code-graph-mcp does not write can run in them. 0.196.0's Not covered
+named this for every connection except a secondary's reads (derived, not
+measured). Measured on 0.196.0:
+- A CLI command started after a pull replaced `index.db-wal` or `index.db`,
+  while a stand-in process kept writing the files it had opened before the
+  pull, ran SQL code-graph-mcp does not write in 10 of 400 runs
+  (`health-check` 5 of 200, `show` 5 of 200); most of the others were refused
+  by their open-time check.
+- An MCP server that had the index open before the pull kept writing after
+  it: over 20 calls, each after a source edit, the `-shm`'s frame count moved
+  from 2 to 26.
+
+Now every connection notes which files it opened: SQLite's own record for
+`index.db` (`SQLITE_FCNTL_HAS_MOVED`), and the device and inode of
+`index.db-wal` when the open finishes (SQLite keeps none for it). Once either
+path holds another file:
+- a commit is refused (SQLite asks before it writes anything to the WAL), and
+  nothing but `BEGIN`, `COMMIT`, `ROLLBACK` and savepoints compiles on that
+  connection;
+- the checkpoint at the end of an index run is skipped;
+- the connection closes without the checkpoint SQLite runs when the last
+  connection closes, which writes the database at the path and deletes the
+  `-wal` at the path;
+- an MCP server checks at the start of every message and answers with the
+  refusal from then on; a secondary's per-call check refuses too.
+
+Measured on this version, same scenario as the server line above: the server
+answered the call before the pull and refused all 20 after it, and the
+`-shm`'s frame count stayed at 2. Source builds of this commit and the one
+before it, on this repository's `src/` (145 files, 4,480 nodes): a full index
+took 1,138 ms against 1,136 ms (median of 6); a call on the first server took
+0.077–0.080 ms against 0.073–0.074 ms (3 rounds of 100 `get_ast_node` calls);
+a secondary's calls took 0.346–0.348 ms against 0.339–0.355 ms.
+
+`rebuild-index` and `reindex --from-snapshot` already refused to replace the
+index while an MCP server holds its lock; with `--force` they now leave that
+server refusing until it restarts, and their message says so instead of "that
+process [would be] writing into a deleted file".
+
+### Not covered
+
+- A commit or a checkpoint already past its check when the files are replaced
+  still lands on the earlier files, once.
+- Files replaced while a connection opens (after SQLite opened the `-wal` and
+  before code-graph-mcp noted it) are not noticed later.
+- Reads of a message or of a CLI command after the files were replaced in the
+  middle of it are not checked; the next message is.
+- An `index.db-wal` deleted rather than replaced counts once a process creates
+  a new one at that path.
+- Processes other than code-graph-mcp's writing the earlier files.
+- Connections other than a secondary's reads still check the schema when they
+  open, not at every transaction (0.196.0's Not covered). What let their later
+  reads see schema their check did not read, in the measurements above, was a
+  process writing replaced files, which code-graph-mcp's own processes no
+  longer do.
+- Windows: SQLite opens the files without delete sharing, so they cannot be
+  replaced while open; the `-wal` check does not run there.
+
+Not running code-graph-mcp in a repository that commits `.code-graph/`
+remains the workaround.
+
 ## 0.196.0
 
 **Upgrading: no index rebuild; upgrade soon.** `INDEX_VERSION` stays 141.
