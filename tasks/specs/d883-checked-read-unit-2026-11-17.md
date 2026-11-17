@@ -1,6 +1,6 @@
 # 2026-11-17 D#883：只读连接的每次读取都落在查过 schema 的快照上（MCP 二级读者）
 
-状态：代码完成，本地提交 4f48c0c0、36fff7ef、9315eda4、3329e646（加本 spec 与 CHANGELOG 的文档提交），**未推送、未发版**；R2 F1 的修复未经独立评审，发版前是否再评审由用户决定。仓库公开：**复现手法只在本地 gitignore 的 `docs/`（`docs/d784-r3-notes.md`、`docs/d877-r1-notes.md`）；本文件和测试都不写手法，也不写怎样让服务进入二级模式。**
+状态：**已随 0.196.0 发版（2026-11-17）**。提交 4f48c0c0、36fff7ef、9315eda4、3329e646、a0386127、a1694c01、610a4b9d，release 3394db38，tag v0.196.0 在 7a119fe7；main CI 44161026745 7/7 绿，Release 44164041373 10/10（36m17s）；npm 六个包 0.196.0 都由 GitHub Actions 经 trusted publishing 发布；GHSA-q67h-24gq-4263 正文已补 0.196.0。主进程、回填与 embedding 线程、晋升后的写连接、CLI 命令仍只在打开时检查（Not covered，D#883 延期条目保持打开）。仓库公开：**复现手法只在本地 gitignore 的 `docs/`（`docs/d784-r3-notes.md`、`docs/d877-r1-notes.md`）；本文件和测试都不写手法，也不写怎样让服务进入二级模式。**
 
 ## 背景
 
@@ -125,3 +125,4 @@ F1 的修复没有经过独立评审（再起一轮即第三轮，按停止线�
 - R2 F1 修复之后（3329e646，release md5 bca7bc7e）：
   - RED：`an_index_on_the_schema_table_does_not_answer_the_check` 修复前失败于 "the index answered the check"（`reject_unowned_index` 返回 Ok）。GREEN：`storage::`、`snapshot::`、二级模式测试 254/254。变异：去掉 `NOT INDEXED`、去掉索引规则各被杀（夹具改为覆盖四列之后）。
   - 端到端（评审的伪造夹具）：0.195.0 与 9315eda4 的 `health-check --json` 都报 `files: 4242`、`reason` 为空，二级 MCP `get_index_status` 回答 `files_count 4242`；3329e646 的 `health-check` 报 `reason: refused`，二级服务在 initialize 前退出 1。
+- 发版核验（2026-11-17）：main CI 44161026745 7/7（macOS 日志里 6 个新增或改动的测试都跑了，Windows 跑了不限 unix 的 4 个）；Release 44164041373 10/10，19:56:57→20:33:14Z；Release 非草稿、14 个资产，正文换成 CHANGELOG 0.196.0 段；npm 六个包 `_npmUser` 都是 GitHub Actions、`trustedPublisher.id` github；`npm install @sdsrs/code-graph@0.196.0` → `added 2 packages`，平台包自带二进制 `--version` 0.196.0，对 `sqlite_stat1` 上的索引行夹具 `health-check --json` 报 `reason: refused`、点名 `index "shadow_idx"`，对照索引健康（145 文件、4,460 节点）；二级模式 20 次 `get_ast_node` 正常（中位数 0.385 ms）。
