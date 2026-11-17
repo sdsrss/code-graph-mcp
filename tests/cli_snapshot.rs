@@ -508,6 +508,10 @@ fn cli_snapshot_inspect_refusal_names_a_relative_file_as_typed() {
             "{mode}: the refusal names {quoted}: {stderr}"
         );
         assert!(
+            stderr.contains("view \"planted\""),
+            "{mode}: the refusal names the object it refuses: {stderr}"
+        );
+        assert!(
             !stderr.contains("delete") && !stderr.contains("rebuild"),
             "{mode}: the refusal tells the user to delete their file to rebuild an index: {stderr}"
         );

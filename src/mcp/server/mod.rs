@@ -6621,6 +6621,14 @@ app.post('/api/login', handleLogin);
                 && text.contains("view \"planted\""),
             "{text}"
         );
+        // The index's own remedy, as the open's refusal gives it (D#883
+        // review R4). The path's tail only: macOS reaches the temp dir
+        // through a symlink.
+        assert!(
+            text.contains(" delete ")
+                && text.contains("/index.db* and re-run to rebuild the index"),
+            "{text}"
+        );
 
         let resource: serde_json::Value = serde_json::from_str(
             &server
