@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.196.0
+
+**Upgrading: no index rebuild; upgrade soon.** `INDEX_VERSION` stays 141.
+0.195.0's schema check can be passed by a crafted `.code-graph/index.db`
+that a repository commits, and its planted SQL then runs (the third section
+below); this version refuses that file. An index holding an index on one of
+SQLite's own tables is now refused like other SQL code-graph-mcp does not
+write; SQLite refuses to create such an index (`table sqlite_master may not
+be indexed`). Nine indexes on one machine answered `health-check --json`
+with the same `healthy` and file count on 0.195.0 and on this version. An MCP
+server reading the index as a secondary now checks the index at every call
+and answers `refusing to read <index>: …` to a call that meets SQL
+code-graph-mcp does not write; each of its calls takes about 0.3 ms longer
+(measured below). To pin the binary back, which brings back the crafted-file
+gap: `npm i -g @sdsrs/code-graph@0.195.0` (or, from source, `cargo install
+--locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.195.0
+--features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The
+plugin's scripts are unchanged.
 
 ### fix: `snapshot inspect` names your file when it refuses planted SQL, and does not tell you to delete it
 
