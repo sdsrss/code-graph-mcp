@@ -5018,6 +5018,52 @@ mod tests {
         }
     }
 
+    /// The index-row rule alone, in the spellings SQLite matches without
+    /// regard to case and on another of its tables: each row is refused by
+    /// name, with no planted view to refuse instead.
+    #[test]
+    fn an_index_row_on_any_sqlite_table_is_refused_in_any_case() {
+        for (kind, table, sql) in [
+            (
+                "index",
+                "SQLITE_MASTER",
+                "CREATE INDEX shadow_idx ON SQLITE_MASTER(name)",
+            ),
+            (
+                "INDEX",
+                "sqlite_master",
+                "CREATE INDEX shadow_idx ON sqlite_master(name)",
+            ),
+            (
+                "index",
+                "sqlite_stat1",
+                "CREATE INDEX shadow_idx ON sqlite_stat1(tbl)",
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let db = own_index(&dir, false);
+            Connection::open(&db)
+                .unwrap()
+                .execute_batch(&format!(
+                    "ANALYZE; \
+                     CREATE TABLE shadow(x); \
+                     CREATE INDEX shadow_idx ON shadow(x); \
+                     PRAGMA writable_schema = ON; \
+                     UPDATE sqlite_schema SET type = '{kind}', tbl_name = '{table}', \
+                       sql = '{sql}' WHERE name = 'shadow_idx'; \
+                     PRAGMA writable_schema = OFF;"
+                ))
+                .unwrap();
+            let msg = reject_unowned_index(&db)
+                .expect_err(&format!("{kind} on {table} passed the check"))
+                .to_string();
+            assert!(
+                msg.contains(&format!("{kind} \"shadow_idx\"")),
+                "{kind} {table}: {msg}"
+            );
+        }
+    }
+
     /// The control: the tool's own index opens through every constructor,
     /// built with the vector tables or without them — a missing object of the
     /// tool's schema is created later, it is not foreign.
