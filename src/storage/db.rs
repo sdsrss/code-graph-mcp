@@ -5003,7 +5003,10 @@ mod tests {
     }
 
     /// The checkpoint after an index run must not move the shared WAL of
-    /// replaced files: a TRUNCATE resets it under every other process.
+    /// replaced files: a TRUNCATE resets it under every other process. The
+    /// `PRAGMA optimize` ahead of it opens a write here (a table without
+    /// statistics is analyzed every time), which the commit hook refuses with
+    /// SQLite's bare "constraint failed"; the check ahead of both says why.
     #[cfg(unix)]
     #[test]
     fn replaced_files_are_not_checkpointed() {
@@ -5015,7 +5018,11 @@ mod tests {
         let frames = std::fs::metadata(&wal).unwrap().len();
         assert!(frames > 0, "the write left frames in the WAL");
         replace_with_copy(&db);
-        assert!(w.run_optimize().is_err(), "the run_optimize went ahead");
+        let err = w
+            .run_optimize()
+            .expect_err("the run_optimize went ahead")
+            .to_string();
+        assert!(err.contains("were replaced"), "{err}");
         assert_eq!(
             std::fs::metadata(&wal).unwrap().len(),
             frames,
