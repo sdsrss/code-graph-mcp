@@ -882,6 +882,7 @@ impl McpServer {
         // `main` runs these after a message, outside it: their reads end here,
         // not with the next message (D#883 review R1).
         let _end_message = EndMessage(&self.db);
+        self.db.check_files();
         // Phase 1: On notifications/initialized, spawn background indexing
         let pending = {
             let mut guard = lock_or_recover(
@@ -2043,8 +2044,10 @@ impl McpServer {
 
     pub fn handle_message(&self, line: &str) -> Result<Option<String>> {
         // D#883: a message's reads share one checked snapshot; the next
-        // message checks a fresh one.
+        // message checks a fresh one. Index files replaced under this server
+        // refuse the message (see `Database::check_files`).
         let _end_message = EndMessage(&self.db);
+        self.db.check_files();
         let req: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(req) => req,
             // Deserialization failed. Fall back to a loose re-parse so we can tell
@@ -6650,6 +6653,54 @@ app.post('/api/login', handleLogin);
         planter.execute_batch("DROP VIEW planted;").unwrap();
         let (text, is_error) = tool_text(&status().unwrap());
         assert!(!is_error, "a clean index is read again: {text}");
+    }
+
+    /// D#883 (remainder): a primary keeps its index files open for the
+    /// session. Once a checkout or `rebuild-index --force` replaces them it
+    /// answers every call with that, instead of reading and writing files
+    /// that are no longer the project's.
+    #[cfg(unix)]
+    #[test]
+    fn test_primary_refuses_index_files_replaced_under_it() {
+        let project = TempDir::new().unwrap();
+        std::fs::write(project.path().join("alpha.rs"), "fn alpha_fn() {}\n").unwrap();
+        McpServer::new_test_with_project(project.path())
+            .ensure_indexed()
+            .unwrap();
+        let server = McpServer::from_project_root(project.path()).unwrap();
+        assert!(server.is_primary(), "precondition: primary");
+        let status = || server.handle_message(&tool_call_json("get_index_status", json!({})));
+        let (text, is_error) = tool_text(&status().unwrap());
+        assert!(!is_error, "{text}");
+
+        let index = project.path().join(CODE_GRAPH_DIR).join("index.db");
+        let copy = index.with_extension("copy");
+        std::fs::copy(&index, &copy).unwrap();
+        std::fs::rename(&copy, &index).unwrap();
+        for call in 0..2 {
+            let (text, is_error) = tool_text(&status().unwrap());
+            assert!(
+                is_error,
+                "call {call} after the replacement answered: {text}"
+            );
+            assert!(
+                text.starts_with("Error: refusing to use ") && text.contains("were replaced"),
+                "call {call}: {text}"
+            );
+        }
+        let resource: serde_json::Value = serde_json::from_str(
+            &server
+                .handle_message(
+                    &json!({"jsonrpc": "2.0", "id": 2, "method": "resources/read",
+                            "params": {"uri": "code-graph://project-summary"}})
+                    .to_string(),
+                )
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let message = resource["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("were replaced"), "{resource}");
     }
 
     /// Review R1: the startup tasks `main` runs after a message read the index

@@ -1,6 +1,6 @@
 use super::schema;
 use anyhow::Result;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{config::DbConfig, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 use std::sync::Once;
 
@@ -489,6 +489,22 @@ pub struct Database {
     index_version_stale: Option<i32>,
     /// Set on the MCP server's read-only connection (D#883); see [`ReadGuard`].
     read_guard: Option<ReadGuard>,
+    /// The index files this connection opened; see [`OpenedFiles`].
+    files: Option<OpenedFiles>,
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        // The last connection to close checkpoints its WAL into the database
+        // file at the path and deletes the `-wal` at the path: other files
+        // once either was replaced. SQLite skips this only when the main
+        // file moved.
+        if self.files.as_ref().is_some_and(OpenedFiles::replaced) {
+            let _ = self
+                .conn
+                .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true);
+        }
+    }
 }
 
 /// No transaction is open; the next [`Database::conn`] opens a checked one.
@@ -552,7 +568,7 @@ impl ReadGuard {
         })
     }
 
-    fn begin(&self, conn: &Connection) {
+    fn begin(&self, conn: &Connection, files: Option<&OpenedFiles>) {
         use std::sync::atomic::Ordering;
         if self
             .state
@@ -566,7 +582,7 @@ impl ReadGuard {
         {
             return;
         }
-        let next = match self.check(conn) {
+        let next = match self.check(conn, files) {
             Ok(()) => READ_CHECKED,
             Err(refusal) => {
                 *self.refusal.borrow_mut() = Some(refusal);
@@ -577,7 +593,11 @@ impl ReadGuard {
     }
 
     /// Opens the transaction and checks its snapshot; `Err` is the refusal.
-    fn check(&self, conn: &Connection) -> Result<()> {
+    fn check(&self, conn: &Connection, files: Option<&OpenedFiles>) -> Result<()> {
+        // Before any read: replaced files are not read at all.
+        if let Some(files) = files.filter(|files| files.replaced()) {
+            return Err(files.refusal());
+        }
         let failed = |e: rusqlite::Error| {
             anyhow::anyhow!(
                 "could not check the schema of {} before reading it: {e}",
@@ -615,6 +635,131 @@ impl ReadGuard {
             let _ = conn.execute_batch("ROLLBACK");
         }
         self.state.store(READ_IDLE, Ordering::Release);
+    }
+}
+
+/// D#883 (remainder): which index files a connection opened, so it can stop
+/// once the files at those paths are other files.
+///
+/// SQLite shares the `-shm` by path. After a checkout or a
+/// `rebuild-index --force` replaces `index.db` or its `-wal`, a process still
+/// holding the earlier files writes and checkpoints them through the `-shm`
+/// that every process opening the new files reads through, and those read
+/// pages their checks never saw. Such a connection now commits nothing
+/// (commit hook: SQLite calls it before any frame is written), compiles
+/// nothing but transaction control, skips the checkpoint after an index run
+/// and closes without checkpointing.
+///
+/// The main file's identity is SQLite's own (`SQLITE_FCNTL_HAS_MOVED`). The
+/// `-wal` has none — SQLite opens it without locks — so its device and inode
+/// are recorded when the open finishes. No process deletes a `-wal` while
+/// another connection holds the database (that takes an exclusive lock), so a
+/// different file there is a replacement. A missing one is not counted: a
+/// connection leaving WAL mode deletes its own, and the next process to open
+/// the database creates one, which is then a different file.
+#[derive(Clone)]
+struct OpenedFiles {
+    path: std::path::PathBuf,
+    /// The connection handle, for `SQLITE_FCNTL_HAS_MOVED`.
+    handle: usize,
+    wal: Option<(std::path::PathBuf, FileId)>,
+    /// Set once a replacement is seen; the files do not come back.
+    replaced: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+type FileId = (u64, u64);
+
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
+}
+
+/// Windows: SQLite opens its files without delete sharing, so they cannot be
+/// replaced while open, and std exposes no file id there.
+#[cfg(not(unix))]
+fn file_id(_: &Path) -> Option<FileId> {
+    None
+}
+
+impl OpenedFiles {
+    fn record(conn: &Connection, path: &Path) -> Self {
+        // SQLite's own name for the file (absolute), not the caller's.
+        let wal = conn
+            .path()
+            .filter(|p| !p.is_empty())
+            .map(|p| std::path::PathBuf::from(format!("{p}-wal")))
+            .and_then(|wal| file_id(&wal).map(|id| (wal, id)));
+        Self {
+            path: sqlite_file_name(path),
+            // SAFETY: only passed back to SQLite while the connection is open
+            // (the hooks holding it are freed when it closes).
+            handle: unsafe { conn.handle() } as usize,
+            wal,
+            replaced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Whether the files were replaced, now or before.
+    fn replaced(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.replaced.load(Ordering::Acquire) {
+            return true;
+        }
+        let mut moved: std::os::raw::c_int = 0;
+        // SAFETY: a live handle (see `record`); the op only stats the path
+        // and writes one int.
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                self.handle as *mut rusqlite::ffi::sqlite3,
+                c"main".as_ptr(),
+                rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+                (&mut moved as *mut std::os::raw::c_int).cast(),
+            )
+        };
+        let replaced = (rc == rusqlite::ffi::SQLITE_OK && moved != 0)
+            || self
+                .wal
+                .as_ref()
+                .is_some_and(|(wal, id)| file_id(wal).is_some_and(|now| now != *id));
+        if replaced {
+            self.replaced.store(true, Ordering::Release);
+        }
+        replaced
+    }
+
+    fn refusal(&self) -> anyhow::Error {
+        anyhow::anyhow!(
+            "refusing to use {}: its files were replaced on disk while this process had them \
+             open (for example by a git pull of a commit that tracks .code-graph/, or by \
+             `rebuild-index --force`). Restart the code-graph server, or rerun the command, \
+             to open the files now at that path.",
+            self.path.display()
+        )
+    }
+
+    /// On a read-write connection: a replacement fails the commit, and once
+    /// one was seen only transaction control compiles.
+    fn guard_writes(&self, conn: &mut Connection) -> Result<()> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::atomic::Ordering;
+        let files = self.clone();
+        conn.commit_hook(Some(move || files.replaced()))?;
+        let replaced = std::sync::Arc::clone(&self.replaced);
+        conn.authorizer(Some(move |ctx: AuthContext<'_>| {
+            if !replaced.load(Ordering::Acquire) {
+                return Authorization::Allow;
+            }
+            match ctx.action {
+                AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => {
+                    Authorization::Allow
+                }
+                _ => Authorization::Deny,
+            }
+        }))?;
+        Ok(())
     }
 }
 
@@ -679,7 +824,9 @@ impl Database {
         reject_unowned_files(path)?;
         let mut db = Self::open_readonly_named(path)?;
         // The server keeps this connection for the session: every later read
-        // checks the snapshot it reads (D#883).
+        // checks the snapshot it reads (D#883), and that its files are still
+        // the files at their paths.
+        db.files = Some(OpenedFiles::record(&db.conn, path));
         db.read_guard = Some(ReadGuard::install(&mut db.conn, path)?);
         Ok(db)
     }
@@ -760,6 +907,7 @@ impl Database {
             vec_enabled,
             index_version_stale: None,
             read_guard: None,
+            files: None,
         })
     }
 
@@ -921,7 +1069,7 @@ impl Database {
         // Always register sqlite-vec extension (it's process-global anyway via auto_extension)
         register_sqlite_vec();
 
-        let conn = Connection::open(path).map_err(|e| Self::explain_open_error(path, e))?;
+        let mut conn = Connection::open(path).map_err(|e| Self::explain_open_error(path, e))?;
         // Ahead of every statement below: migrations, table creation and the
         // INDEX_VERSION sweep all write, and a write fires the index's triggers.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -1148,11 +1296,14 @@ If you see this repeatedly, another code-graph server of a different version is 
             conn.pragma_update(None, "application_id", current_index_version)?;
         }
 
+        let files = OpenedFiles::record(&conn, path);
+        files.guard_writes(&mut conn)?;
         Ok(Self {
             conn,
             vec_enabled: enable_vec,
             index_version_stale,
             read_guard: None,
+            files: Some(files),
         })
     }
 
@@ -1398,7 +1549,7 @@ If you see this repeatedly, another code-graph server of a different version is 
 
     pub fn conn(&self) -> &Connection {
         if let Some(guard) = &self.read_guard {
-            guard.begin(&self.conn);
+            guard.begin(&self.conn, self.files.as_ref());
         }
         &self.conn
     }
@@ -1422,12 +1573,33 @@ If you see this repeatedly, another code-graph server of a different version is 
         }
     }
 
+    /// Checks, at the start of a unit of work (an MCP message), that this
+    /// connection's files are still the files at their paths (see
+    /// [`OpenedFiles`]). Once they are not, nothing commits, every statement
+    /// compiled from then on is refused, and [`Database::take_read_refusal`]
+    /// says why — the MCP server answers the message with that.
+    pub(crate) fn check_files(&self) {
+        if let Some(files) = &self.files {
+            files.replaced();
+        }
+    }
+
     /// Why this message's reads were refused, if they were: the schema
     /// objects the check found, or why it could not run. Taken once.
+    /// A connection whose files were replaced (see [`Database::check_files`])
+    /// answers with that every time.
     pub(crate) fn take_read_refusal(&self) -> Option<anyhow::Error> {
         self.read_guard
             .as_ref()
             .and_then(|guard| guard.refusal.borrow_mut().take())
+            .or_else(|| {
+                let files = self.files.as_ref()?;
+                use std::sync::atomic::Ordering;
+                files
+                    .replaced
+                    .load(Ordering::Acquire)
+                    .then(|| files.refusal())
+            })
     }
 
     /// For tests that install a trace: rusqlite's `trace_v2` takes
@@ -1461,6 +1633,10 @@ If you see this repeatedly, another code-graph server of a different version is 
     /// resident on disk (audit §8). Best-effort: a concurrent reader can defer the
     /// truncation, but it never blocks indefinitely or risks the data.
     pub fn run_optimize(&self) -> Result<()> {
+        // A TRUNCATE moves the WAL other processes share (see `OpenedFiles`).
+        if let Some(files) = self.files.as_ref().filter(|files| files.replaced()) {
+            return Err(files.refusal());
+        }
         self.conn.execute_batch("PRAGMA optimize;")?;
         // TRUNCATE reclaims the WAL file; tolerate a transient BUSY (best-effort).
         let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
@@ -4754,6 +4930,185 @@ mod tests {
             .unwrap();
         assert_eq!(count_files(&ro), 0);
         assert!(ro.take_read_refusal().is_none());
+    }
+
+    /// Moves a byte-identical copy of `path` over it: the same bytes under a
+    /// new inode, which is what a checkout that rewrites the file leaves.
+    #[cfg(unix)]
+    fn replace_with_copy(path: &Path) {
+        let copy = path.with_extension("copy");
+        std::fs::copy(path, &copy).unwrap();
+        std::fs::rename(&copy, path).unwrap();
+    }
+
+    fn insert_file(db: &Database, path: &str) -> rusqlite::Result<usize> {
+        db.conn().execute(
+            "INSERT INTO files (path, blake3_hash, last_modified, language, indexed_at) \
+             VALUES (?1, 'b', 0, 'rust', 0)",
+            [path],
+        )
+    }
+
+    /// D#883 (remainder): the `-shm` is shared by path. A process still
+    /// holding an `index.db` or `-wal` that was replaced at its path wrote
+    /// on, and moved the `-shm` every process that opened the new files
+    /// reads through. Its writes are now refused, and so is the rest of its
+    /// work, with the reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_connection_whose_index_files_were_replaced_writes_nothing_more() {
+        for replaced in ["index.db", "index.db-wal"] {
+            let dir = TempDir::new().unwrap();
+            let db = own_index(&dir, false);
+            let w = Database::open(&db).unwrap();
+            insert_file(&w, "before.rs").unwrap();
+            replace_with_copy(&dir.path().join(replaced));
+            assert!(
+                insert_file(&w, "after.rs").is_err(),
+                "{replaced}: the write reached the replaced files"
+            );
+            // A process that opens the files at the path now sees no later write.
+            let fresh = Connection::open(&db).unwrap();
+            let paths: i64 = fresh
+                .query_row(
+                    "SELECT count(*) FROM files WHERE path = 'after.rs'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(paths, 0, "{replaced}");
+            drop(fresh);
+            w.check_files();
+            let refusal = w
+                .take_read_refusal()
+                .unwrap_or_else(|| panic!("{replaced}: no refusal"))
+                .to_string();
+            assert!(
+                refusal.contains("were replaced") && refusal.contains("Restart the code-graph"),
+                "{replaced}: {refusal}"
+            );
+            // A statement compiled from now on is refused too.
+            assert!(
+                w.conn()
+                    .query_row("SELECT count(*) FROM nodes WHERE id > -1", [], |r| r
+                        .get::<_, i64>(0))
+                    .is_err(),
+                "{replaced}: a read compiled after the replacement ran"
+            );
+            // A transaction can still end, so that it holds no snapshot.
+            w.conn().execute_batch("BEGIN; ROLLBACK;").unwrap();
+            // The reason stays: the files do not come back.
+            assert!(w.take_read_refusal().is_some(), "{replaced}");
+        }
+    }
+
+    /// The checkpoint after an index run must not move the shared WAL of
+    /// replaced files: a TRUNCATE resets it under every other process.
+    #[cfg(unix)]
+    #[test]
+    fn replaced_files_are_not_checkpointed() {
+        let dir = TempDir::new().unwrap();
+        let db = own_index(&dir, false);
+        let w = Database::open(&db).unwrap();
+        insert_file(&w, "before.rs").unwrap();
+        let wal = dir.path().join("index.db-wal");
+        let frames = std::fs::metadata(&wal).unwrap().len();
+        assert!(frames > 0, "the write left frames in the WAL");
+        replace_with_copy(&db);
+        assert!(w.run_optimize().is_err(), "the run_optimize went ahead");
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().len(),
+            frames,
+            "the shared WAL was checkpointed"
+        );
+    }
+
+    /// The last connection to close checkpoints its WAL into the database and
+    /// deletes the `-wal` at the path; when that `-wal` is another file, both
+    /// steps act on files that are not this connection's.
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_connection_whose_wal_was_replaced_leaves_the_files_alone() {
+        let dir = TempDir::new().unwrap();
+        let db = own_index(&dir, false);
+        let w = Database::open(&db).unwrap();
+        insert_file(&w, "before.rs").unwrap();
+        let wal = dir.path().join("index.db-wal");
+        replace_with_copy(&wal);
+        let db_bytes = std::fs::read(&db).unwrap();
+        drop(w);
+        assert!(wal.exists(), "the close deleted the -wal now at the path");
+        assert!(
+            std::fs::read(&db).unwrap() == db_bytes,
+            "the close checkpointed into the database"
+        );
+    }
+
+    /// The MCP secondary's per-message check refuses replaced files as well.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_connection_refuses_files_replaced_under_it() {
+        for replaced in ["index.db", "index.db-wal"] {
+            let dir = TempDir::new().unwrap();
+            let db = own_index(&dir, false);
+            let w = Database::open(&db).unwrap();
+            insert_file(&w, "a.rs").unwrap();
+            let ro = Database::open_readonly(&db).unwrap();
+            assert_eq!(count_files(&ro), 1);
+            ro.end_message();
+            replace_with_copy(&dir.path().join(replaced));
+            let read = ro
+                .conn()
+                .query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0));
+            assert!(read.is_err(), "{replaced}: read {read:?}");
+            let refusal = ro
+                .take_read_refusal()
+                .unwrap_or_else(|| panic!("{replaced}: no refusal"))
+                .to_string();
+            assert!(refusal.contains("were replaced"), "{replaced}: {refusal}");
+            ro.end_message();
+            drop(w);
+        }
+    }
+
+    /// What the tool does to its own files is not a replacement: checkpoints
+    /// that truncate the WAL, another connection's writes, and the close and
+    /// reopen of the last connection.
+    #[test]
+    fn checkpoints_and_other_writers_are_not_a_replacement() {
+        let dir = TempDir::new().unwrap();
+        let db = own_index(&dir, true);
+        let w = Database::open_with_vec(&db).unwrap();
+        let other = Database::open(&db).unwrap();
+        for i in 0..3 {
+            insert_file(&w, &format!("w{i}.rs")).unwrap();
+            insert_file(&other, &format!("o{i}.rs")).unwrap();
+            w.run_optimize().unwrap();
+        }
+        drop(other);
+        insert_file(&w, "last.rs").unwrap();
+        w.check_files();
+        assert!(w.take_read_refusal().is_none());
+        assert_eq!(count_files(&w), 7);
+        drop(w);
+        let again = Database::open(&db).unwrap();
+        insert_file(&again, "reopened.rs").unwrap();
+        assert_eq!(count_files(&again), 8);
+    }
+
+    /// A connection dropped inside a write transaction closes without
+    /// calling into a freed hook (rusqlite frees hook closures before
+    /// `sqlite3_close` rolls back; only the rollback hook is called there).
+    #[test]
+    fn dropping_a_connection_inside_a_write_transaction_closes_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let db = own_index(&dir, false);
+        let w = Database::open(&db).unwrap();
+        w.conn().execute_batch("BEGIN;").unwrap();
+        insert_file(&w, "open.rs").unwrap();
+        drop(w);
+        let again = Database::open(&db).unwrap();
+        assert_eq!(count_files(&again), 0);
     }
 
     /// The check and the reads it vouches for see one snapshot; another

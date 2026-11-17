@@ -341,8 +341,10 @@ pub(crate) fn warn_if_index_locked(code_graph_dir: &Path) {
 /// now-unlinked inode — so every subsequent write from that server (watcher
 /// increments, embedding backfill) lands in a deleted file and is lost the
 /// moment it closes, while its queries keep answering from the pre-rebuild
-/// snapshot. Nothing detects it; the user sees a rebuild that "worked" and a
-/// server that never picks it up. The MCP `rebuild_index` tool avoids the same
+/// snapshot. Since D#883 the server notices the replacement at its next call
+/// or commit and refuses the index until it restarts (see
+/// `storage::db::OpenedFiles`); its pending work is still lost. The MCP
+/// `rebuild_index` tool avoids the same
 /// inode trap by rebuilding inside one transaction, and snapshot install avoids
 /// it by landing before the DB is opened — this path was the one left unguarded
 /// (audit 2026-08-02 P1-3).
@@ -376,9 +378,8 @@ pub(crate) fn lock_index_for_replace(
             anyhow::bail!(
                 "another process (a running MCP server, or a concurrent rebuild-index / \
                  reindex) holds the index lock at {}. \
-                 Replacing index.db now would leave that process writing into a deleted file — \
-                 its indexing and embedding work would be lost silently, and its answers would \
-                 stay on the pre-rebuild index until it restarts.\n  \
+                 Replacing index.db now makes that process refuse every query and write until \
+                 it restarts, and its pending indexing and embedding work is lost.\n  \
                  Stop the MCP server first (end the Claude Code session using this project) \
                  or wait for the other rebuild to finish, then rerun. Pass --force to replace \
                  the index anyway.",
@@ -388,7 +389,8 @@ pub(crate) fn lock_index_for_replace(
         // ONE channel (CON-06); the terse twin printed alongside this one.
         tracing::warn!(
             "--force: another process holds the index lock at {}. \
-             Replacing the index anyway — that process's pending writes will be lost.",
+             Replacing the index anyway — that process refuses the index until it restarts, \
+             and its pending writes are lost.",
             lock.display()
         );
         Ok(())
