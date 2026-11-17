@@ -1,6 +1,6 @@
 # 2026-11-17 D#883 剩余：索引文件在打开期间被替换后，本工具的连接不再读写它们
 
-状态：**已实现（cb8b7096），评审 R1 修复见下，待 R2 与发版 0.197.0**（L3：跨 storage、mcp/server、cli 三个模块，且改变用户可见行为——文件被替换后服务改为拒绝）。授权：用户 2026-11-17“把剩余工作都做了，授权清理和发版”。仓库公开：**复现手法只在本地 gitignore 的 `docs/`（`docs/d883b-notes.md`、`docs/d883b-scripts/`），本文件和测试不写手法。**
+状态：**已实现（cb8b7096），评审 R1 修复（12feb709），R2 只改说法，待发版 0.197.0**（L3：跨 storage、mcp/server、cli 三个模块，且改变用户可见行为——文件被替换后服务改为拒绝）。授权：用户 2026-11-17“把剩余工作都做了，授权清理和发版”。仓库公开：**复现手法只在本地 gitignore 的 `docs/`（`docs/d883b-notes.md`、`docs/d883b-scripts/`），本文件和测试不写手法。**
 
 ## 背景
 
@@ -81,7 +81,20 @@
 | N3 | 3875a878 的提交说明说“`check_files` 不再清缓存”，但那个清空在 cb8b7096 之前就去掉了 | 不改写未推送的提交说明（保留评审轨迹），以本 spec 为准 |
 | N4 | 决定表“Windows 不做”与钩子在 Windows 也装不符 | 决定表已改 |
 | N5 | 变异存活：拒绝 savepoint（R7）、`-wal` 路径取调用方路径（R8）、`run_startup_tasks` 去掉检查（R15） | R7：事务控制一段加 `SAVEPOINT s; RELEASE s;`；R8：L2 的修复后 `-wal` 路径就是调用方路径的绝对形式，不再有两种来源；R15：去掉 `run_startup_tasks` 里的检查（消息开始时已查，二级的读在 `ReadGuard` 里查，主进程的写由 commit hook 查，没有可观察的效果） |
-| N6 | 每次调用 3–7 µs 未被确认：评审在高负载下测得中位 +9.6 µs、最小值 +3.4 µs | CHANGELOG 两次测量都写上，“3 到 10 µs” |
+| N6 | 每次调用 3–7 µs 未被确认：评审在高负载下测得中位 +9.6 µs、最小值 +3.4 µs | CHANGELOG 两次测量都写上，“3 到 10 µs”（R2 NOTE-4 后改为在 12feb709 上重测，见验证记录） |
+
+## 评审 R2（新起的子代理，只审修复提交 12feb709，盲审收窄简报）：HIGH 0 / MEDIUM 0 / LOW 1 / NOTE 5
+
+三处修复（被删的 `-wal`、非 UTF-8 路径、二级的缓存语句）在父提交上各自复现了修复前的失败，修复后通过；产品流程里没有找到回归（切到 DELETE、别的进程做 TRUNCATE checkpoint、同进程/跨进程关闭、二级在时主连接重开、相对路径加 `chdir`、符号链接目录、`:memory:`、移动项目目录）。评审自造 11 个变异，杀 9、存活 2。按评审深度上限（2 轮），本轮只改说法、记录，不再改代码。
+
+| # | 结论 | 处理 |
+|---|------|------|
+| LOW-1（实测） | `-wal` 不在时的判据比较的是 WAL 对象的堆地址：WAL→DELETE→WAL 来回后，默认情况下新 WAL 落在旧地址、下一次提交被拒；占住空闲块让地址不同时，删掉的 `-wal` 判为未替换、提交放行。与 CHANGELOG 第 102 行“来回后下一次提交被拒”不符 | 产品里唯一切 journal 模式的是 snapshot 的 staging 连接，切到 DELETE 后即关闭，不回到 WAL。不改代码；CHANGELOG 的 Not covered 改为写明两种实测结果 |
+| NOTE-1（实测） | 去掉 `std::path::absolute` 的变异存活（只有相对路径打开后 `chdir` 的探针能杀） | 产品路径都来自 `getcwd`，本来就是绝对路径。不加测试：`chdir` 是进程级状态，会干扰同一测试进程里并行的其他测试。记为遗留 |
+| NOTE-2（实测） | `-wal` 路径用调用方的写法，主库用 SQLite 解析后的名字：目录符号链接改指另一份副本时，12feb709 判为替换（385b1d9c 判未移动）；相对的 `file:x.db` 被 SQLite 当 URI 打开，`-wal` 检查静默关闭（385b1d9c 能查） | 两种都只出现在库调用方：服务与 CLI 的路径来自 `getcwd`，符号链接的 `.code-graph` 被 `reject_symlinked_dir` 拒绝。不改代码；评审建议的改法（把 `sqlite3_db_filename` 按字节读成 `OsStr`）记为遗留 |
+| NOTE-3（读代码） | 去掉 `run_startup_tasks` 的检查后，只有一个极窄的时间窗（`notifications/initialized` 的检查与随后 `get_index_status` 之间被替换）日志行不同 | 两版都存在同样的竞争，只是窗口位置不同；不改 |
+| NOTE-4（读代码） | CHANGELOG 的每次调用耗时是在每条消息检查两次的构建（cb8b7096：`handle_message` 与每条消息后的 `run_startup_tasks` 各一次）上测的 | 在 12feb709 的源码构建上重测，CHANGELOG 换成重测数字（见验证记录） |
+| NOTE-5 | “64 MB”应为 64,000 KiB；R1 M1 的溢出说法“推导、未实测”现已由评审实测（rv20：替换后 2 万行事务提交前向旧 WAL 写了 119,393,512 字节，提交被拒并回滚，新连接读到 count=1，integrity ok）；二级上连 `BEGIN; ROLLBACK;` 也被拒（二级的 authorizer 在检查过的读事务之外一律拒绝，`src/storage/db.rs:556-562`） | CHANGELOG 三处改写 |
 
 ## 验证记录
 
@@ -90,4 +103,5 @@
 - 变异（git archive 副本 + 独立 target，`/var/tmp/agent-tmp-d883b/`，每个变异都确认编译并跑了 29 个测试）：commit hook 不否决、不查 `-wal`、不查 HAS_MOVED、`run_optimize` 不查（测试加强后）、关闭时照常 checkpoint、替换后 authorizer 放行、authorizer 拒绝事务控制、`handle_message` 不查、只读检查忽略替换、缺失的 `-wal` 算替换、`take_read_refusal` 不报替换——11/11 被杀。
 - 端到端（scratchpad 沙箱，真实主进程，pull 替换 `-wal` 或 `index.db` 并带源码，之后 20 次“改源码 + 工具调用”，同时循环跑 `health-check`）：发布版 0.196.0 两种变体 20 次调用都照常回答，`-shm` 的 mxFrame 从 2 走到 26；新构建（cb8b7096 的 embed release，md5 5d53eea9，其后只改了测试和 `check_files` 的缓存清空）pull 前 1 次正常、之后 20 次都报 "refusing to use …: its files were replaced"，mxFrame 停在 2。两边 CLI 都没有执行植入的 SQL（0.196.0 0/1049、0/1490；新构建 0/977、0/1251）。
 - 说法逐条实测（cb8b7096 nodef release，md5 ed57c670，对 0.196.0）：主进程下 `rebuild-index --confirm --force` 之后，0.196.0 照常回答、新构建拒绝；主进程运行时移动项目目录，0.196.0 报找不到符号、新构建拒绝；二级服务（另一进程持锁）`index.db` 被替换后，0.196.0 照常回答、新构建拒绝。CLI 命令的写入只在数据库层测过（CHANGELOG 已写明）。
-- 代价（两边源码构建：6e81e29b md5 7e1045a9 对 cb8b7096 md5 ed57c670，不带 embed，本仓库 `src/` 145 个文件 4,480 个节点）：全量索引 6 轮中位数 1,136 → 1,138 ms；主进程每次 `get_ast_node` 0.073/0.073/0.074 → 0.080/0.077/0.077 ms（3 轮×100）；二级 0.355/0.347/0.339 → 0.346/0.348/0.347 ms。
+- 代价（两边源码构建：6e81e29b md5 7e1045a9 对 cb8b7096 md5 ed57c670，不带 embed，本仓库 `src/` 145 个文件 4,480 个节点）：全量索引 6 轮中位数 1,136 → 1,138 ms；主进程每次 `get_ast_node` 0.073/0.073/0.074 → 0.080/0.077/0.077 ms（3 轮×100）；二级 0.355/0.347/0.339 → 0.346/0.348/0.347 ms。cb8b7096 每条消息检查两次（R2 NOTE-4），这组数字已不进 CHANGELOG。
+- 代价重测（R2 后；6e81e29b md5 7e1045a9 对 12feb709 md5 77d75f2e，不带 embed，同一份 `src/` 副本，`health-check --json` 145 个文件 4,480 个节点，两边交替各 6 轮，负载 0.95–1.31，脚本 scratchpad `d883b/perf/run_r2.sh`）：`rebuild-index --confirm --quiet` 中位 1,070 → 1,062 ms（1,013–1,086 对 998–1,100）；主进程每轮 300 次 `get_ast_node` 的中位数，6 轮的中位 0.0715 → 0.076 ms（0.071–0.079 对 0.075–0.105），+4.5 µs；二级每轮 100 次，0.320–0.348 → 0.321–0.351 ms，中位 0.335 → 0.339 ms。

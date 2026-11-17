@@ -50,7 +50,7 @@ journals to it:
   savepoints compiles on that connection. On the first server, statements it
   compiled earlier still run, and the server answers with the refusal
   whatever they read; a secondary discards its parsed schema first, so its
-  statements compile again and are refused;
+  statements compile again and are refused, `BEGIN` and `ROLLBACK` too;
 - the checkpoint at the end of an index run is skipped;
 - the connection closes without the checkpoint SQLite runs when the last
   connection closes, which writes the database at the path and deletes the
@@ -60,14 +60,13 @@ journals to it:
 
 Measured on this version, same scenario as the server line above: the server
 answered the call before the pull and refused all 20 after it, and the
-`-shm`'s frame count stayed at 2. Source builds of this commit and the one
-before it, on this repository's `src/` (145 files, 4,480 nodes): a full index
-took 1,138 ms against 1,136 ms (median of 6; a pre-release review measured
-1,320 against 1,324 ms); a call on the first server took 0.077–0.080 ms
-against 0.073–0.074 ms (3 rounds of 100 `get_ast_node` calls), and the review,
-on a loaded machine, 0.0639 against 0.0605 ms (minimum of 16 rounds of 300)
-and 0.0752 against 0.0656 ms (median): 3 to 10 µs more per call; a
-secondary's calls took 0.346–0.348 ms against 0.339–0.355 ms.
+`-shm`'s frame count stayed at 2. Source builds of this version and of
+0.196.0, on this repository's `src/` (145 files, 4,480 nodes), 6 alternating
+rounds each: `rebuild-index` took 1,062 ms against 1,070 ms (median); a call
+on the first server took 0.076 ms against 0.0715 ms (median of the rounds'
+medians, 300 `get_ast_node` calls a round; 0.075–0.105 against
+0.071–0.079 ms), 4.5 µs more per call; a secondary's calls took
+0.321–0.351 ms against 0.320–0.348 ms (100 calls a round).
 
 `rebuild-index` and `reindex --from-snapshot` already refused to replace the
 index while an MCP server holds its lock; with `--force` they now leave that
@@ -78,11 +77,12 @@ process [would be] writing into a deleted file".
 
 - A commit or a checkpoint already past its check when the files are replaced
   still lands on the earlier files, once.
-- A transaction larger than SQLite's page cache (64 MB here; the MCP
+- A transaction larger than SQLite's page cache (64,000 KiB here; the MCP
   `rebuild_index` tool runs a whole index in one) writes uncommitted pages to
-  the WAL before its commit is refused; the refusal rolls them back, and other
-  processes read only up to the last commit (derived from SQLite's source, not
-  measured).
+  the WAL it opened before its commit is refused. In a pre-release review a
+  20,000-row transaction wrote 119,393,512 bytes there; the refusal rolled it
+  back, and a new connection read only the earlier commit, with
+  `integrity_check` ok.
 - `VACUUM` commits without SQLite's commit hook: the vector compaction at
   server start runs one right after a commit that passed the check, and a
   replacement in between is not stopped.
@@ -100,7 +100,10 @@ process [would be] writing into a deleted file".
   replaced while open; the `-wal` check does not run there, and SQLite's
   Windows file layer does not answer `SQLITE_FCNTL_HAS_MOVED`.
 - A connection that leaves WAL mode and enters it again (no code-graph-mcp
-  code does) refuses its next commit.
+  code does) is judged by whether SQLite's new WAL sits at the address of the
+  one it opened with. In a pre-release review it did by default, and the next
+  commit was refused; with that memory held elsewhere, an `index.db-wal`
+  deleted afterwards went unnoticed and the commit went through.
 
 Not running code-graph-mcp in a repository that commits `.code-graph/`
 remains the workaround.
