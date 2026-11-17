@@ -453,6 +453,43 @@ fn cli_snapshot_inspect_error_quotes_a_relative_name_with_dot_slash() {
     );
 }
 
+/// D#878: a snapshot holding SQL code-graph-mcp does not write is refused,
+/// and the refusal names the file as the user typed it, `./` in front as the
+/// in-place read quotes it (D#666), on the arm that reads a copy too: that arm
+/// named the temporary copy.
+#[test]
+fn cli_snapshot_inspect_refusal_names_a_relative_file_as_typed() {
+    let dir = TempDir::new().unwrap();
+    for (name, mode) in [
+        ("planted-copy.db", "WAL"),
+        ("planted-in-place.db", "DELETE"),
+    ] {
+        {
+            let c = rusqlite::Connection::open(dir.path().join(name)).unwrap();
+            c.pragma_update(None, "journal_mode", mode).unwrap();
+            c.execute_batch("CREATE VIEW planted AS SELECT 1;").unwrap();
+        }
+        let out = Command::new(cli_bin())
+            .current_dir(dir.path())
+            .args(["snapshot", "inspect", name])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let quoted = format!(
+            "refusing to open {}:",
+            std::path::Path::new(".").join(name).display()
+        );
+        assert!(
+            !out.status.success(),
+            "{mode}: a planted view was inspected"
+        );
+        assert!(
+            stderr.contains(&quoted) && !stderr.contains("snapshot.db"),
+            "{mode}: the refusal names {quoted}: {stderr}"
+        );
+    }
+}
+
 // clap-migrated (audit #4 Step 4): `snapshot` is now a nested #[command(subcommand)].
 // clap owns --help for the parent and each sub, plus no-subcommand /
 // unknown-subcommand rejection (exit 2), replacing the hand-rolled args[2]/args[3]

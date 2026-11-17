@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### fix: `snapshot inspect` names your file when it refuses planted SQL
+
+`snapshot inspect` reads a WAL-mode snapshot, or one beside a hot journal,
+through a copy in a temporary directory. When the copy held SQL
+code-graph-mcp does not write, 0.195.0's refusal named the copy (for example
+`/tmp/.tmpaoiSY9/snapshot.db`) as the file to delete. It now names the file
+you gave, as the refusal of a snapshot read in place does (a relative name
+with `./` in front).
+
+### Not covered: wider than 0.195.0 said
+
+0.195.0's Not covered says that an MCP server running as a secondary reader
+of the index checks the index once, when it opens it, and that index files
+that change beside it while it runs are not checked again. A secondary
+server that starts after a `git pull` changed the index files is exposed
+too, while another process that opened the earlier files keeps writing to
+them: the processes share the index's `-shm`, and the newer server can then
+read pages its check did not read. Measured on 0.195.0 with a second process
+writing to the index the way a first server does: a view in a pulled `-wal`,
+and one in a pulled `index.db`, ran in a secondary server that started
+after the pull. Not running code-graph-mcp in a repository that commits
+`.code-graph/` remains the workaround.
+
 ## 0.195.0
 
 **Upgrading: no index rebuild; upgrade soon.** `INDEX_VERSION` stays 141.

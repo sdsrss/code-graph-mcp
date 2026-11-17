@@ -544,14 +544,14 @@ fn side_file_of(file: &Path, suffix: &str) -> std::path::PathBuf {
 /// counts. The reader open still migrates and bootstraps the copy, which is
 /// what the meta probe relies on. Its corrupt-file refusal is put in
 /// `inspect`'s own words: it names `rebuild-index` and the temp copy's path,
-/// and neither is anything a user inspecting a snapshot can act on.
+/// and neither is anything a user inspecting a snapshot can act on. Its
+/// refusal of SQL the tool does not write names the user's file, as the
+/// in-place arm does, not the temp copy (D#878).
 fn open_staged(staged: &Path, file: &Path) -> Result<crate::storage::db::Database> {
-    use crate::storage::db::Database;
-    Database::open_nondestructive(staged).map_err(|e| {
-        if Database::is_corrupt_index_error(&e) {
-            invalid_snapshot(file)
-        } else {
-            e
-        }
+    use crate::storage::db::{Database, ForeignSchema};
+    Database::open_nondestructive(staged).map_err(|e| match e.downcast::<ForeignSchema>() {
+        Ok(refusal) => refusal.naming(file).into(),
+        Err(e) if Database::is_corrupt_index_error(&e) => invalid_snapshot(file),
+        Err(e) => e,
     })
 }

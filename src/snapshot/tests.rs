@@ -1907,3 +1907,59 @@ fn includes_vec_says_whether_the_snapshot_holds_vectors() {
         .is_some();
     assert_eq!(meta.includes_vec, model, "{vectors} vectors");
 }
+
+/// 0.195.0 review R3 (D#878): a file whose schema SQLite reports corrupt
+/// cannot be loaded by any connection, so the in-place open lets it through
+/// and `inspect` then calls it what it is, in its own words, on the copy it
+/// falls back to. Refusing it at the in-place open instead surfaced SQLite's
+/// bare "malformed database schema".
+#[test]
+fn inspect_calls_a_corrupt_schema_not_a_valid_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("corrupt.db");
+    {
+        let c = Connection::open(&file).unwrap();
+        c.execute_batch(
+            "PRAGMA journal_mode = DELETE; CREATE TABLE t(v); \
+             PRAGMA writable_schema = ON; \
+             UPDATE sqlite_schema SET sql = 'CREATE TABLE t(' WHERE name = 't'; \
+             PRAGMA writable_schema = OFF;",
+        )
+        .unwrap();
+    }
+    let read =
+        Connection::open(&file)
+            .unwrap()
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |r| {
+                r.get::<_, i64>(0)
+            });
+    assert_eq!(
+        read.map_err(|e| e.sqlite_error_code()),
+        Err(Some(rusqlite::ErrorCode::DatabaseCorrupt)),
+        "precondition: SQLite reports the schema corrupt"
+    );
+    let err = inspect_outcome(&file).expect_err("a corrupt schema");
+    assert!(err.contains("is not a valid code-graph snapshot"), "{err}");
+}
+
+/// D#878: a snapshot holding SQL the tool does not write is refused on every
+/// arm, and the refusal names the file the user gave. The staged arms open a
+/// copy in a temporary directory, and named that copy as the file to delete.
+#[test]
+fn inspect_names_the_users_file_when_it_refuses_planted_sql() {
+    for mode in ["DELETE", "WAL"] {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("planted.db");
+        {
+            let c = Connection::open(&file).unwrap();
+            c.pragma_update(None, "journal_mode", mode).unwrap();
+            c.execute_batch("CREATE VIEW planted AS SELECT 1;").unwrap();
+        }
+        let err = format!("{:#}", crate::snapshot::inspect(&file).expect_err(mode));
+        assert!(err.contains("does not create"), "{mode}: {err}");
+        assert!(
+            err.contains(&file.display().to_string()) && !err.contains("snapshot.db"),
+            "{mode}: names the user's file, not the copy: {err}"
+        );
+    }
+}

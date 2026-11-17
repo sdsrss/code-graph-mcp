@@ -306,13 +306,43 @@ fn foreign_schema_message(db_path: &Path, foreign: &[String]) -> String {
     )
 }
 
+/// The D#784 refusal of an open, as an error a caller that opened a copy can
+/// re-address to the file the user named (`snapshot inspect`, D#878).
+#[derive(Debug)]
+pub(crate) struct ForeignSchema {
+    path: std::path::PathBuf,
+    objects: Vec<String>,
+}
+
+impl ForeignSchema {
+    /// The same refusal, naming `path` as an open of it would.
+    pub(crate) fn naming(self, path: &Path) -> Self {
+        Self {
+            path: sqlite_file_name(path),
+            ..self
+        }
+    }
+}
+
+impl std::fmt::Display for ForeignSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&foreign_schema_message(&self.path, &self.objects))
+    }
+}
+
+impl std::error::Error for ForeignSchema {}
+
 /// The open-time half of [`foreign_schema_objects`], on the connection the
 /// caller goes on to use, before any statement that could fire a trigger.
 /// Fails closed: a schema it cannot read fails the open.
 fn refuse_foreign_schema(db_path: &Path, conn: &Connection) -> Result<()> {
-    let foreign = foreign_schema_objects(conn)?;
-    if !foreign.is_empty() {
-        anyhow::bail!("{}", foreign_schema_message(db_path, &foreign));
+    let objects = foreign_schema_objects(conn)?;
+    if !objects.is_empty() {
+        return Err(ForeignSchema {
+            path: db_path.to_path_buf(),
+            objects,
+        }
+        .into());
     }
     Ok(())
 }
@@ -501,8 +531,8 @@ impl Database {
         // checks. Any other failure of the read fails the open: a schema
         // SQLite loads is a schema it runs (review R2).
         match foreign_schema_objects(&conn) {
-            Ok(foreign) if !foreign.is_empty() => {
-                anyhow::bail!("{}", foreign_schema_message(&path, &foreign));
+            Ok(objects) if !objects.is_empty() => {
+                return Err(ForeignSchema { path, objects }.into());
             }
             Ok(_) => {}
             Err(e) if schema_cannot_load(&e) => {}
@@ -4214,7 +4244,7 @@ mod tests {
     /// was not written by it and every open refuses it, readers included.
     #[test]
     fn schema_objects_the_tool_does_not_create_are_refused() {
-        let plants: [(&str, &str); 8] = [
+        let plants: [(&str, &str); 10] = [
             (
                 "nodes_fts on another module",
                 "DROP TABLE nodes_fts; \
@@ -4227,6 +4257,18 @@ mod tests {
                 "DROP TABLE nodes_fts; \
                  CREATE VIRTUAL TABLE nodes_fts USING fts5(name, \
                  content='files', content_rowid='id');",
+            ),
+            (
+                "nodes_fts with a column the tool never wrote",
+                "DROP TABLE nodes_fts; \
+                 CREATE VIRTUAL TABLE nodes_fts USING fts5(name, body, \
+                 content='nodes', content_rowid='id');",
+            ),
+            (
+                "nodes_fts with another tokenizer",
+                "DROP TABLE nodes_fts; \
+                 CREATE VIRTUAL TABLE nodes_fts USING fts5(name, \
+                 content='nodes', content_rowid='id', tokenize='trigram');",
             ),
             (
                 "a trigger",
@@ -4411,6 +4453,29 @@ mod tests {
             .query_row("SELECT count(*) FROM fired", [], |r| r.get(0))
             .unwrap();
         assert_eq!(fired, 0, "the planted trigger ran during open");
+    }
+
+    /// 0.195.0 review R3 (D#878): only an error meaning the connection cannot
+    /// load the schema at all lets the user-named open through; any other
+    /// failure of the read fails it. A schema format number newer than SQLite
+    /// reads fails the read with a plain error.
+    #[test]
+    fn a_schema_read_error_the_check_does_not_know_fails_the_named_open() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("snapshot.db");
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode = DELETE; CREATE TABLE t(v);")
+            .unwrap();
+        // The schema format number, big-endian at byte 44: SQLite reads 1 to 4.
+        let mut bytes = std::fs::read(&db).unwrap();
+        bytes[44..48].copy_from_slice(&5u32.to_be_bytes());
+        std::fs::write(&db, bytes).unwrap();
+        let err = Database::open_readonly_named(&db)
+            .map(drop)
+            .expect_err("a schema the read fails on")
+            .to_string();
+        assert!(err.contains("unsupported file format"), "{err}");
     }
 
     /// The control: the tool's own index opens through every constructor,
