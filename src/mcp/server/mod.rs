@@ -6614,6 +6614,23 @@ app.post('/api/login', handleLogin);
             "{text}"
         );
 
+        let resource: serde_json::Value = serde_json::from_str(
+            &server
+                .handle_message(
+                    &json!({"jsonrpc": "2.0", "id": 2, "method": "resources/read",
+                            "params": {"uri": "code-graph://project-summary"}})
+                    .to_string(),
+                )
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let message = resource["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("refusing to read ") && message.contains("view \"planted\""),
+            "{resource}"
+        );
+
         planter.execute_batch("DROP VIEW planted;").unwrap();
         let (text, is_error) = tool_text(&status().unwrap());
         assert!(!is_error, "a clean index is read again: {text}");

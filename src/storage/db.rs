@@ -4732,6 +4732,46 @@ mod tests {
         assert_eq!(count_files(&ro), 1, "the next message");
     }
 
+    /// A check that could not run vouches for nothing: the rest of the message
+    /// is refused even once the snapshot becomes readable. Here the check
+    /// waits out its busy timeout on another connection's lock, and that
+    /// connection then commits a view.
+    #[test]
+    fn a_check_that_fails_refuses_the_rest_of_the_message() {
+        let dir = TempDir::new().unwrap();
+        let db = own_index(&dir, false);
+        // Rollback mode: an exclusive lock keeps readers out.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode = DELETE;")
+            .unwrap();
+        let ro = Database::open_readonly(&db).unwrap();
+        ro.conn
+            .busy_timeout(std::time::Duration::from_millis(20))
+            .unwrap();
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch("BEGIN EXCLUSIVE; CREATE VIEW planted AS SELECT 'ran' AS v;")
+            .unwrap();
+        assert!(ro
+            .conn()
+            .query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+            .is_err());
+        writer.execute_batch("COMMIT;").unwrap();
+        let read = ro
+            .conn()
+            .query_row("SELECT v FROM planted", [], |r| r.get::<_, String>(0));
+        assert!(read.is_err(), "read after a failed check: {read:?}");
+        let refusal = ro.take_read_refusal().expect("why").to_string();
+        assert!(refusal.contains("could not check the schema"), "{refusal}");
+        ro.end_read();
+        drop(writer);
+        assert!(ro
+            .conn()
+            .query_row("SELECT v FROM planted", [], |r| r.get::<_, String>(0))
+            .is_err());
+    }
+
     /// SQLite rolls a transaction back by itself when a statement in it meets
     /// an I/O or memory error, and every statement after that reads a snapshot
     /// of its own — one nobody checked. Nothing compiles again until the next
