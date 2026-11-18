@@ -645,12 +645,42 @@ TEST(Coding, Fixed32) { EncodeFixed32(); }
 
 /// (target, metadata) of every call in `code`.
 fn call_meta(code: &str, lang: &str) -> Vec<(String, Option<String>)> {
-    extract_relations(code, lang)
-        .unwrap()
+    calls_in(extract_relations(code, lang).unwrap())
+}
+
+/// (target, metadata) of every call among `relations`.
+fn calls_in(relations: Vec<ParsedRelation>) -> Vec<(String, Option<String>)> {
+    relations
         .into_iter()
         .filter(|r| r.relation == REL_CALLS)
         .map(|r| (r.target_name, r.metadata))
         .collect()
+}
+
+/// Runs `extract` over Python `code` in a thread and fails past 60 s. The
+/// cost tests time the extraction, so the parse runs without the indexer's
+/// 5 s budget, which is sized for release builds: a 500 KB input that parses
+/// in 0.74 s on a Linux debug build went past it on a Windows one (D#896). A
+/// failure inside the thread comes back as one, not as a timeout.
+fn extract_within_60s<T: Send + 'static>(
+    label: &str,
+    code: String,
+    extract: impl FnOnce(&tree_sitter::Tree, &str) -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let _ = tx.send(parser.parse(&code, None).map(|tree| extract(&tree, &code)));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(Some(out)) => out,
+        Ok(None) => panic!("{label}: tree-sitter returned no tree"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{label} took over 60 s"),
+        Err(e) => panic!("{label}: the extraction thread died: {e}"),
+    }
 }
 
 fn meta_of<'a>(calls: &'a [(String, Option<String>)], target: &str) -> Option<&'a str> {
@@ -1588,12 +1618,9 @@ fn test_python_call_on_a_module_level_class_binds_the_mro_owner() {
 #[test]
 fn test_python_class_rule_costs_stay_linear() {
     let within = |label: &str, code: String| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(call_meta(&code, "python"));
-        });
-        rx.recv_timeout(std::time::Duration::from_secs(60))
-            .unwrap_or_else(|_| panic!("{label} took over 60 s"))
+        extract_within_60s(label, code, |tree, code| {
+            calls_in(extract_relations_from_tree(tree, code, "python", None))
+        })
     };
     let k = 100_000;
     let dup = format!(
@@ -1630,13 +1657,9 @@ fn test_python_class_body_marking_stays_linear() {
         code.len() < 1 << 20,
         "keep the input under the 1 MiB file cap"
     );
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(extract_relations(&code, "python").unwrap());
+    let rels = extract_within_60s("marking the calls nested 200 deep", code, |tree, code| {
+        extract_relations_from_tree(tree, code, "python", None)
     });
-    let rels = rx
-        .recv_timeout(std::time::Duration::from_secs(60))
-        .expect("marking the calls nested 200 deep took over 60 s");
     let calls: Vec<_> = rels.iter().filter_map(|r| r.call_at).collect();
     assert!(calls.len() > 1_000, "{} bare calls", calls.len());
     // Every call is in `g`'s body but the last, which runs in the class body.
@@ -9553,28 +9576,19 @@ fn a_python_module_call_reach_holds_for_review_round_two_shapes() {
         "deep import"
     );
 
-    // Inputs stay under the indexer's 1 MiB file cap: a 2.6 MB one outran
-    // tree-sitter's 5 s parse timeout on a Windows debug build. Names come many
+    // Inputs stay under the indexer's 1 MiB file cap, the largest file it
+    // parses (a 2.6 MB one was not a file it would index). Names come many
     // to a line so that a quadratic product stays large: names x stars is
     // 2.1e9 here (the per-name star expansion this replaced: 60 s at 1.6e9),
     // targets x occurrences 7.0e9 (no deduplication: 16 s at 1.6e9). A
     // quadratic loop cheaper per step can still pass: these guard the shapes
     // measured, they do not prove linearity.
-    let within =
-        |label: &str, code: String| {
-            assert!(code.len() < 1 << 20, "{label}: {} bytes", code.len());
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = tx.send(crate::parser::treesitter::parse_tree(&code, "python").map(
-                    |tree| extract_relations_from_tree(&tree, &code, "python", Some("pkg/mod.py")),
-                ));
-            });
-            match rx.recv_timeout(std::time::Duration::from_secs(60)) {
-                Ok(Ok(relations)) => relations,
-                Ok(Err(e)) => panic!("{label}: {e}"),
-                Err(_) => panic!("{label} took over 60 s"),
-            }
-        };
+    let within = |label: &str, code: String| {
+        assert!(code.len() < 1 << 20, "{label}: {} bytes", code.len());
+        extract_within_60s(label, code, |tree, code| {
+            extract_relations_from_tree(tree, code, "python", Some("pkg/mod.py"))
+        })
+    };
     let short = |mut i: usize| {
         let mut name = String::from("z");
         loop {
