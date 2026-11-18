@@ -4,16 +4,17 @@
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 142 → 143
 because the stored graph changes for unchanged source: the confidence of
-Python calls of a name the file also imports under another name (below). The
-MCP server rebuilds the index when it starts. From the command line, a query
-answers from the old index with "This index was built by an older code-graph
-(index v142, this binary v143): answers come from it until it is rebuilt —
-run: code-graph-mcp reindex", and the first `incremental-index` prints "Index
-version mismatch (stored v142 ≠ binary v143): clearing + rebuilding". 0.199.0
-answers queries from an index this version wrote but will not write to it:
-its `incremental-index` exits 1 and says to delete `.code-graph/index.db*`
-first. To pin the binary back: `npm i -g @sdsrs/code-graph@0.199.0`, then
-delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+Python calls and references of a name the file also imports under another
+name (below). The MCP server rebuilds the index when it starts. From the
+command line, a query answers from the old index with "This index was built
+by an older code-graph (index v142, this binary v143): answers come from it
+until it is rebuilt — run: code-graph-mcp reindex", and the first
+`incremental-index` prints "Index version mismatch (stored v142 ≠ binary
+v143): clearing + rebuilding". 0.199.0 answers queries from an index this
+version wrote but will not write to it: its `incremental-index` exits 1 and
+says to delete `.code-graph/index.db*` first. To pin the binary back:
+`npm i -g @sdsrs/code-graph@0.199.0`, then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set
 `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The plugin's
 scripts are unchanged.
 
@@ -22,15 +23,18 @@ scripts are unchanged.
 `from m import a as b` binds `b` in the importing file, not `a`. Beside
 `from n import a`, a bare `a()` had edges to both `m.a` and `n.a`, both
 `inferred`: the confidence pass counted the renamed import as an import of
-`m.a` that vouched for the call. It no longer counts a renamed import for a
-bare call or a bare type mention (`x: A`) of the definition it imports, so
-the edge to `m.a` is `ambiguous` whenever `a` has another definition.
-`callgraph`, `impact` and the MCP call-graph tools leave it out by default:
-`callgraph go` lists `n.a` and says one ambiguous edge is hidden, where it
-listed both, and `impact a --file m.py` no longer counts `go` as a caller.
-`refs` still lists the call, marked `~ambiguous`. A qualified `m.a()` and a
-call through the alias (`b()`) keep their label. Which edges exist does not
-change.
+`m.a` that vouched for the call. It no longer counts a renamed import for an
+edge the resolver bound by the bare name alone — a bare call `a()` or a
+bare type mention `x: A` — so such an edge to `m.a` is `ambiguous` whenever
+`a` has another definition. `callgraph`, `impact` and the MCP call-graph
+tools leave it out by default: `callgraph go` lists `n.a` and says one
+ambiguous edge is hidden, where it listed both, and `impact a --file m.py`
+no longer counts `go` as a caller. `refs` still lists the call, marked
+`~ambiguous`. A call through a module (`m.a()`, with `m` from
+`from app import m` or `from . import m`), on `self.x`, or on a local value
+keeps its `inferred` edge to `m.a`, and so does a call through the alias
+(`b()`); `callgraph` lists them as before. Which edges a full index holds
+does not change: this release changes labels of calls and references only.
 
 In a private application (1,258 Python files), 8 edges go from `inferred`
 to `ambiguous`, each of them wrong on reading the source: 4 `calls` —
@@ -45,13 +49,22 @@ the same edges.
 
 ### Not covered
 
-- `from m import a as _a` followed by `a = _a` makes a bare `a()` call
-  `m.a`; its edge is now `ambiguous` (it was `inferred`) when `a` has another
-  definition.
-- JavaScript and TypeScript are unchanged: `import { x as z } from './m'`
-  beside `import { x } from './n'`, or a re-export `export { x as y }`
-  imported beside `x`, still gives a bare `x()` edges to both `m.x` and
-  `n.x`, `inferred`.
+These keep their edge but now label a correct one `ambiguous` (it was
+`inferred`) when the name has another definition; none of them occurs in
+the five projects above:
+
+- `from m import a as _a` followed by `a = _a` — at module level, after
+  `global a` in a function, or in an `except ImportError:` fallback — makes
+  a bare `a()` call `m.a`.
+- `from m import a as b` beside `from m import *`: the star import binds `a`
+  to `m.a`.
+- A type annotation written through a module, `x: m.A`, beside
+  `from m import A as B`: its `references` edge to `m.A`.
+
+JavaScript and TypeScript are unchanged: `import { x as z } from './m'`
+beside `import { x } from './n'`, or a re-export `export { x as y }`
+imported beside `x`, still gives a bare `x()` edges to both `m.x` and
+`n.x`, `inferred`.
 
 ## 0.199.0
 

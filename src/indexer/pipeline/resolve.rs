@@ -2710,17 +2710,19 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                           WHERE i.fid = src.file_id
                             AND i.tid = tgt.id
                             -- a Python `from m import a as b` binds `b`, so
-                            -- it vouches for no bare `a` (D#893): a bare call
-                            -- or reference, or one bare as far as resolution
-                            -- goes (a D10B `ur` mark). A qualified `m.a()`
-                            -- keeps it, and a call of `b` is `pyimp`, exempt
-                            -- below. Only the label: the prune still reads
-                            -- the import as one of `a`, so the edge set is
-                            -- the one 0.199.0 builds, and an incremental run
-                            -- has no edge to restore that a rebuild keeps.
+                            -- it vouches for no edge the resolver bound by
+                            -- the bare name alone (no metadata: `a()`,
+                            -- `x: A`) (D#893). An edge with any mark keeps
+                            -- it: a qualified `m.a()` (`q`, or `ur` when a
+                            -- relative import binds `m`), the `ur` calls on
+                            -- `self.x` or a local value, and a call of `b`
+                            -- (`pyimp`, exempt below anyway). Only the
+                            -- label: the prune still reads the import as one
+                            -- of `a`, so the edge set is the one 0.199.0
+                            -- builds, and an incremental run has no edge to
+                            -- restore that a rebuild keeps.
                             AND (i.alias IS NULL
-                                 OR (e.metadata IS NOT NULL AND e.metadata <> ''
-                                     AND json_extract(e.metadata, '$.ur') IS NULL))
+                                 OR (e.metadata IS NOT NULL AND e.metadata <> ''))
                             -- a `P.X()` call's synthetic import vouches only
                             -- for that call (D#518)
                             AND (i.attr IS NULL

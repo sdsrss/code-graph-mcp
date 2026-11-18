@@ -12711,6 +12711,16 @@ const D893_LABEL_FILES: &[(&str, &str)] = &[
         "app/qual.py",
         "from app import m\nfrom app.m import a as b\n\n\ndef go():\n    return m.a()\n",
     ),
+    // So does one through a module a relative import binds (`ur` `rel`).
+    (
+        "app/relq.py",
+        "from . import m\nfrom .m import a as b\n\n\ndef go():\n    return m.a()\n",
+    ),
+    // A plain import of the same target still vouches beside the renamed one.
+    (
+        "app/both.py",
+        "from app.m import a as b\nfrom app.m import a\n\n\ndef go():\n    return a()\n",
+    ),
     // A bare type mention is a bare `A` as much as a call is.
     (
         "app/ref.py",
@@ -12735,6 +12745,17 @@ fn test_python_renamed_import_does_not_bind_its_original_name() {
             &["app/m.py:a ambiguous", "app/n.py:a inferred"],
         ),
         ("app/only.py", "go", &["app/m.py:a ambiguous"]),
+        // the `ur` `rel` edge keeps `inferred`; its unmarked twin is bare
+        (
+            "app/relq.py",
+            "go",
+            &[
+                "app/m.py:a ambiguous",
+                "app/m.py:a inferred",
+                "app/n.py:a ambiguous",
+            ],
+        ),
+        ("app/both.py", "go", &["app/m.py:a inferred"]),
         (
             "app/qual.py",
             "go",
