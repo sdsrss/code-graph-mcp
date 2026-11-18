@@ -916,7 +916,9 @@ fn build_imports_temp(conn: &rusqlite::Connection, with_name: bool) -> Result<()
                 COALESCE(json_extract(ie.metadata, '$.imported'), itn.name) AS nm,
                 ie.target_id AS tid,
                 json_extract(ie.metadata, '$.attr') AS attr,
-                json_extract(ie.metadata, '$.python_module') AS module
+                json_extract(ie.metadata, '$.python_module') AS module,
+                -- the name a Python `from m import a as b` binds (`b`, D#893)
+                json_extract(ie.metadata, '$.as') AS alias
          FROM edges ie
          JOIN nodes mn  ON mn.id  = ie.source_id
          JOIN nodes itn ON itn.id = ie.target_id
@@ -2259,6 +2261,9 @@ pub(super) fn bind_calls_to_imported_targets(
            AND itf.path <> '<external>'
            -- a `P.X()` call's synthetic import binds no bare `X()` (D#518)
            AND json_extract(ie.metadata, '$.attr') IS NULL
+           -- nor does a Python `from m import a as b` bind a bare `a()`, and
+           -- a call of `b` it binds is D#726's `pyimp` call (D#893)
+           AND json_extract(ie.metadata, '$.as') IS NULL
          GROUP BY 1, 2
          HAVING COUNT(DISTINCT itn.id) = 1",
         rusqlite::params![REL_IMPORTS],
@@ -2509,13 +2514,19 @@ pub(super) fn prune_import_contradicted_call_edges(
                     AND i.nm = tn.name
                     AND i.tid <> e.target_id
                     AND i.attr IS NULL
+                    AND i.alias IS NULL
               )
-              -- ... and does NOT import THIS target (so it is contradicted)
+              -- ... and does NOT import THIS target (so it is contradicted).
+              -- Neither side reads a Python `from m import a as b`: it binds
+              -- `b`, so it neither contradicts nor keeps a bare `a()` (D#893),
+              -- and keyed by `b` it contradicted the only edge a bare `b()`
+              -- had, which no later run restored (0.199.0 review R2).
               AND NOT EXISTS (
                   SELECT 1 FROM cg_imports i2
                   WHERE i2.fid = sn.file_id
                     AND i2.tid = e.target_id
                     AND i2.attr IS NULL
+                    AND i2.alias IS NULL
               )";
     let mut removed = 0;
     for predicate in [PRUNE_PREDICATE, FIELD_CALL_PRUNE_PREDICATE] {
@@ -2707,6 +2718,10 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                           SELECT 1 FROM cg_imports i
                           WHERE i.fid = src.file_id
                             AND i.tid = tgt.id
+                            -- a renamed Python import vouches for no bare
+                            -- call of the original name (D#893); a call of
+                            -- the alias is `pyimp`, exempt below
+                            AND i.alias IS NULL
                             -- a `P.X()` call's synthetic import vouches only
                             -- for that call (D#518)
                             AND (i.attr IS NULL
