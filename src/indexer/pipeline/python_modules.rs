@@ -312,6 +312,47 @@ fn module_level_definition_ids(
     Ok(kept)
 }
 
+/// Record that Phase 0 could not move an `imports` edge of `importer`, a
+/// Python file outside the run, onto the one module-level node of its name in
+/// the re-indexed file it pointed into (D#901). The edge is restored or
+/// requeued as before, but the file's other edges were decided by it: a bare
+/// call of the name pruned while the import pointed elsewhere
+/// (`prune_import_contradicted_call_edges`), or bound through it
+/// (`bind_calls_to_imported_targets`), comes back only when the file is
+/// re-extracted, as a rebuild has it. Read by [`take_importers_to_refresh`].
+pub(super) fn record_importer_to_refresh(
+    conn: &rusqlite::Connection,
+    importer: &str,
+) -> anyhow::Result<()> {
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS cg_py_requeued (path TEXT PRIMARY KEY);")?;
+    conn.execute(
+        "INSERT OR IGNORE INTO temp.cg_py_requeued (path) VALUES (?1)",
+        [importer],
+    )?;
+    Ok(())
+}
+
+/// The files [`record_importer_to_refresh`] recorded since the last call, which
+/// drops the record.
+pub(super) fn take_importers_to_refresh(
+    conn: &rusqlite::Connection,
+) -> anyhow::Result<Vec<String>> {
+    let recorded: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name = 'cg_py_requeued')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !recorded {
+        return Ok(Vec::new());
+    }
+    let paths = conn
+        .prepare("SELECT path FROM temp.cg_py_requeued ORDER BY path")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    conn.execute_batch("DROP TABLE temp.cg_py_requeued;")?;
+    Ok(paths)
+}
+
 /// How deep a re-export chain is followed: `pkg/__init__.py` re-exporting from
 /// `pkg/sub/__init__.py`, which re-exports from `pkg/sub/impl.py`, is two.
 const REEXPORT_MAX_DEPTH: usize = 8;

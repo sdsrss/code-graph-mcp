@@ -3912,6 +3912,25 @@ fn mint_external_sentinels(
     Ok((nodes_created, edges_created))
 }
 
+/// The nodes of `pf` inside a `def`, method or class of the same file, by the
+/// lines `module_level_definition_ids` reads: what a Python `from m import x`
+/// does not reach as a module attribute.
+fn python_nested_node_ids(pf: &FileParsed) -> HashSet<i64> {
+    let containers: Vec<(u32, u32)> = pf
+        .node_types
+        .iter()
+        .zip(pf.node_lines.iter())
+        .filter(|(ty, _)| matches!(ty.as_str(), "function" | "method" | "class"))
+        .map(|(_, lines)| *lines)
+        .collect();
+    pf.node_ids
+        .iter()
+        .zip(pf.node_lines.iter())
+        .filter(|(_, (start, end))| containers.iter().any(|(s, e)| s < start && end <= e))
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// Phase 2c: restore the cross-file inbound edges that cascade-delete stripped.
 ///
 /// Re-indexing a file deletes its old nodes, and the cascade takes every edge
@@ -3976,6 +3995,10 @@ fn restore_inbound_edges(
 
         // Memoized source-file lookup for the requeue path below.
         let mut src_file_info: HashMap<i64, (String, String)> = HashMap::new();
+        // A batch file's nested nodes — inside a `def` or class, as
+        // `module_level_definition_ids` tells them — filled per file on first
+        // use by a Python import below.
+        let mut nested_of_file: HashMap<i64, HashSet<i64>> = HashMap::new();
 
         let mut restored = 0usize;
         let mut skipped_intra_batch = 0usize;
@@ -4061,6 +4084,42 @@ fn restore_inbound_edges(
                 .then(|| super::resolve::python_attr_of(metadata.as_deref()))
                 .flatten()
                 .filter(|attr| batch_name_to_ids.contains_key(&(*target_file_id, attr.as_str())));
+            // D#901: a Python import is restored as it was only when its file
+            // still has one node of the name, at module level, with the same
+            // qualified name. Otherwise a rebuild binds it elsewhere — every
+            // node of the name the module now has, a method beside the
+            // function included (`resolve_python_module_targets`), or the
+            // fallback's choice — and the importer's calls of the name, pruned
+            // or bound by the old target, follow only a re-extraction of the
+            // importer, which the fan-out round runs. A file a later batch of
+            // this run re-extracts anyway is left to it.
+            if relation.as_str() == REL_IMPORTS
+                && src_lang == "python"
+                && target_name != "<module>"
+                && !metadata
+                    .as_deref()
+                    .is_some_and(|m| m.contains(r#""attr":"#))
+                && !src_path.is_empty()
+                && (!run_file_paths.contains(src_path.as_str()) || done_paths.contains(&src_path))
+            {
+                let same = batch_name_to_ids.get(&(*target_file_id, target_name.as_str()));
+                let unchanged = match same.map(Vec::as_slice) {
+                    Some([(id, q, _)]) if *q == target_qualified.as_deref() => {
+                        let nested = nested_of_file.entry(*target_file_id).or_insert_with(|| {
+                            batch_parsed
+                                .iter()
+                                .find(|pf| pf.file_id == *target_file_id)
+                                .map(python_nested_node_ids)
+                                .unwrap_or_default()
+                        });
+                        !nested.contains(id)
+                    }
+                    _ => false,
+                };
+                if !unchanged {
+                    super::python_modules::record_importer_to_refresh(db.conn(), &src_path)?;
+                }
+            }
             let new_target_ids: Option<Vec<i64>> = (!renamed_import
                 && !receiver_typed
                 && attr_import.is_none())

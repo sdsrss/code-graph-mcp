@@ -851,6 +851,8 @@ fn fan_out_to_new_duplicate_definitions(
     hashes: &HashMap<String, String>,
     model: Option<&EmbeddingModel>,
 ) -> Result<usize> {
+    // Python importers whose import Phase 0 could not restore as it was (D#901).
+    let requeued = python_modules::take_importers_to_refresh(db.conn())?;
     // Typed callers first: the bare-name half drops the snapshot both read.
     let typed = resolve::typed_callers_of_class_drift(db.conn())?;
     let bare = resolve::bare_name_callers_of_new_duplicates(
@@ -866,6 +868,7 @@ fn fan_out_to_new_duplicate_definitions(
         .chain(bare.iter())
         .chain(reexported.iter())
         .chain(js_reexported.iter())
+        .chain(requeued.iter())
         .cloned()
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -876,12 +879,14 @@ fn fan_out_to_new_duplicate_definitions(
     tracing::info!(
         "[index] fan-out round: re-extracting {} caller file(s): {} bare-name caller(s) reached \
          by a new same-name definition, {} typed caller(s) of a changed class structure, {} \
-         importer(s) of a moved Python re-export, {} of a moved JS/TS re-export",
+         importer(s) of a moved Python re-export, {} of a moved JS/TS re-export, {} Python \
+         importer(s) of a moved definition",
         callers.len(),
         bare.len(),
         typed.len(),
         reexported.len(),
-        js_reexported.len()
+        js_reexported.len(),
+        requeued.len()
     );
     // Same reason round one captures it: re-indexing these files replaces their
     // node ids, so the context strings of nodes in OTHER files that point at
@@ -899,6 +904,7 @@ fn fan_out_to_new_duplicate_definitions(
     for _ in 0..REEXPORT_FANOUT_ROUNDS {
         let mut more = resolve::importers_of_python_reexport_drift(db.conn())?;
         more.extend(js_exports::importers_of_js_reexport_drift(db.conn())?);
+        more.extend(python_modules::take_importers_to_refresh(db.conn())?);
         more.sort_unstable();
         more.dedup();
         if more.is_empty() {

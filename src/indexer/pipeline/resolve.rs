@@ -1154,12 +1154,19 @@ pub(super) fn snapshot_definition_counts(
     // target.
     conn.execute_batch(
         "CREATE TEMP TABLE cg_fanout_before AS
-           SELECT f.path AS path, n.name AS nm, f.language AS lang, COUNT(*) AS cnt
+           SELECT f.path AS path, n.name AS nm, f.language AS lang, n.type AS ty,
+                  COALESCE(n.qualified_name, n.name) AS qn,
+                  (f.language = 'python' AND EXISTS (
+                      SELECT 1 FROM nodes o
+                      WHERE o.file_id = n.file_id
+                        AND o.type IN ('function', 'method', 'class')
+                        AND o.start_line < n.start_line AND n.end_line <= o.end_line)) AS nested,
+                  COUNT(*) AS cnt
            FROM nodes n
            JOIN files f ON f.id = n.file_id
            JOIN cg_fanout_paths p ON p.path = f.path
            WHERE n.name <> '<module>'
-           GROUP BY f.path, n.name, f.language;
+           GROUP BY 1, 2, 3, 4, 5, 6;
          CREATE INDEX cg_fanout_before_k ON cg_fanout_before(path, nm, lang);",
     )?;
     conn.execute_batch(&format!(
@@ -1536,7 +1543,8 @@ pub(super) fn drop_fanout_temps(conn: &rusqlite::Connection) -> Result<()> {
          DROP TABLE IF EXISTS temp.cg_fanout_after;
          DROP TABLE IF EXISTS temp.cg_fanout_up;
          DROP TABLE IF EXISTS temp.cg_fanout_up_file;
-         DROP TABLE IF EXISTS temp.cg_shape_before;",
+         DROP TABLE IF EXISTS temp.cg_shape_before;
+         DROP TABLE IF EXISTS temp.cg_py_requeued;",
     )?;
     Ok(())
 }
@@ -1722,18 +1730,21 @@ pub(super) fn importers_of_python_reexport_drift(
 ///
 /// Two halves, both read off state that already exists rather than re-derived:
 ///
-/// * **Which names.** Those whose definition count inside this run's own paths
-///   ROSE — up only, unlike `scope_names_from_count_drift`'s symmetric
-///   difference. A name that LOST a definition needs no new edge; the surviving
-///   edges only need the relabel the post passes already do. Summed over the
-///   run (`cg_fanout_up`), except for a relative import that fell back to its
-///   module's `<module>` node, which is counted per file
-///   (`cg_fanout_up_file`): a run that defines `a` in `impl.py` and deletes
-///   another file's `a` gives `from .impl import a` a definition, and the
-///   unchanged sum hid it (D#895). Per file for every arm re-extracted 285
-///   files instead of 7 when three standard-library packages moved (0.199.0
-///   review R1), and changed no edge in the other arms' moves measured then
-///   (an absolute Python import, a JS import).
+/// * **Which names.** Those with a definition inside this run's own paths that
+///   was not there before — counted per path, node type, qualified name and,
+///   for Python, whether it is nested in a `def` or class, and the count ROSE
+///   — up only, unlike `scope_names_from_count_drift`'s
+///   symmetric difference. A name that LOST a definition needs no new edge;
+///   the surviving edges only need the relabel the post passes already do.
+///   Summed over the run until D#901, which hid a name another node of the run
+///   defined in its place: a run that defines `a` in `m.py` and deletes
+///   `other.py`'s, or turns a method `K.a` into a function `a`, left callers a
+///   rebuild binds to the new one (and D#899's moves: three standard-library
+///   packages moved, 1,292 calls only the incremental index had). The price is
+///   paid by moves: that move re-extracts 288 files instead of 7, 6.8 s
+///   against 3.6 s, where a rebuild takes 3.0 s. A relative import that fell
+///   back to its module's `<module>` node asks per file, all types together
+///   (`cg_fanout_up_file`, D#895).
 /// * **Which callers.** Files outside the run holding a `calls` edge to that
 ///   name that Phase 2e has just labelled `ambiguous`. `conf_case` assigns that
 ///   label exactly when the target name's count is >1 AND the caller's file does
@@ -1754,9 +1765,16 @@ pub(super) fn bare_name_callers_of_new_duplicates(
 ) -> Result<Vec<String>> {
     use crate::domain::{CONF_AMBIGUOUS, REL_CALLS, REL_IMPORTS, REL_REFERENCES};
 
-    // `(nm, lang)` all the way through, never `nm` alone. Counted per path and
-    // summed per pair for `cg_fanout_up`; one pair can rise in two paths, so
-    // `cg_fanout_up_file` takes DISTINCT pairs. Carrying the language is what keeps the round from firing across
+    // `(nm, lang)` all the way through, never `nm` alone. Counted per path,
+    // type, qualified name and — Python only — whether the node sits inside a
+    // `def` or class (as `module_level_definition_ids` tells it; a nested `def`
+    // keeps its bare name as qualified name): a pair rises in `cg_fanout_up`
+    // when any such row grew, so one name defined by another node of the run —
+    // a method by a function, a nested `def` by the module's own, one file's by
+    // another's in a run that moves it — rises though its count stayed (D#901;
+    // summed per pair, those rebuild-only edges stayed until the next rebuild). `cg_fanout_up_file` sums the rows per path, for
+    // the relative-import arm below. One pair can rise in two paths, so both
+    // take DISTINCT pairs. Carrying the language is what keeps the round from firing across
     // languages: a rise in the JavaScript count of `render` says nothing about a
     // Python caller of `render`, because `conf_case` joins its name count as
     // `nc.lang IS tf.language` and so can never label that pair `ambiguous` in
@@ -1768,27 +1786,37 @@ pub(super) fn bare_name_callers_of_new_duplicates(
     conn.execute_batch(
         "DROP TABLE IF EXISTS temp.cg_fanout_after;
          CREATE TEMP TABLE cg_fanout_after AS
-           SELECT f.path AS path, n.name AS nm, f.language AS lang, COUNT(*) AS cnt
+           SELECT f.path AS path, n.name AS nm, f.language AS lang, n.type AS ty,
+                  COALESCE(n.qualified_name, n.name) AS qn,
+                  (f.language = 'python' AND EXISTS (
+                      SELECT 1 FROM nodes o
+                      WHERE o.file_id = n.file_id
+                        AND o.type IN ('function', 'method', 'class')
+                        AND o.start_line < n.start_line AND n.end_line <= o.end_line)) AS nested,
+                  COUNT(*) AS cnt
            FROM nodes n
            JOIN files f ON f.id = n.file_id
            JOIN cg_fanout_paths p ON p.path = f.path
-           GROUP BY f.path, n.name, f.language;
-         CREATE INDEX cg_fanout_after_k ON cg_fanout_after(path, nm, lang);
-         DROP TABLE IF EXISTS temp.cg_fanout_up;
+           GROUP BY 1, 2, 3, 4, 5, 6;
+         CREATE INDEX cg_fanout_after_k ON cg_fanout_after(path, nm, lang);",
+    )?;
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.cg_fanout_up;
          CREATE TEMP TABLE cg_fanout_up AS
-           SELECT a.nm AS nm, a.lang AS lang
-           FROM (SELECT nm, lang, SUM(cnt) AS cnt FROM cg_fanout_after
-                 GROUP BY nm, lang) a
-           LEFT JOIN (SELECT nm, lang, SUM(cnt) AS cnt FROM cg_fanout_before
-                      GROUP BY nm, lang) b
-             ON b.nm = a.nm AND b.lang IS a.lang
+           SELECT DISTINCT a.nm AS nm, a.lang AS lang
+           FROM cg_fanout_after a
+           LEFT JOIN cg_fanout_before b
+             ON b.path = a.path AND b.nm = a.nm AND b.lang IS a.lang
+                AND b.ty IS a.ty AND b.qn IS a.qn AND b.nested IS a.nested
            WHERE a.cnt > COALESCE(b.cnt, 0);
          CREATE INDEX cg_fanout_up_k ON cg_fanout_up(nm, lang);
          DROP TABLE IF EXISTS temp.cg_fanout_up_file;
          CREATE TEMP TABLE cg_fanout_up_file AS
            SELECT DISTINCT a.nm AS nm, a.lang AS lang
-           FROM cg_fanout_after a
-           LEFT JOIN cg_fanout_before b
+           FROM (SELECT path, nm, lang, SUM(cnt) AS cnt FROM cg_fanout_after
+                 GROUP BY path, nm, lang) a
+           LEFT JOIN (SELECT path, nm, lang, SUM(cnt) AS cnt FROM cg_fanout_before
+                      GROUP BY path, nm, lang) b
              ON b.path = a.path AND b.nm = a.nm AND b.lang IS a.lang
            WHERE a.cnt > COALESCE(b.cnt, 0);
          CREATE INDEX cg_fanout_up_file_k ON cg_fanout_up_file(nm, lang);",
@@ -1816,7 +1844,16 @@ pub(super) fn bare_name_callers_of_new_duplicates(
          CROSS JOIN files tf ON tf.id = tgt.file_id AND tf.language IS u.lang
          CROSS JOIN edges e ON e.target_id = tgt.id
                            AND e.relation IN ('{REL_CALLS}', '{REL_REFERENCES}')
-                           AND e.confidence = '{CONF_AMBIGUOUS}'
+                           -- A Python call through an imported module name
+                           -- (`m.a()`, `\"q\":\"module\"`) binds every
+                           -- same-named node by name, as a bare call does, but
+                           -- an import of the name vouches for one of them
+                           -- (`inferred`), so it is never `ambiguous` while it
+                           -- has one candidate: a rebuild adds the new one
+                           -- beside it (D#901).
+                           AND (e.confidence = '{CONF_AMBIGUOUS}'
+                                OR (e.relation = '{REL_CALLS}'
+                                    AND e.metadata LIKE '%\"q\":\"module\"%'))
          CROSS JOIN nodes src ON src.id = e.source_id
          CROSS JOIN files f ON f.id = src.file_id
          WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)

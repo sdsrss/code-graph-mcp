@@ -9498,28 +9498,40 @@ fn an_ordinary_edit_does_not_drag_callers_into_a_fanout_round() {
         "an edit that adds no same-name definition must not re-extract the caller"
     );
 
-    // Nor does one run moving the definition to another file: the by-name pool
-    // keeps two `helper`s, so the callers are counted over the run, not per
-    // file. Per file, moving three standard-library packages re-extracted 285
-    // files instead of 7 and took 6.60 s against 3.45 s (0.199.0 review R1).
+    // A run moving the definition to another file DOES re-extract it (D#901,
+    // reversing 0.199.0's choice): the by-name pool still has two `helper`s,
+    // but which of them a rebuild binds is ranked by path, so the moved one
+    // can win or lose against the other. Counted over the run, three moved
+    // standard-library packages left 1,292 calls only the incremental index
+    // had (D#899); counted per file, 288 files are re-extracted instead of 7
+    // and the run takes 6.8 s against 3.6 s, a rebuild 3.0 s.
     fs::remove_file(src.join("a.py")).unwrap();
     fs::write(src.join("e.py"), "def helper():\n    pass\n").unwrap();
     run_incremental_index(&db, project_dir.path(), None, None).unwrap();
-    assert_eq!(
-        node_ids_of("src/b.py"),
-        b_before,
-        "a definition moving between files must not re-extract the bare-name caller"
+    let b_moved = node_ids_of("src/b.py");
+    assert_ne!(
+        b_moved, b_before,
+        "a definition moving between files re-extracts the bare-name caller (D#901)"
     );
 
-    // Contrast arm, so the assertion above cannot pass by the round being dead:
-    // a THIRD `helper` appears, and now b.py must be re-extracted.
+    // An ordinary edit of the moved file still leaves the caller alone.
+    fs::write(src.join("e.py"), "def helper():\n    return 2\n").unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        node_ids_of("src/b.py"),
+        b_moved,
+        "an edit that adds no same-name definition must not re-extract the caller"
+    );
+
+    // Contrast arm, so the assertions of no round cannot pass by the round
+    // being dead: a THIRD `helper` appears, and now b.py must be re-extracted.
     fs::write(src.join("d.py"), "def helper():\n    pass\n").unwrap();
     run_incremental_index(&db, project_dir.path(), None, None).unwrap();
     assert_ne!(
         node_ids_of("src/b.py"),
-        b_before,
+        b_moved,
         "a new same-name definition must re-extract the bare-name caller — if this still \
-         matches, the arm above proves nothing"
+         matches, the arms above prove nothing"
     );
 }
 
@@ -14802,7 +14814,8 @@ fn an_incremental_run_leaves_no_fanout_tables() {
         db.conn()
             .prepare(
                 "SELECT name FROM sqlite_temp_master
-                 WHERE name LIKE 'cg_fanout%' OR name LIKE 'cg_shape_before%'",
+                 WHERE name LIKE 'cg_fanout%' OR name LIKE 'cg_shape_before%'
+                    OR name LIKE 'cg_py_requeued%'",
             )
             .unwrap()
             .query_map([], |r| r.get(0))
@@ -14816,6 +14829,16 @@ fn an_incremental_run_leaves_no_fanout_tables() {
     fs::write(project.path().join("d.py"), "def helper():\n    pass\n").unwrap();
     run_incremental_index(&db, project.path(), None, None).unwrap();
     assert_eq!(temps(), Vec::<String>::new(), "after a round");
+    // D#901: an import Phase 0 cannot restore as it was records its file.
+    fs::write(project.path().join("e.py"), "from c import helper\n").unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    fs::write(
+        project.path().join("c.py"),
+        "def helper():\n    pass\n\n\nclass K:\n    def helper(self):\n        pass\n",
+    )
+    .unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert_eq!(temps(), Vec::<String>::new(), "after a requeued import");
 }
 
 // D#517: an `__init__.py` that appears or vanishes makes its directory a
@@ -19646,4 +19669,300 @@ fn a_python_from_import_binds_no_def_nested_in_a_function() {
         has("user3.py.<module> --imports--> pkg/impl.py.tag"),
         "{edges:#?}"
     );
+}
+
+/// Every edge as the D#893 fuzz harness compares it: relation, both ends
+/// (path, qualified name, type), confidence and metadata, duplicates kept.
+fn edge_rows(db: &Database) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT e.relation || ' | ' || sf.path || ':' || COALESCE(sn.qualified_name, sn.name) \
+                 || ':' || sn.type || ' | ' || tf.path || ':' \
+                 || COALESCE(tn.qualified_name, tn.name) || ':' || tn.type || ' | ' \
+                 || e.confidence || ' | ' || COALESCE(e.metadata, '') \
+             FROM edges e \
+             JOIN nodes sn ON sn.id = e.source_id JOIN files sf ON sf.id = sn.file_id \
+             JOIN nodes tn ON tn.id = e.target_id JOIN files tf ON tf.id = tn.file_id",
+        )
+        .unwrap();
+    let mut rows: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// One D#901 case: a label, a tree, and the steps applied to it.
+type D901Case<'a> = (
+    &'a str,
+    &'a [(&'a str, &'a str)],
+    &'a [&'a [(&'a str, Option<&'a str>)]],
+);
+
+/// D#901 cases: a tree, then one update per step (None deletes); every edge
+/// must equal a fresh index of the result. Each case runs twice: through
+/// `run_incremental_index` (the CLI and the server's startup check) and through
+/// `apply_file_refreshes` with the step's paths as one batch (the server's
+/// query-time refresh, as `resync_stale_files` hands them over). Collects every
+/// case's failure before asserting.
+fn assert_d901_cases(cases: &[D901Case]) {
+    let mut failures = Vec::new();
+    for via_refresh in [false, true] {
+        assert_d901_cases_via(cases, via_refresh, &mut failures);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+fn assert_d901_cases_via(cases: &[D901Case], via_refresh: bool, failures: &mut Vec<String>) {
+    for (label, before, steps) in cases {
+        let (project, _d, db) = fresh_index_of(before);
+        let mut tree: Vec<(String, String)> = before
+            .iter()
+            .map(|(p, b)| (p.to_string(), b.to_string()))
+            .collect();
+        for step in *steps {
+            for (path, body) in *step {
+                tree.retain(|(p, _)| p != path);
+                let abs = project.path().join(path);
+                match body {
+                    Some(b) => {
+                        fs::create_dir_all(abs.parent().unwrap()).unwrap();
+                        fs::write(&abs, b).unwrap();
+                        tree.push((path.to_string(), b.to_string()));
+                    }
+                    None => fs::remove_file(&abs).unwrap(),
+                }
+            }
+            if via_refresh {
+                let (mut drop_rows, mut reindex) = (Vec::new(), Vec::new());
+                for (path, _) in *step {
+                    match plan_file_refresh(&db, project.path(), path, RefreshScope::IncludeNew)
+                        .unwrap()
+                    {
+                        FileRefresh::Fresh => {}
+                        FileRefresh::DropStaleRow => drop_rows.push(path.to_string()),
+                        FileRefresh::Reindex(hash) => reindex.push((path.to_string(), hash)),
+                    }
+                }
+                apply_file_refreshes(&db, project.path(), &drop_rows, &reindex, None).unwrap();
+            } else {
+                run_incremental_index(&db, project.path(), None, None).unwrap();
+            }
+        }
+        let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+        let (_p2, _d2, control) = fresh_index_of(&files);
+        let (got, want) = (edge_rows(&db), edge_rows(&control));
+        if got != want {
+            let only = |a: &[String], b: &[String]| -> Vec<String> {
+                a.iter().filter(|x| !b.contains(x)).cloned().collect()
+            };
+            let path = if via_refresh {
+                "refresh"
+            } else {
+                "incremental run"
+            };
+            failures.push(format!(
+                "{label} ({path}):\n    incremental only {:#?}\n    rebuild only {:#?}",
+                only(&got, &want),
+                only(&want, &got)
+            ));
+        }
+    }
+}
+
+/// D#901 (1): a run moves an unchanged file's Python import to another
+/// target — the module it names stops defining the name, so the import falls
+/// back — and the file's bare calls of that name, pruned while the import
+/// pointed elsewhere, must come back as a rebuild has them. Reduced from the
+/// D#893 fuzz (seeds 1749, 1870).
+#[test]
+fn d901_an_import_moved_by_a_run_restores_its_files_pruned_calls() {
+    let views = "from other import b\n\ndef go_p(b):\n    return b()\n";
+    let fl = "from app.sub.impl import a as b\n\ndef go_a():\n    return a()\n\n\
+              def go_local():\n    from other import a as b\n    return b()\n";
+    assert_d901_cases(&[
+        (
+            "the import falls back by name; the parameter's call was pruned",
+            &[
+                ("other.py", "def b():\n    return 3\n"),
+                ("app/sub/impl.py", "def b():\n    return 2\n"),
+                ("app/views.py", views),
+            ],
+            &[&[("other.py", Some(""))]],
+        ),
+        (
+            "a renamed import of a nested def falls back; the bare call was pruned",
+            &[
+                ("app/m.py", "def a():\n    return 9\n"),
+                (
+                    "other.py",
+                    "def outer_a():\n    def a():\n        return 1\n    return a\n",
+                ),
+                (
+                    "app/sub/impl.py",
+                    "class K:\n    def a(self):\n        return 1\n",
+                ),
+                ("app/fl.py", fl),
+            ],
+            &[&[("other.py", Some(""))]],
+        ),
+    ]);
+}
+
+/// D#901 (1): an import restored onto the same-named node of its re-indexed
+/// target file must bind what a rebuild binds there — every node of the name
+/// the module now has (a method beside the function, seeds 1755, 1854, 2634),
+/// and not a nested def a fallback would not choose (seed 1621).
+#[test]
+fn d901_a_restored_import_binds_what_a_rebuild_binds() {
+    let with_method = "def a():\n    return 0\n\nclass K:\n    def a(self):\n        return 1\n";
+    assert_d901_cases(&[
+        (
+            "the module gains a same-named method",
+            &[
+                ("app/n.py", "def a():\n    return 1\n"),
+                ("app/fl.py", "from app.n import a\n"),
+            ],
+            &[&[("app/n.py", Some(with_method))]],
+        ),
+        (
+            "a relative import's module gains a same-named method",
+            &[
+                ("app/sub/__init__.py", "from .impl import a\n"),
+                ("app/sub/impl.py", "def a():\n    return 7\n"),
+            ],
+            &[&[("app/sub/impl.py", Some(with_method))]],
+        ),
+        (
+            "the imported call follows",
+            &[
+                ("app/n.py", "def a():\n    return 2\n"),
+                ("app/rev.py", "from app.n import a\n\na()\n"),
+            ],
+            &[&[("app/n.py", Some(with_method))]],
+        ),
+        (
+            "a fallback-bound import's def becomes nested",
+            &[
+                ("app/n.py", "def b():\n    return 4\n"),
+                ("other.py", ""),
+                (
+                    "app/views.py",
+                    "from other import b\n\ndef go_local():\n    from app.n import a as b\n    return b()\n",
+                ),
+                ("app/fl.py", "def b():\n    return 5\n"),
+            ],
+            &[&[(
+                "app/n.py",
+                Some("def outer_b():\n    def b():\n        return 1\n    return b\n"),
+            )]],
+        ),
+    ]);
+}
+
+/// D#901 (2): a run that replaces a name's definition by another of the same
+/// name — a method by a function, a function by a method, one file's by
+/// another's — leaves the name's count where it was, and the fan-out round,
+/// which asked only whether the count rose, re-extracted none of the files a
+/// rebuild binds differently (seeds 1213, 2012; the third is D#901's own).
+#[test]
+fn d901_a_same_name_replacement_reaches_its_callers() {
+    let k = "class K:\n    def a(self):\n        return 1\n";
+    assert_d901_cases(&[
+        (
+            "an import parked on the sentinel; a method becomes a function",
+            &[
+                ("app/m.py", k),
+                ("tests/helpers.py", ""),
+                ("use.py", "from tests.helpers import a\n"),
+            ],
+            &[&[("app/m.py", Some("def a():\n    return 9\n"))]],
+        ),
+        (
+            "a member call; a function becomes a method nearer the caller",
+            &[
+                ("other.py", "def a():\n    return 9\n"),
+                ("tests/helpers.py", k),
+                ("app/fl.py", "m.a()\n"),
+            ],
+            &[&[("other.py", Some(k))]],
+        ),
+        (
+            "one run adds the name in one file and deletes it in another",
+            &[
+                ("other.py", "def a():\n    return 2\n"),
+                ("app/sub/impl.py", "def a():\n    return 3\n"),
+                ("app/views.py", "def go():\n    return a()\n"),
+            ],
+            &[&[
+                ("other.py", None),
+                ("app/m.py", Some("def a():\n    return 1\n")),
+            ]],
+        ),
+    ]);
+}
+
+/// D#901 (4): `m.a()` through an imported module binds every `a` by name
+/// beside the one an import of `a` vouches for (`inferred`); a run that adds
+/// another `a` gives a rebuild a second, `ambiguous` edge. The fan-out round
+/// looked only at callers already `ambiguous`.
+#[test]
+fn d901_a_module_call_reaches_a_new_namesake() {
+    let base: &[(&str, &str)] = &[
+        ("app/__init__.py", ""),
+        ("app/m.py", "def a():\n    return 1\n"),
+    ];
+    let with = |qual: &'static str| -> Vec<(&'static str, &'static str)> {
+        let mut t: Vec<(&str, &str)> = base.to_vec();
+        t.push(("app/qual.py", qual));
+        t
+    };
+    let renamed =
+        with("from app import m\nfrom app.m import a as b\n\n\ndef go():\n    return m.a()\n");
+    let plain = with("from app import m\nfrom app.m import a\n\n\ndef go():\n    return m.a()\n");
+    let added: &[&[(&str, Option<&str>)]] = &[&[("app/n.py", Some("def a():\n    return 2\n"))]];
+    assert_d901_cases(&[
+        ("a renamed import of the name", &renamed, added),
+        ("a plain import of the name", &plain, added),
+    ]);
+}
+
+/// D#901 (2): a nested `def a` that becomes the module's own `def a` keeps its
+/// type and qualified name, so the fan-out round saw no new definition; but an
+/// import, its by-name fallback and a bare call reach only a module-level
+/// `def` (`module_level_definition_ids`), and a rebuild binds the new one
+/// (seeds 299, 862 of the final fuzz).
+#[test]
+fn d901_a_nested_def_made_module_level_reaches_its_callers() {
+    let nested = "def outer_a():\n    def a():\n        return 1\n    return a\n";
+    assert_d901_cases(&[
+        (
+            "an import parked on the sentinel",
+            &[
+                ("app/m.py", nested),
+                (
+                    "app/views.py",
+                    "def go_local():\n    from other import a as a\n    return a()\n",
+                ),
+                ("other.py", ""),
+            ],
+            &[&[("app/m.py", Some("def a():\n    return 3\n"))]],
+        ),
+        (
+            "an import bound to another file's module-level namesake",
+            &[
+                ("app/__init__.py", ""),
+                ("app/n.py", nested),
+                (
+                    "app/views.py",
+                    "from app import a\n\ndef go_a():\n    return a()\n",
+                ),
+                ("tests/helpers.py", "def a():\n    return 9\n"),
+            ],
+            &[&[("app/n.py", Some("def a():\n    return 3\n"))]],
+        ),
+    ]);
 }
