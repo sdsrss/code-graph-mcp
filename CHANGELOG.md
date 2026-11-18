@@ -1,5 +1,95 @@
 # Changelog
 
+## 0.198.0
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 141 → 142
+because the stored graph changes for unchanged source: Python calls through a
+renamed import (below). The MCP server rebuilds the index when it starts.
+From the command line, a query answers from the old index with "This index
+was built by an older code-graph (index v141, this binary v142): answers come
+from it until it is rebuilt — run: code-graph-mcp reindex", and the first
+`incremental-index` prints "Index version mismatch (stored v141 ≠ binary
+v142): clearing + rebuilding". 0.197.0 answers queries from an index this
+version wrote but will not write to it: its `incremental-index` exits 1 and
+says to delete `.code-graph/index.db*` first. The embedding runtime moves to
+candle 0.11.1 (below): embedding took 48.8–52.0 s against 101.0–103.0 s
+and kept 5.8 cores busy on average against 2.1. To pin the binary back:
+`npm i -g @sdsrs/code-graph@0.197.0` (or, from source, `cargo install
+--locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.197.0
+--features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The
+plugin's scripts are unchanged.
+
+### fix: a Python call through `from m import a as b` binds `a` of module `m`
+
+`b()` after `from m import a as b` was recorded as a call to `b` and bound
+by name: to nothing when no project function is called `b`, else to
+project functions called `b`. It is now a call to `a` in the files of module `m`,
+through a package's `__init__.py` re-export, at `inferred` confidence; a
+module outside the project gives no edge. Only a name the module binds
+through one such import and nothing else counts: a `def`, `class`,
+assignment, loop or `with` target, another import of the name, a function's
+`global` of it, or a parameter or local of the calling function keeps the
+by-name resolution.
+
+Measured on four projects, each indexed by 0.197.0 and by this version from
+identical copies, call pairs compared by caller and callee:
+
+- CPython 3.14's standard library (569 files): 99,552 → 99,536 pairs.
+  27 added, all `inferred`, each to the definition its import names
+  (`from operator import index as _index` in `random.py` and
+  `_pydatetime.py`, `from collections import namedtuple as _namedtuple` in
+  `difflib.py`). 43 removed, 8 `inferred` and 35 `ambiguous`: 42 had bound
+  the alias to another function of that name (`from math import log as _log`
+  made `Random.gauss` call `Logger._log` and `IMAP4._log`;
+  `from email.base64mime import body_encode as encode_base64` made
+  `SMTP.auth` call `email.encoders.encode_base64`). The 43rd,
+  `ntpath._readlink_deep` → `genericpath.islink`, is the function the call
+  runs where `nt` has no `_path_islink` (Not covered).
+- nltk 3.9.2 (358 files): 8 added, all `inferred`, each to the definition
+  its import names; none removed.
+- flask (d086db85): no pair changed.
+- A private application (1,255 Python files): 35 added, each to the
+  definition its import names; 1 removed, which had bound
+  `load_active_config` to another function of that name.
+
+### deps: candle 0.9.2 → 0.11.1, tokenizers 0.22 → 0.23
+
+candle 0.11.1 depends on zip 9.6.1 instead of 7.2.0. `cargo audit`
+(0.22.2) reports 8 vulnerabilities against 0.197.0's lock, all in zip 7.2.0,
+and none against this one; CI had ignored the 8 (code-graph-mcp loads the
+model from safetensors files and reaches none of the zip code they concern)
+and no longer ignores any advisory.
+
+The same 600 of this repository's embedding inputs (1,021 characters on
+average) embedded by both versions: no vector is bit-identical; every pair's
+cosine similarity is 1.000000000 to nine decimals, and no component differs
+by more than 2.086e-07; each snippet's 10 nearest neighbours among the 600
+are the same, in the same order, for 600 of 600. On a 12-core machine,
+three alternating runs each took 48.8–52.0 s against 101.0–103.0 s; one
+more run each used 282.0 s of CPU time against 216.2 s (5.8 cores busy on
+average against 2.1). These timings run the embedding code alone, model
+load included; code-graph-mcp does not limit the threads it uses.
+
+### Not covered
+
+- A call written directly in a class body is judged as the module's: a class
+  attribute named like the alias does not stop it binding to the import.
+- Star imports are not read, so a name a star import also binds is judged
+  by the renamed import alone. `ntpath.py` binds `islink` with
+  `from genericpath import *`, then inside `try` with
+  `from nt import _path_islink as islink`: the call now binds only `nt`'s,
+  outside the project, and loses its edge to `genericpath.islink`, which
+  runs where `nt` has no `_path_islink`. In a two-module test,
+  `from m import b as a` followed by `from n import *` (which defines `a`)
+  bound `a()` to `m.b`, which `n.a` replaces at run time; 0.197.0 bound it by
+  name to `m.a` and `n.a`.
+- A renamed import of a module-level variable (`handler = make()`, then
+  `from m import handler as h; h()`) gives no edge: the index holds no node
+  for a Python variable.
+- A renamed import inside a function (`def f(): from m import a as b`)
+  keeps the by-name resolution.
+
 ## 0.197.0
 
 **Upgrading: no index rebuild; restart a session after its index files are replaced.** `INDEX_VERSION` stays 141.

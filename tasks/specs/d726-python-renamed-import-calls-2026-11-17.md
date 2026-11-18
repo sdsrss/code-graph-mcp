@@ -1,6 +1,6 @@
 # 2026-11-17 D#726：Python 经改名导入的调用绑定到导入的那个定义
 
-状态：**已实现，分支 `d726-d884`，待与 D#884 一起评审、发 0.198.0**。授权：用户 2026-11-17“把剩余工作都做了，授权清理和发版”。
+状态：**已实现，分支 `d726-d884`，变异与四个语料差分已做，待发版前评审、发 0.198.0**。授权：用户 2026-11-17“把剩余工作都做了，授权清理和发版”。
 
 ## 问题（2026-11-03 实测，见 D#726 延期条目）
 
@@ -49,3 +49,17 @@ JS 的改名导入调用（`member::js_renamed_import_call`）被记成导出名
 - RED（385b1d9c 的 archive 副本只放入新测试）：`test_python_renamed_import_binds_the_export` 失败于 go_date / go_ci / go_h 都是 `[]`；`test_python_renamed_import_changes_match_rebuild` 失败于不空断言（`[]` 对 `["app/pkg/impl.py:function:load"]`）。GREEN：两个都通过。
 - 全量 `cargo test --no-default-features --no-fail-fast`：2508 通过、2 失败（上面两个守卫的预期变化），更新后 `edge_coverage` 14/14、`index_version_guard` 7/7。
 - 语料差分（daagu f32defc5 的 archive 副本，1,487 个文件；0.197.0 代码 cb8b7096 nodef md5 ed57c670 对本分支 nodef md5 d47ac9a2）：Python calls 边 54,445 → 54,479；新增 35 条全部带 `pyimp`，逐条核对目标文件就是导入语句的模块对应的文件且在模块顶层定义了该名（35/35）；删掉 1 条：`run_stock_picker.py main -> config.py load_active_config`，源码是 `load_active_config_standalone as load_active_config`，旧边按名字绑到了另一个同名函数，现在绑到 `data_providers.load_active_config_standalone`。
+- 语料差分（0.198.0 前；0.197.0 nodef 源码构建 12feb709 md5 77d75f2e 对本分支 nodef md5 2f7315ff，各自 `incremental-index --no-embed`，按 caller/callee 比较 calls 对，`/var/tmp/agent-tmp-d726/c2/`）：
+  - CPython 3.14 标准库副本（569 个 .py，按 stdlib 语料的打包方法）：99,552 → 99,536 对；新增 27 对全部 `pyimp`、`inferred`，逐条 grep 导入行核对（`_strptime` 的 `re_compile/re_sub/re_escape`、`collections` 的 `_itemgetter/_recursive_repr`、`random` 与 `_pydatetime` 的 `_index`、`smtplib` 的 `encode_base64` 等）都指向导入所指的定义；删掉 43 对（8 `inferred`、35 `ambiguous`）：42 对是旧的按名错边（`math`/`_thread`/`itertools` 的 C 模块函数被改名后绑到项目里同名的 `Logger._log`、`Lock`、`Barrier._count` 等；`smtplib` 的 `encode_base64` 原绑 `email.encoders`），1 对是 `ntpath._readlink_deep → genericpath.islink`：`ntpath.py:23` 先 `from genericpath import *`，`:851` 在 try 里 `from nt import _path_islink as islink`，星号导入不读，现在只绑 `nt`（外部）→ 无边；`nt` 没有该函数时运行的正是 `genericpath.islink`。写进 CHANGELOG Not covered。
+  - nltk 3.9.2（`/usr/lib/python3/dist-packages/nltk`，358 个 .py）：新增 8 对，导入行逐条核对；删除 0。
+  - flask d086db85：无变化。
+  - daagu f32defc5（1,255 个 .py）：新增 35 对，与此前逐条核对过的 35 对集合相同；删除 1 对（同前）。
+- 版本不一致提示（flask 副本）：新二进制在 v141 索引上查询打印 "This index was built by an older code-graph (index v141, this binary v142) …"，`incremental-index` 打印 "Index version mismatch (stored v141 ≠ binary v142): clearing + rebuilding"；0.197.0 在 v142 索引上 `incremental-index` 退出 1 并提示删除 `.code-graph/index.db*`；`serve` 收到 `notifications/initialized` 后重建（日志 "Index version changed (141 → 142)"，meta 里 v 变为 142）。
+- Not covered 各条在小夹具上实测（`/var/tmp/agent-tmp-d726/fx`）：类体里 `y = x()` 在类属性 `x = 3` 下仍绑到导入；函数内的改名导入无边；模块级变量导出无边（Python 不建变量节点：标准库索引里只有 class/function/method/module 四种节点）；`from m import b as a` 后接 `from n import *`（n 定义 `a`）绑到 `m.b`，0.197.0 按名绑 `m.a` 与 `n.a`（ambiguous）。
+- 变异（`/var/tmp/agent-tmp-d726/mutate_d726.py`，git archive 副本 + 独立 target，跑 lib 里名字含 python 的 96 个测试和 `edge_coverage` 14 个）：第一次驱动脚本按 `test … FAILED` 行判死，`-q` 下没有这种行，19 个全报存活，作废重跑。19 个变异：初版测试杀死 P1（模块级 def 不阻断）、P2（global）、P3（两个改名导入）、P7（批次不延后）、P10（pending 清扫按名）、P12（不跟重导出）、P13（同时记按名调用，`python_resolution_tier_inventory_is_pinned` 杀）；P14–P19（模块级 for/with/海象/普通导入/`import … as`/赋值不算绑定）存活，补夹具后全部杀死（3b1eaa1c）。仍存活：
+  - P4（`from m import a as a` 也走改名路径）：有意的范围（同名别名留给普通导入路径）；能区分两者的输入要用到 D#298 的已知缺陷（外部包的名字按名绑到项目同名函数），不把缺陷写进测试。
+  - P5（外部模块也写 pending）：等价——同一次索引的 pending 清扫对外部模块删行（`resolve.rs:415-417`）。
+  - P6（不按节点类型过滤）：等价——Python 只建 class/function/method/module 节点，method 的限定名带类名，被 `qualified_name = name` 排除。
+  - P8（inbound 恢复按名）：恢复对带元数据的调用已按限定名过滤；补了“重导出删除且目标文件同时改动”一例仍相等，未找到能区分的输入。
+  - P9（pyimp 不豁免置信度降级）：试了一层、两层包重导出加同名函数，导入表已为目标作证，走不到豁免；保留与 JS `imp` 对称。
+  - P11（延后阶段空结果不进 pending）：未找到能区分的输入（“export 回来后重新绑上”那一例在变异下也通过）；推测调用方在模块文件改动时经由别的路径被重新解析，未核实。
