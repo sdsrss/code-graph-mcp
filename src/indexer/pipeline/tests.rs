@@ -12612,6 +12612,142 @@ fn test_python_renamed_import_changes_match_rebuild() {
     );
 }
 
+/// D#893: `from m import a as b` binds `b`, not `a`. Beside `from n import a`,
+/// a bare `a()` is `n.a`'s alone: the renamed import neither kept `m.a` from
+/// the import-contradiction prune nor vouched for it as an import of `a`.
+const D893_TREE: &[(&str, &str)] = &[
+    ("app/__init__.py", ""),
+    ("app/m.py", "def a():\n    return 1\n"),
+    ("app/n.py", "def a():\n    return 2\n"),
+    (
+        "app/views.py",
+        "from app.m import a as b\nfrom app.n import a\n\n\ndef go():\n    return a()\n\n\n\
+         def go_b():\n    return b()\n",
+    ),
+    (
+        "app/rev.py",
+        "from .n import a\nfrom .m import a as b\n\n\ndef go():\n    return a()\n",
+    ),
+    // Nothing binds `a` here: a by-name guess between two namesakes.
+    (
+        "app/only.py",
+        "from app.m import a as b\n\n\ndef go():\n    return a()\n",
+    ),
+];
+
+/// `callee confidence` of each `calls` edge out of `caller` in `path`.
+fn py_calls_with_confidence(db: &Database, path: &str, caller: &str) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT ft.path || ':' || COALESCE(nt.qualified_name, nt.name) || ' ' || e.confidence \
+             FROM edges e \
+             JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id \
+             JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id \
+             WHERE e.relation = 'calls' AND fs.path = ?1 AND ns.name = ?2 ORDER BY 1",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([path, caller], |r| r.get::<_, String>(0))
+        .unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+#[test]
+fn test_python_renamed_import_does_not_bind_its_original_name() {
+    let (_p, _d, db) = fresh_index_of(D893_TREE);
+    let want: &[(&str, &str, &[&str])] = &[
+        ("app/views.py", "go", &["app/n.py:a inferred"]),
+        ("app/views.py", "go_b", &["app/m.py:a inferred"]),
+        ("app/rev.py", "go", &["app/n.py:a inferred"]),
+        (
+            "app/only.py",
+            "go",
+            &["app/m.py:a ambiguous", "app/n.py:a ambiguous"],
+        ),
+    ];
+    let wrong: Vec<String> = want
+        .iter()
+        .filter_map(|(path, caller, callees)| {
+            let got = py_calls_with_confidence(&db, path, caller);
+            (got != *callees).then(|| format!("{path} {caller}: {got:?} (want {callees:?})"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+
+    let plain =
+        "from app.n import a\n\n\ndef go():\n    return a()\n\n\ndef go_b():\n    return 0\n";
+    for after in [
+        // The renamed import goes, with or without its caller, or binds
+        // another name.
+        vec![("app/views.py", Some(plain))],
+        vec![(
+            "app/views.py",
+            Some("from app.n import a\n\n\ndef go():\n    return a()\n"),
+        )],
+        vec![(
+            "app/views.py",
+            Some("from app.m import a as c\nfrom app.n import a\n\n\ndef go():\n    return a()\n"),
+        )],
+        // The plain import's module goes, comes back, or stops defining `a`.
+        vec![("app/n.py", None)],
+        vec![("app/n.py", Some("def a2():\n    return 2\n"))],
+        vec![("app/m.py", Some("def a2():\n    return 1\n"))],
+        vec![("app/m.py", None)],
+    ] {
+        assert_incremental_matches_rebuild(D893_TREE, &after);
+    }
+    // `n.py` first indexed after the caller: the import of `a` binds then.
+    // Last, the renamed import arrives.
+    let without_n: Vec<(&str, &str)> = D893_TREE
+        .iter()
+        .copied()
+        .filter(|(f, _)| *f != "app/n.py")
+        .collect();
+    assert_incremental_matches_rebuild(
+        &without_n,
+        &[("app/n.py", Some("def a():\n    return 2\n"))],
+    );
+    let plain_before: Vec<(&str, &str)> = D893_TREE
+        .iter()
+        .map(|&(f, b)| {
+            if f == "app/views.py" {
+                (f, plain)
+            } else {
+                (f, b)
+            }
+        })
+        .collect();
+    assert_incremental_matches_rebuild(
+        &plain_before,
+        &[(
+            "app/views.py",
+            D893_TREE
+                .iter()
+                .find(|(f, _)| *f == "app/views.py")
+                .map(|(_, b)| *b),
+        )],
+    );
+
+    // By name, a call prefers a definition outside a tests/ directory; the
+    // bind pass took the renamed import of `tests.helpers.a` as an import of
+    // `a` and bound the call there as well.
+    let (_p, _d, db) = fresh_index_of(&[
+        ("app/__init__.py", ""),
+        ("app/n.py", "def a():\n    return 2\n"),
+        ("tests/__init__.py", ""),
+        ("tests/helpers.py", "def a():\n    return 1\n"),
+        (
+            "app/only.py",
+            "from tests.helpers import a as b\n\n\ndef go():\n    return a()\n",
+        ),
+    ]);
+    assert_eq!(
+        py_calls_with_confidence(&db, "app/only.py", "go"),
+        ["app/n.py:a ambiguous"]
+    );
+}
+
 /// D#120 F1: the export renamed away. The requeued edge must not be bound by
 /// name in another file (`y.js:load`), and a later sweep must not either.
 #[test]

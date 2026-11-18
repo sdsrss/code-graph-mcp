@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.199.0
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 142 → 143
+because the stored graph changes for unchanged source: Python calls in a
+file with a renamed import (below). The MCP server rebuilds the index when
+it starts. From the command line, a query answers from the old index with
+"This index was built by an older code-graph (index v142, this binary
+v143): answers come from it until it is rebuilt — run: code-graph-mcp
+reindex", and the first `incremental-index` prints "Index version mismatch
+(stored v142 ≠ binary v143): clearing + rebuilding". To pin the binary
+back: `npm i -g @sdsrs/code-graph@0.198.0` (or, from source, `cargo install
+--locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.198.0
+--features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
+and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The
+plugin's scripts are unchanged.
+
+### fix: `from m import a as b` no longer counts as an import of `a`
+
+In a file with `from m import a as b` and `from n import a`, a call `a()`
+bound both `m.a` and `n.a`, each at `inferred`. The passes that drop a call
+the file's imports contradict, and that label a call's confidence, asked
+whether the file imports the target, and took the renamed import as an
+import of `a`. It now counts as an import of `b` only, so `a()` binds `n.a`
+alone. Where nothing in the file binds `a`, its by-name edges are
+`ambiguous`; before, the renamed import made `m.a` `inferred` and dropped
+the others. A call of `b` that 0.198.0 left to by-name resolution, such as
+one after `from m import a as b` inside a function, binds `m.a` when `b` is
+the only name the file imports as `b`, as a call through a plain import
+does.
+
+Measured on five projects, each indexed by 0.198.0 and by this version from
+identical copies, `calls` rows compared with their confidence:
+
+- CPython 3.14's standard library (569 files): 38 rows removed, 1 added.
+  36 bound `_()` in `argparse.py`, `getopt.py` and `optparse.py`, where `_`
+  is `from gettext import gettext as _`, to `importlib/resources/_common.py`'s
+  `_` (`ambiguous`). In `_pyrepl/readline.py`, `Console(...)` lost its edge to
+  `console.Console`: the file binds `Console` to `UnixConsole` or
+  `WindowsConsole` and renames the other with `from .console import Console
+  as ConsoleType`. `random._test_generator` calls `mean()` after
+  `from statistics import stdev, fmean as mean`: it binds `statistics.fmean`
+  instead of `statistics.mean` and `NormalDist.mean`.
+- A private application (1,258 Python files): 4 removed, each a call of `X`
+  in a file that imports `X` and renames another `X` (`AIProvider as
+  AIProviderSchema`, `CL3Signal as CL3SignalModel`), bound to the renamed
+  one; 1 added, `load_active_config()` after a function-level
+  `from ... import load_active_config_standalone as load_active_config`.
+- nltk 3.9.2 (358 files), flask 3.1.0 and this repository (Rust,
+  JavaScript, Python): no row changed.
+
+### Not covered
+
+- The same shape in JavaScript and TypeScript is unchanged: with
+  `import { x as z } from './m.js'` and `import { x } from './o.js'`, or
+  `import { y } from './re.js'` where `re.js` has `export { x as y } from
+  './m.js'`, a call `x()` binds `m.x` and `o.x`, both `inferred`. An `imports`
+  edge does not record the local name of `import { x as z }`.
+- A function's renamed import counts for the whole file, as a plain import
+  does: after `def f(): from m import a as b`, a `b()` in another function,
+  where Python raises `NameError`, binds `m.a` too.
+
 ## 0.198.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 141 → 142
