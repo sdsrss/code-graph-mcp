@@ -1,5 +1,101 @@
 # Changelog
 
+## 0.201.0
+
+**Upgrading: no rebuild.** `INDEX_VERSION` stays 143: a full index holds
+the same graph as 0.200.0 (every edge, both ends, confidence and metadata
+compared on CPython 3.14's standard library, nltk 3.9.2, flask 3.1.0, this
+repository and a private application). What changes is the incremental
+update — `incremental-index`, and the MCP server's refresh, which runs the
+same code. An index an earlier version updated incrementally can still hold
+edges a rebuild does not have; they go when the files involved are indexed
+again, or all at once with `code-graph-mcp rebuild-index --confirm`.
+Moving or swapping files now takes longer (below). To pin the binary back:
+`npm i -g @sdsrs/code-graph@0.200.0`, then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The plugin's
+scripts are unchanged.
+
+### fix: a Python incremental update ends where a rebuild does in more cases
+
+An incremental update re-extracts the files that changed, and the files
+whose edges depend on them. In these cases it did not re-extract the
+dependent file, which kept its old edges until it changed itself:
+
+- An import whose target the run removed or changed. The module stopped
+  defining the name, so the import falls back to another file's
+  definition; or the name became nested in a function; or the module
+  gained a method of the same name, which a rebuild binds too. The
+  importer's calls of the name, dropped or bound because of where the
+  import used to point, stayed as they were.
+- A definition replaced by another of the same name in one run: a method
+  `K.a` by a function `a`, a nested `def a` by the module's own, or one
+  file's `a` by another's — one file deletes it and another adds it, or
+  files move. The name's count did not rise, and only a rise reached its
+  callers.
+- `m.a()` through an imported module, beside an import of `a`, when another
+  `a` is added: a rebuild binds the new one too.
+
+For example, with `go()` calling a bare `a()` and one run deleting
+`other.py`'s `a` and adding one to `app/m.py`,
+`callgraph go --min-confidence ambiguous` listed only `app/sub/impl.py`'s
+`a`; it now lists `app/m.py`'s as well, as a rebuild does.
+
+Measured with random edit sequences on small Python projects, each step's
+incremental index compared edge for edge with a fresh index of the same
+files: 497 of 4,500 sequences differed (2,090 edges in all) and now
+15 do (21 edges); with a second generator (classes, methods, star and
+conditional imports), 278 of 1,500 (1,417 edges) and now 56 (120). No
+sequence differs that did not before, and every edge that still differs
+did at the same step before.
+
+### change: moving or swapping files re-extracts more callers
+
+Because a definition that moves is now seen as new where it lands, its
+callers are re-extracted, as when one is added. This part applies to every
+language, not only Python: replaying 0.180.0 → 0.198.0 of this repository
+(Rust, JavaScript, Python) re-extracts 102 files where it re-extracted 100.
+
+In a copy of the standard library, moving `email`, `json` and `xml` into a
+new directory took 3.6 s and left 1,292 calls only the incremental index
+had and 69 only a rebuild had; it now takes 6.9 s (288 files re-extracted,
+7 before) and no call differs, where a rebuild takes 3.1 s. Swapping `shutil.py` and `tempfile.py`: 1.1 s with
+132 and 4 differing calls and 1 reference, now 3.8 s and none of them.
+Moving `nltk/corpus`: 1.2 s with 14 differing calls, now 2.2 s and none.
+In the same measurement editing one file took 0.25 s and now 0.26 s
+(median of 7), and replaying 200 commits of the private application took
+6.3 s and now 6.2 s, 0.180.0 → 0.198.0 of this repository 3.2 s and now
+3.1 s (medians of 3).
+
+### Not covered
+
+The edges above that still differ (21 and 120) include these cases, each
+reproduced with two to five files, and each in 0.200.0 too. The
+incremental index catches up when the dependent file is indexed again, or
+with `rebuild-index --confirm`:
+
+- `inherits` and `references` to a name a run adds: `class W(B)` gets no
+  edge to a class `B` added where there was none, and keeps its edge to
+  the old `B` when one is added in a file nearer to it; a decorator `@a`,
+  or a name in a value such as `REFS = [a, b]`, gets no edge to an `a` or
+  `b` added later.
+- A call on an attribute, `self.x.a()`, when a run adds a method `a` in
+  another file; and `m.a()` with no `m` imported as a module, beside
+  `from other import a as c`, bound to `other.py`'s method `a`, when a run
+  adds another method `a` nearer to it.
+- A run that deletes a definition: a bare `a()` that had no edge while `a`
+  had three definitions (functions or methods) still has none when one is
+  deleted, where a rebuild binds the other two `ambiguous`.
+- A run that adds a definition beside an import. With
+  `from lib.k import a` and `lib/k.py` defining a function `a` and a method
+  `A.a`, adding an `a` to another file in the caller's directory leaves the
+  call `a()`'s two edges, where a rebuild has none. That is a gap of the
+  full index itself: it gives this call no edge at all, and both edges when
+  the other `a` is in a directory farther away.
+- An import through a re-export (`app/sub/__init__.py` importing `a` from
+  `impl.py`, which imports it from `other.py`) when a run adds `a` at the
+  end of the chain, or adds a method `a` to `impl.py` beside its function.
+
 ## 0.200.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 142 → 143
