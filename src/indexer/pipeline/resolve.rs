@@ -864,13 +864,6 @@ pub(super) fn resolve_pending_calls_touching(
     Ok(edges_added)
 }
 
-/// The name an `imports` edge `ie` to node `itn` binds in the importing file,
-/// as SQL: the name a renamed JS re-export's edge imports beside a target of
-/// another name (D#740), else the name a Python `from m import a as b` binds
-/// (`b`, D#893), else the target's own.
-const IMPORT_EDGE_NAME: &str = "COALESCE(json_extract(ie.metadata, '$.imported'), \
-     json_extract(ie.metadata, '$.as'), itn.name)";
-
 /// Positively resolve bare-name `calls` edges to the node an explicit import in
 /// the caller's file binds them to. Runs once after all call edges exist (post
 /// Phase-2 + pending sweep), immediately before
@@ -918,18 +911,16 @@ fn build_imports_temp(conn: &rusqlite::Connection, with_name: bool) -> Result<()
     use crate::domain::REL_IMPORTS;
     conn.execute_batch("DROP TABLE IF EXISTS temp.cg_imports;")?;
     conn.execute(
-        &format!(
-            "CREATE TEMP TABLE cg_imports AS
+        "CREATE TEMP TABLE cg_imports AS
          SELECT mn.file_id AS fid,
-                {IMPORT_EDGE_NAME} AS nm,
+                COALESCE(json_extract(ie.metadata, '$.imported'), itn.name) AS nm,
                 ie.target_id AS tid,
                 json_extract(ie.metadata, '$.attr') AS attr,
                 json_extract(ie.metadata, '$.python_module') AS module
          FROM edges ie
          JOIN nodes mn  ON mn.id  = ie.source_id
          JOIN nodes itn ON itn.id = ie.target_id
-         WHERE ie.relation = ?1"
-        ),
+         WHERE ie.relation = ?1",
         rusqlite::params![REL_IMPORTS],
     )?;
     conn.execute_batch("CREATE INDEX cg_imports_fid_tid ON cg_imports(fid, tid);")?;
@@ -2254,10 +2245,11 @@ pub(super) fn bind_calls_to_imported_targets(
     let conn = db.conn();
     conn.execute_batch("DROP TABLE IF EXISTS temp.cg_unique_imports;")?;
     conn.execute(
-        &format!(
-            "CREATE TEMP TABLE cg_unique_imports AS
+        "CREATE TEMP TABLE cg_unique_imports AS
          SELECT mn.file_id AS import_file,
-                {IMPORT_EDGE_NAME} AS import_name,
+                -- the name imported, which a renamed JS re-export's edge
+                -- carries beside a target of another name (D#740)
+                COALESCE(json_extract(ie.metadata, '$.imported'), itn.name) AS import_name,
                 MIN(itn.id) AS import_target_id
          FROM edges ie
          JOIN nodes mn  ON mn.id  = ie.source_id
@@ -2267,14 +2259,8 @@ pub(super) fn bind_calls_to_imported_targets(
            AND itf.path <> '<external>'
            -- a `P.X()` call's synthetic import binds no bare `X()` (D#518)
            AND json_extract(ie.metadata, '$.attr') IS NULL
-           -- nor does a Python `from m import a as b`: a call of `b` it binds
-           -- is D#726's `pyimp` call, and a bare one has a by-name edge only
-           -- while some unrelated `b` exists, so binding through it left an
-           -- edge a rebuild lacks once that `b` went (0.199.0 review R1)
-           AND json_extract(ie.metadata, '$.as') IS NULL
          GROUP BY 1, 2
-         HAVING COUNT(DISTINCT itn.id) = 1"
-        ),
+         HAVING COUNT(DISTINCT itn.id) = 1",
         rusqlite::params![REL_IMPORTS],
     )?;
     conn.execute_batch(
@@ -2525,14 +2511,11 @@ pub(super) fn prune_import_contradicted_call_edges(
                     AND i.attr IS NULL
               )
               -- ... and does NOT import THIS target (so it is contradicted)
-              -- under its name: a Python `from m import a as b` binds `b`,
-              -- and says nothing of a bare `a()` (D#893)
               AND NOT EXISTS (
                   SELECT 1 FROM cg_imports i2
                   WHERE i2.fid = sn.file_id
                     AND i2.tid = e.target_id
                     AND i2.attr IS NULL
-                    AND (i2.nm = tn.name OR i2.module IS NULL)
               )";
     let mut removed = 0;
     for predicate in [PRUNE_PREDICATE, FIELD_CALL_PRUNE_PREDICATE] {
@@ -2724,9 +2707,6 @@ pub(super) fn classify_edge_confidence(db: &Database, scope: &PostPassScope) -> 
                           SELECT 1 FROM cg_imports i
                           WHERE i.fid = src.file_id
                             AND i.tid = tgt.id
-                            -- a Python import vouches for the name it binds
-                            -- (`as`, D#893)
-                            AND (i.nm = tgt.name OR i.module IS NULL)
                             -- a `P.X()` call's synthetic import vouches only
                             -- for that call (D#518)
                             AND (i.attr IS NULL
