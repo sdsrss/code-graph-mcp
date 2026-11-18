@@ -3,62 +3,55 @@
 ## 0.200.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 142 → 143
-because the stored graph changes for unchanged source: Python calls of a name
-the file also imports under another name (below). The MCP server rebuilds the
-index when it starts. From the command line, a query answers from the old
-index with "This index was built by an older code-graph (index v142, this
-binary v143): answers come from it until it is rebuilt — run: code-graph-mcp
-reindex", and the first `incremental-index` prints "Index version mismatch
-(stored v142 ≠ binary v143): clearing + rebuilding". 0.199.0 answers queries
-from an index this version wrote but will not write to it: its
-`incremental-index` exits 1 and says to delete `.code-graph/index.db*` first.
-To pin the binary back: `npm i -g @sdsrs/code-graph@0.199.0`, then delete
-`~/.cache/code-graph/bin/code-graph-mcp` and set `CODE_GRAPH_NO_AUTO_UPDATE=1`,
-as described under 0.171.0. The plugin's scripts are unchanged.
+because the stored graph changes for unchanged source: the confidence of
+Python calls of a name the file also imports under another name (below). The
+MCP server rebuilds the index when it starts. From the command line, a query
+answers from the old index with "This index was built by an older code-graph
+(index v142, this binary v143): answers come from it until it is rebuilt —
+run: code-graph-mcp reindex", and the first `incremental-index` prints "Index
+version mismatch (stored v142 ≠ binary v143): clearing + rebuilding". 0.199.0
+answers queries from an index this version wrote but will not write to it:
+its `incremental-index` exits 1 and says to delete `.code-graph/index.db*`
+first. To pin the binary back: `npm i -g @sdsrs/code-graph@0.199.0`, then
+delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The plugin's
+scripts are unchanged.
 
-### fix: a Python renamed import no longer binds calls of the name it renames
+### fix: a Python renamed import no longer vouches for calls of the name it renames
 
 `from m import a as b` binds `b` in the importing file, not `a`. Beside
-`from n import a`, a bare `a()` was bound to both `m.a` and `n.a`, both
-`inferred`: the passes that bind, prune and label a bare call by its file's
-imports read the renamed import as an import of `a`, so it kept `m.a` from
-the pass that removes calls an import contradicts and vouched for it as an
-imported target. They no longer read it, and `a()` binds `n.a` alone.
+`from n import a`, a bare `a()` had edges to both `m.a` and `n.a`, both
+`inferred`: the confidence pass counted the renamed import as an import of
+`m.a` that vouched for the call. It no longer counts a renamed import for a
+bare call or a bare type mention (`x: A`) of the definition it imports, so
+the edge to `m.a` is `ambiguous` whenever `a` has another definition.
+`callgraph`, `impact` and the MCP call-graph tools leave it out by default:
+`callgraph go` lists `n.a` and says one ambiguous edge is hidden, where it
+listed both, and `impact a --file m.py` no longer counts `go` as a caller.
+`refs` still lists the call, marked `~ambiguous`. A qualified `m.a()` and a
+call through the alias (`b()`) keep their label. Which edges exist does not
+change.
 
-In a private application (1,258 Python files) 4 wrong `calls` edges are gone
-— `AIProvider(...)` was also bound to the schema class imported as
+In a private application (1,258 Python files), 8 edges go from `inferred`
+to `ambiguous`, each of them wrong on reading the source: 4 `calls` —
+`AIProvider(...)` to the schema class imported as
 `AIProvider as AIProviderSchema` beside the model's `AIProvider`, and
 `CL3Signal(...)` to the model imported as `CL3SignalModel` beside the type's
-`CL3Signal` — and 4 `references` edges to those classes and to one imported
-as `DataSource as ProviderDataSource` go from `inferred` to `ambiguous`.
-CPython 3.14's standard library (569 files), nltk 3.9.2 (358 files),
-flask 3.1.0 and this repository, each indexed by 0.199.0 and by this
-version, give the same edges of every relation, with the same confidence
-and metadata.
-
-With no other import of `a`, a bare `a()` is now the by-name guess it is
-without the renamed import: with two definitions of `a` it has two
-`ambiguous` edges, where 0.199.0 kept `m.a` alone at `inferred`. Calls of
-`b` are bound and labelled as in 0.199.0 (measured for a module-level renamed
-import, one inside a function, one in a `try:` block, and a parameter named
-`b`).
+`CL3Signal` — and 4 `references` to those classes and to one imported as
+`DataSource as ProviderDataSource`. CPython 3.14's standard library
+(569 files), nltk 3.9.2 (358 files), flask 3.1.0 and this repository give
+the same edges, confidence and metadata as 0.199.0, and all five projects
+the same edges.
 
 ### Not covered
 
-- When a module stops defining a name another file imports from it, so that
-  import falls back to binding that name's definitions in other files, an
-  incremental run can leave the importing file without calls a rebuild binds
-  to those definitions, as in 0.199.0. A renamed import of the same name in
-  that file used to hide some of these. On 4,500 random edit sequences over
-  small Python projects, comparing an incremental index with a rebuild after
-  every step, 0.199.0 differed on 525 and this version on 501; the 21 this
-  version alone differs on all differ the same way on 0.199.0 once their
-  renamed imports are removed. A rebuild (`code-graph-mcp rebuild-index
-  --confirm`) gives the rebuilt answer.
+- `from m import a as _a` followed by `a = _a` makes a bare `a()` call
+  `m.a`; its edge is now `ambiguous` (it was `inferred`) when `a` has another
+  definition.
 - JavaScript and TypeScript are unchanged: `import { x as z } from './m'`
   beside `import { x } from './n'`, or a re-export `export { x as y }`
-  imported beside `x`, still binds a bare `x()` to both `m.x` and `n.x`,
-  `inferred`.
+  imported beside `x`, still gives a bare `x()` edges to both `m.x` and
+  `n.x`, `inferred`.
 
 ## 0.199.0
 

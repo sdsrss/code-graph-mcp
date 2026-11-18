@@ -12626,12 +12626,22 @@ fn test_python_renamed_import_changes_match_rebuild() {
 }
 
 /// D#893: `from m import a as b` binds `b`, not `a`. Beside `from n import a`,
-/// a bare `a()` is `n.a`'s alone: the renamed import neither kept `m.a` from
-/// the import-contradiction prune nor vouched for it as an import of `a`.
+/// a bare `a()` is `n.a`'s: the renamed import no longer vouches for `m.a` as
+/// an imported target, so that edge is `ambiguous` and below the default
+/// floor. The prune still reads the import as one of `a` and keeps the edge:
+/// the edge set is 0.199.0's, which is what keeps an incremental run in step
+/// with a rebuild (0.200.0 review R1: pruning it exposed incremental
+/// divergences a protected edge had hidden).
 const D893_TREE: &[(&str, &str)] = &[
     ("app/__init__.py", ""),
-    ("app/m.py", "def a():\n    return 1\n"),
-    ("app/n.py", "def a():\n    return 2\n"),
+    (
+        "app/m.py",
+        "def a():\n    return 1\n\n\nclass A:\n    pass\n",
+    ),
+    (
+        "app/n.py",
+        "def a():\n    return 2\n\n\nclass A:\n    pass\n",
+    ),
     (
         "app/views.py",
         "from app.m import a as b\nfrom app.n import a\n\n\ndef go():\n    return a()\n\n\n\
@@ -12641,16 +12651,13 @@ const D893_TREE: &[(&str, &str)] = &[
         "app/rev.py",
         "from .n import a\nfrom .m import a as b\n\n\ndef go():\n    return a()\n",
     ),
-    // Nothing binds `a` here: a by-name guess between two namesakes.
+    // Nothing binds `a` here: a by-name guess.
     (
         "app/only.py",
         "from app.m import a as b\n\n\ndef go():\n    return a()\n",
     ),
-    // Calls of the alias the import does not bind, which keep the by-name
-    // edge they had before D#893: the renamed import neither binds `b()` nor
-    // contradicts its edge (keyed by `b`, the withdrawn first design pruned
-    // it, and no later run restored it once `m.py` stopped defining `a`:
-    // 0.199.0 review R2).
+    // Calls of the alias the import does not bind keep the by-name edge and
+    // the label they had before D#893.
     ("app/other.py", "def b():\n    return 9\n"),
     (
         "app/fl.py",
@@ -12669,6 +12676,16 @@ const D893_TREE: &[(&str, &str)] = &[
 
 /// `callee confidence` of each `calls` edge out of `caller` in `path`.
 fn py_calls_with_confidence(db: &Database, path: &str, caller: &str) -> Vec<String> {
+    py_edges_with_confidence(db, "calls", path, caller)
+}
+
+/// `target confidence` of each `relation` edge out of `caller` in `path`.
+fn py_edges_with_confidence(
+    db: &Database,
+    relation: &str,
+    path: &str,
+    caller: &str,
+) -> Vec<String> {
     let mut stmt = db
         .conn()
         .prepare(
@@ -12676,26 +12693,52 @@ fn py_calls_with_confidence(db: &Database, path: &str, caller: &str) -> Vec<Stri
              FROM edges e \
              JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id \
              JOIN nodes nt ON nt.id = e.target_id JOIN files ft ON ft.id = nt.file_id \
-             WHERE e.relation = 'calls' AND fs.path = ?1 AND ns.name = ?2 ORDER BY 1",
+             WHERE e.relation = ?1 AND fs.path = ?2 AND ns.name = ?3 ORDER BY 1",
         )
         .unwrap();
     let rows = stmt
-        .query_map([path, caller], |r| r.get::<_, String>(0))
+        .query_map([relation, path, caller], |r| r.get::<_, String>(0))
         .unwrap();
     rows.filter_map(Result::ok).collect()
 }
 
+/// Label-only shapes beside D893_TREE. Not in its rebuild comparisons: with a
+/// renamed import, `m.a()` misses its by-name `n.a` when `n.py` is indexed
+/// after it, on 0.199.0 as here.
+const D893_LABEL_FILES: &[(&str, &str)] = &[
+    // A qualified `m.a()` names the target the import reaches: still vouched.
+    (
+        "app/qual.py",
+        "from app import m\nfrom app.m import a as b\n\n\ndef go():\n    return m.a()\n",
+    ),
+    // A bare type mention is a bare `A` as much as a call is.
+    (
+        "app/ref.py",
+        "from app.m import A as B\nfrom app.n import A\n\n\ndef ann(x: A):\n    return x\n",
+    ),
+];
+
 #[test]
 fn test_python_renamed_import_does_not_bind_its_original_name() {
-    let (_p, _d, db) = fresh_index_of(D893_TREE);
+    let files: Vec<(&str, &str)> = D893_TREE.iter().chain(D893_LABEL_FILES).copied().collect();
+    let (_p, _d, db) = fresh_index_of(&files);
     let want: &[(&str, &str, &[&str])] = &[
-        ("app/views.py", "go", &["app/n.py:a inferred"]),
-        ("app/views.py", "go_b", &["app/m.py:a inferred"]),
-        ("app/rev.py", "go", &["app/n.py:a inferred"]),
         (
-            "app/only.py",
+            "app/views.py",
             "go",
-            &["app/m.py:a ambiguous", "app/n.py:a ambiguous"],
+            &["app/m.py:a ambiguous", "app/n.py:a inferred"],
+        ),
+        ("app/views.py", "go_b", &["app/m.py:a inferred"]),
+        (
+            "app/rev.py",
+            "go",
+            &["app/m.py:a ambiguous", "app/n.py:a inferred"],
+        ),
+        ("app/only.py", "go", &["app/m.py:a ambiguous"]),
+        (
+            "app/qual.py",
+            "go",
+            &["app/m.py:a inferred", "app/n.py:a ambiguous"],
         ),
         ("app/fl.py", "go", &["app/other.py:b inferred"]),
         ("app/param.py", "go", &["app/other.py:b ambiguous"]),
@@ -12709,10 +12752,14 @@ fn test_python_renamed_import_does_not_bind_its_original_name() {
         })
         .collect();
     assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(
+        py_edges_with_confidence(&db, "references", "app/ref.py", "ann"),
+        ["app/m.py:A ambiguous", "app/n.py:A inferred"]
+    );
 
-    // By name, a call prefers a definition outside a tests/ directory; read
-    // as an import of `a`, the renamed import of `tests.helpers.a` bound the
-    // call there as well.
+    // Read as an import of `a`, the renamed import of `tests.helpers.a` still
+    // binds the call there and prunes the by-name `n.a` (0.199.0's edges),
+    // but no longer vouches for it.
     let (_p, _d, db) = fresh_index_of(&[
         ("app/__init__.py", ""),
         ("app/n.py", "def a():\n    return 2\n"),
@@ -12725,7 +12772,7 @@ fn test_python_renamed_import_does_not_bind_its_original_name() {
     ]);
     assert_eq!(
         py_calls_with_confidence(&db, "app/only.py", "go"),
-        ["app/n.py:a ambiguous"]
+        ["tests/helpers.py:a ambiguous"]
     );
 }
 
@@ -14732,7 +14779,10 @@ fn an_incremental_run_leaves_no_fanout_tables() {
     ]);
     let temps = || -> Vec<String> {
         db.conn()
-            .prepare("SELECT name FROM sqlite_temp_master WHERE name LIKE 'cg_fanout%'")
+            .prepare(
+                "SELECT name FROM sqlite_temp_master
+                 WHERE name LIKE 'cg_fanout%' OR name LIKE 'cg_shape_before%'",
+            )
             .unwrap()
             .query_map([], |r| r.get(0))
             .unwrap()
