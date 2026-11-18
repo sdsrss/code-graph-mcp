@@ -12276,8 +12276,14 @@ const D726_TREE: &[(&str, &str)] = &[
         "app/dates.py",
         "def parse_date_param(v):\n    return v\n\n\nclass Model:\n    def parse_date_param(self):\n        return 1\n",
     ),
-    ("app/stats.py", "def wilson_ci(n):\n    return n\n"),
-    ("app/other.py", "def parse_date_param(v):\n    return 2\n"),
+    ("app/stats.py", "def wilson_ci(n):\n    return n\n\n\nhandler = len\n"),
+    (
+        "app/other.py",
+        "def parse_date_param(v):\n    return 2\n\n\ndef helper():\n    return 4\n\n\ndef deep_fn():\n    return 6\n",
+    ),
+    ("app/deep/__init__.py", "from .sub import deep_fn\n"),
+    ("app/deep/sub/__init__.py", "from .impl import deep_fn\n"),
+    ("app/deep/sub/impl.py", "def deep_fn():\n    return 5\n"),
     ("app/pkg/__init__.py", "from .impl import helper\n"),
     ("app/pkg/impl.py", "def helper():\n    return 3\n"),
     (
@@ -12285,12 +12291,26 @@ const D726_TREE: &[(&str, &str)] = &[
         "from app.dates import parse_date_param as _parse_date_param\n\
 from .stats import wilson_ci as ci\n\
 from app.pkg import helper as h\n\
+from app.deep import deep_fn as dd\n\
 from json import loads as jl\n\
 from app.stats import wilson_ci as shadowed\n\
 from app.stats import wilson_ci as param_named\n\
 from app.stats import wilson_ci as gl\n\
 try:\n    from app.stats import wilson_ci as either\n\
 except ImportError:\n    from app.dates import parse_date_param as either\n\
+from app.stats import handler as hh\n\
+from app.stats import wilson_ci as looped\n\
+from app.stats import wilson_ci as withed\n\
+from app.stats import wilson_ci as walrused\n\
+from app.stats import wilson_ci as plain\n\
+from app.stats import wilson_ci as modalias\n\
+from app.stats import wilson_ci as assigned\n\
+import plain\n\
+import json as modalias\n\
+for looped in []:\n    pass\n\
+with open(__file__) as withed:\n    pass\n\
+if (walrused := None):\n    pass\n\
+assigned = None\n\
 \n\
 \n\
 def wilson_ci(n):\n    return 0\n\n\n\
@@ -12298,6 +12318,7 @@ def shadowed():\n    return 0\n\n\n\
 def go_date():\n    return _parse_date_param(1)\n\n\n\
 def go_ci():\n    return ci(2)\n\n\n\
 def go_h():\n    return h()\n\n\n\
+def go_dd():\n    return dd()\n\n\n\
 def go_jl():\n    return jl('x')\n\n\n\
 def go_shadowed():\n    return shadowed()\n\n\n\
 def go_param(param_named):\n    return param_named()\n\n\n\
@@ -12306,7 +12327,14 @@ def rebinder():\n    global gl\n    gl = None\n\n\n\
 def go_gl():\n    return gl()\n\n\n\
 def go_comp(xs):\n    return [ci() for ci in xs]\n\n\n\
 def go_lambda():\n    return lambda ci: ci()\n\n\n\
-def go_nested():\n    ci = None\n\n    def inner():\n        return ci()\n\n    return inner\n",
+def go_nested():\n    ci = None\n\n    def inner():\n        return ci()\n\n    return inner\n\n\n\
+def go_hh():\n    return hh()\n\n\n\
+def go_looped():\n    return looped()\n\n\n\
+def go_withed():\n    return withed()\n\n\n\
+def go_walrused():\n    return walrused()\n\n\n\
+def go_plain():\n    return plain()\n\n\n\
+def go_modalias():\n    return modalias()\n\n\n\
+def go_assigned():\n    return assigned()\n",
     ),
 ];
 
@@ -12335,6 +12363,8 @@ fn check_d726_calls(db: &Database, when: &str) {
         ("go_ci", &["app/stats.py:function:wilson_ci"]),
         // Through the package's re-export.
         ("go_h", &["app/pkg/impl.py:function:helper"]),
+        // Through two packages' re-exports.
+        ("go_dd", &["app/deep/sub/impl.py:function:deep_fn"]),
         // A library's function runs no project code.
         ("go_jl", &[]),
         // The module also defines the name: the call is not the import's.
@@ -12348,6 +12378,16 @@ fn check_d726_calls(db: &Database, when: &str) {
         ("go_comp", &[]),
         ("go_lambda", &[]),
         ("inner", &[]),
+        // Only functions and classes bind: a module-level variable does not.
+        ("go_hh", &[]),
+        // A loop, `with` and walrus target, a plain import, an `import … as`
+        // and an assignment at module level rebind the name too.
+        ("go_looped", &[]),
+        ("go_withed", &[]),
+        ("go_walrused", &[]),
+        ("go_plain", &[]),
+        ("go_modalias", &[]),
+        ("go_assigned", &[]),
     ];
     let wrong: Vec<String> = want
         .iter()
@@ -12357,6 +12397,22 @@ fn check_d726_calls(db: &Database, when: &str) {
         })
         .collect();
     assert!(wrong.is_empty(), "{when}: {wrong:#?}");
+    // `helper` and `deep_fn` are each defined in two files, and the caller's
+    // import names a package, not the defining file: the module decided the
+    // target, so a namesake does not make the edge `ambiguous`.
+    for caller in ["go_h", "go_dd"] {
+        let confidence: String = db
+            .conn()
+            .query_row(
+                "SELECT e.confidence FROM edges e \
+                 JOIN nodes ns ON ns.id = e.source_id JOIN files fs ON fs.id = ns.file_id \
+                 WHERE e.relation = 'calls' AND fs.path = 'app/views.py' AND ns.name = ?1",
+                [caller],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(confidence, "inferred", "{when}: {caller}'s edge");
+    }
 }
 
 /// D#726: a Python call through `from m import a as b` binds `a` in the files
@@ -12408,6 +12464,18 @@ fn test_python_renamed_import_changes_match_rebuild() {
     );
     assert_incremental_matches_rebuild(before, &[("app/x.py", None)]);
     assert_incremental_matches_rebuild(before, &[("app/pkg/__init__.py", Some("\n"))]);
+    // The re-export dropped while its target's file changes too: re-resolved
+    // through the package, not restored onto the same-named function.
+    assert_incremental_matches_rebuild(
+        before,
+        &[
+            ("app/pkg/__init__.py", Some("\n")),
+            ("app/pkg/impl.py", Some("def load():\n    return 30\n")),
+        ],
+    );
+    // The export becomes a variable: nothing binds, also not the variable by
+    // its old target's name.
+    assert_incremental_matches_rebuild(before, &[("app/x.py", Some("load = len\n"))]);
     let without: Vec<(&str, &str)> = before
         .iter()
         .map(|&(f, b)| {
