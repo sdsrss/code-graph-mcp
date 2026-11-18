@@ -1,6 +1,6 @@
 # 2026-11-18 D#893 + D#895：Python 改名导入不再佐证原名；增量里重新出现的定义要刷新回退导入
 
-状态：**D#893 第四版（只改无标记边的标签；R2 MEDIUM 后按停止线做只减不增的收窄，不再送第三轮）发 0.200.0；D#895 已发布 0.199.0（tag 在 c4774055，2026-11-18，CI 7/7、Release 10/10 用时 34 分 41 秒；npm 6 个包发布者 GitHub Actions；发布版 linux-x64 md5 c67a84f2 在五个语料上与源码构建逐边相同）**。授权：用户 2026-11-17“把剩余工作都做了，授权清理和发版”，2026-11-18“继续完成剩下的任务”。
+状态：**D#893 第四版已发布 0.200.0（tag v0.200.0 在 04760d4e，2026-11-18；CI 7/7，Windows 首跑因 Chocolatey 取 ripgrep 失败重跑一次；Release 10/10 用时 33 分 45 秒；npm 6 个包发布者 GitHub Actions、trustedPublisher github、带签名证明；发布版 linux-x64 md5 75cebab3 在五个语料与 probe 树上与源码构建 head4 逐边相同）；D#895 已发布 0.199.0。** 授权：用户 2026-11-17“把剩余工作都做了，授权清理和发版”，2026-11-18“D#893按你建议执行，只记录、没有修的要修”。
 
 ## 为什么
 
@@ -109,7 +109,7 @@
 - 升级/降级提示（head2 = INDEX_VERSION 143 构建，md5 02650990，对 0.199.0 建的 flask 索引）：查询打印 “This index was built by an older code-graph (index v142, this binary v143): answers come from it until it is rebuilt — run: code-graph-mcp reindex”；`incremental-index` 打印 “Index version mismatch (stored v142 ≠ binary v143): clearing + rebuilding …”，退出 0；MCP 服务启动后 `application_id` 142 → 143 并重建（带一次查询的会话结束时 3,705 条边）。0.199.0 对 143 的索引：查询警告 “index built by a newer code-graph (v143 > binary v142); leaving it intact” 并照常回答；`incremental-index` 退出 1，提示先删 `.code-graph/index.db*`。
 
 ### 遗留
-- D#900（新延期）：普通导入因模块失去该名字而改为按名绑定时，导入方此前被剪掉的裸调用不恢复。0.199.0 已有；随机序列里新版独有的 21 个分歧都是它。
+- D#901（新延期，取代 D#900）：0.199.0 已有的四种增量分歧（普通导入回退按名绑定后被剪的裸调用不恢复、求和计数抵消、`<external>` 占位导入丢 `as`、改名导入 + `m.a()` 在同名定义后到时缺按名边），每种都有复现；0.200.0 不改边，不再暴露它们。
 - JS 同类（D#897）不在本次：JS 改名导入的 imports 边不记本地别名，要改解析器。
 
 ## 0.200.0 评审 R1（新起的子代理，盲审 v0.199.0..2b2d5478）：HIGH 0 / MEDIUM 1 / LOW 5 / NOTE 7
