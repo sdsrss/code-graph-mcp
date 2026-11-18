@@ -158,12 +158,30 @@ def index(binary, d):
         raise RuntimeError(f"index failed in {d}: {r.stderr[-400:]}")
 
 
+_GEN = {}
+
+
+def load_gen(path):
+    """Another generator module's `initial(rng)` / `step(state, rng)`. Loaded in
+    the worker: Python 3.14 starts pool workers with forkserver, which
+    re-imports this module, so a swap made in main() never reached them and
+    `--gen` silently ran this file's generator (found 2026-11-18, D#901)."""
+    if path not in _GEN:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("gen", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _GEN[path] = (mod.initial, mod.step)
+    return _GEN[path]
+
+
 def run_seed(args):
-    binary, seed, steps = args
+    binary, seed, steps, gen = args
+    initial_, step_ = load_gen(gen) if gen else (initial, step)
     rng = random.Random(seed)
-    states = [initial(rng)]
+    states = [initial_(rng)]
     for _ in range(steps):
-        states.append(step(states[-1], rng))
+        states.append(step_(states[-1], rng))
     base = tempfile.mkdtemp(prefix=f"s{seed}-", dir=ROOT)
     try:
         inc = os.path.join(base, "inc")
@@ -219,18 +237,11 @@ def main():
     binary, first, count, out = os.path.abspath(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
     steps = int(sys.argv[sys.argv.index("--steps") + 1]) if "--steps" in sys.argv else 3
     jobs = int(sys.argv[sys.argv.index("--jobs") + 1]) if "--jobs" in sys.argv else 8
-    if "--gen" in sys.argv:
-        # another generator module's `initial(rng)` / `step(state, rng)`; workers fork after this
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("gen", sys.argv[sys.argv.index("--gen") + 1])
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        global initial, step
-        initial, step = mod.initial, mod.step
+    gen = os.path.abspath(sys.argv[sys.argv.index("--gen") + 1]) if "--gen" in sys.argv else None
     os.makedirs(ROOT, exist_ok=True)
     bad = err = 0
     with Pool(jobs) as pool, open(out, "w") as fh:
-        for res in pool.imap_unordered(run_seed, [(binary, s, steps) for s in range(first, first + count)]):
+        for res in pool.imap_unordered(run_seed, [(binary, s, steps, gen) for s in range(first, first + count)]):
             if "error" in res:
                 err += 1
             elif not res.get("ok"):
