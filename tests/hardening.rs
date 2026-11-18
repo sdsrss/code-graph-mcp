@@ -2610,10 +2610,9 @@ fn audit_ignores_hold_only_while_their_reason_does() {
         "an audit.toml would ignore advisories past AUDIT_IGNORES: put each \
          ignore on ci.yml's `cargo audit` line, with its row here"
     );
-    // A config file reaches cargo-audit from anywhere its cwd or CARGO_HOME
-    // can be pointed (`working-directory:`, an `env:` at any level), so no
-    // `audit.toml` may exist in the checkout at all, and nothing in ci.yml
-    // may move CARGO_HOME onto one written later.
+    // A config file reaches cargo-audit from anywhere its cwd, HOME or
+    // CARGO_HOME can be pointed, so no `audit.toml` may exist in the checkout
+    // at all; the fixed job form below keeps all three where they are.
     fn find_audit_toml(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in fs::read_dir(dir).expect("read a checkout directory") {
             let entry = entry.expect("read a directory entry");
@@ -2628,122 +2627,113 @@ fn audit_ignores_hold_only_while_their_reason_does() {
     }
     let mut configs = Vec::new();
     find_audit_toml(root, &mut configs);
-    // A workflow-level `env:` or `defaults:` reaches every job, the audit
-    // included (`HOME` moves `~/.cargo`, `working-directory` the workspace).
     assert!(
-        configs.is_empty()
-            && !ci.contains("CARGO_HOME")
-            && !ci
-                .lines()
-                .any(|l| l.starts_with("env:") || l.starts_with("defaults:")),
-        "audit config {configs:?}, a CARGO_HOME in ci.yml, or a workflow-level \
-         `env:` / `defaults:` would let cargo-audit ignore advisories past AUDIT_IGNORES"
+        configs.is_empty(),
+        "audit config {configs:?} would let cargo-audit ignore advisories past AUDIT_IGNORES"
     );
-    // The ignores read below are the ones on ci.yml's own `cargo audit` line,
-    // so every line of the job starts with an allowed key: no `make audit` or
-    // script (its ignores live in another file), no other action
-    // (`rustsec/audit-check` takes `ignore:`), no `env:` or
-    // `working-directory:` (another CARGO_HOME, HOME or workspace), no
-    // `continue-on-error:` (every advisory non-blocking), no `with:` input but
-    // rust-cache's `key:`. A shape this rejects that audits the same way can be
-    // added here.
-    const AUDIT_KEYS: &[&str] = &[
-        "name:",
-        "timeout-minutes:",
-        "runs-on:",
-        "steps:",
-        "uses:",
-        "with:",
-        "key:",
-        "run:",
-    ];
-    const AUDIT_ACTIONS: &[&str] = &[
-        "actions/checkout@",
-        "dtolnay/rust-toolchain@",
-        "Swatinem/rust-cache@",
-    ];
-    // A one-line YAML scalar: quoted, or plain with an optional ` # comment`.
-    fn scalar(value: &str) -> &str {
-        let quoted = ['"', '\'']
-            .iter()
-            .find_map(|q| value.strip_prefix(*q).and_then(|v| v.strip_suffix(*q)));
-        quoted.unwrap_or_else(|| value.split(" #").next().unwrap_or("").trim())
+    // Nothing above or around the job reaches it either: a workflow-level
+    // `env:` (HOME moves `~/.cargo`) or `defaults:` (another workspace)
+    // applies to every job, so the top-level keys are a closed list.
+    for line in ci.lines() {
+        let top = !line.starts_with(' ') && !line.starts_with('#') && !line.trim().is_empty();
+        assert!(
+            !top || ["name:", "on:", "permissions:", "concurrency:", "jobs:"]
+                .iter()
+                .any(|k| line.starts_with(k)),
+            "ci.yml has the top-level `{line}`: a workflow `env:` / `defaults:` reaches \
+             the audit job; allowed are name, on, permissions, concurrency, jobs"
+        );
     }
-    let mut ignored = BTreeSet::new();
-    let mut audits = 0;
-    for raw in workflow_job(&ci, "audit").lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // a sequence item's dash and the spaces after it
-        let line = line.strip_prefix('-').map_or(line, str::trim_start);
-        let key = AUDIT_KEYS
-            .iter()
-            .find(|k| line.starts_with(**k))
-            .unwrap_or_else(|| {
-                panic!("ci.yml `audit` has `{line}`: only the keys {AUDIT_KEYS:?} are allowed")
-            });
-        let value = line[key.len()..].trim();
-        if *key == "uses:" {
-            assert!(
-                AUDIT_ACTIONS.iter().any(|a| value.starts_with(a)),
-                "ci.yml `audit` uses `{value}`: an action that audits takes \
-                 ignores this test never reads"
-            );
-            continue;
-        }
-        if *key != "run:" {
-            continue;
-        }
-        let cmd = scalar(value);
-        let mut words = cmd.split_whitespace();
-        match (words.next(), words.next()) {
-            (Some("cargo"), Some("install")) => {
-                let mut crates = 0;
-                while let Some(w) = words.next() {
-                    match w {
-                        "--locked" => {}
-                        "--version" => {
-                            words.next();
-                        }
-                        _ if w.starts_with("--version=") => {}
-                        _ if w == "cargo-audit" || w.starts_with("cargo-audit@") => crates += 1,
-                        _ => panic!(
-                            "ci.yml `audit` installs with `{w}`: only cargo-audit from \
-                             crates.io (`--locked`, `--version`) is allowed"
-                        ),
-                    }
-                }
-                assert_eq!(crates, 1, "ci.yml `audit` installs `{cmd}`");
-            }
-            (Some("cargo"), Some("audit")) => {
-                audits += 1;
-                while let Some(w) = words.next() {
-                    if w == "--ignore" {
-                        ignored.insert(words.next().expect("--ignore takes an id").to_string());
-                    } else if let Some(id) = w.strip_prefix("--ignore=") {
-                        ignored.insert(id.to_string());
-                    } else if w == "--deny" {
-                        words.next();
-                    } else if !w.starts_with("--deny=") {
-                        panic!(
-                            "ci.yml `cargo audit` takes `{w}`: only `--ignore ID` and \
-                             `--deny KIND` are allowed"
-                        );
-                    }
-                }
-            }
-            _ => panic!(
-                "ci.yml `audit` runs `{cmd}`: only `cargo install … cargo-audit` and \
-                 `cargo audit [--ignore ID]…` are allowed, each on one line"
-            ),
+    // The job is compared with a fixed form, not scanned for hazards: two
+    // reviews each found a dozen spellings a key-by-key scan let through
+    // (a checkout `with:`, shell `||`, YAML escapes, continuation lines). Every
+    // line that is not a comment must equal the next one here, indentation
+    // included; an action's pin (`@<40 hex>` and an optional ` # <tag>`) reads
+    // as `@PIN`, and the `cargo audit` line may add only `--ignore
+    // RUSTSEC-YYYY-NNNN` pairs, single-spaced. Changing the job means changing
+    // this list, where the change meets the guard.
+    const AUDIT_JOB: &[&str] = &[
+        "    name: Cargo Audit (supply-chain CVE scan)",
+        "    timeout-minutes: 20",
+        "    runs-on: ubuntu-latest",
+        "    steps:",
+        "      - uses: actions/checkout@PIN",
+        "      - uses: dtolnay/rust-toolchain@PIN",
+        "      - uses: Swatinem/rust-cache@PIN",
+        "        with:",
+        "          key: cargo-audit",
+        "      - name: Install cargo-audit",
+        "        run: cargo install --locked --version ^0.22 cargo-audit",
+        "      - name: Run cargo audit",
+        "        run: cargo audit",
+    ];
+    fn unpin(line: &str) -> String {
+        let Some((head, pin)) = line.split_once('@') else {
+            return line.to_string();
+        };
+        let (sha, tag) = pin.split_at(pin.len().min(40));
+        let tag_ok = tag.is_empty()
+            || tag
+                .strip_prefix(" # ")
+                .is_some_and(|t| !t.is_empty() && !t.contains(char::is_whitespace));
+        if head.trim_start().starts_with("- uses: ")
+            && sha.len() == 40
+            && sha.bytes().all(|b| b.is_ascii_hexdigit())
+            && tag_ok
+        {
+            format!("{head}@PIN")
+        } else {
+            line.to_string()
         }
     }
+    assert!(
+        ci.contains("\n  audit:\n"),
+        "ci.yml's `audit` job header must be the bare `  audit:` line"
+    );
+    let body: Vec<String> = workflow_job(&ci, "audit")
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .map(unpin)
+        .collect();
     assert_eq!(
-        audits, 1,
-        "ci.yml `audit` must run `cargo audit` exactly once"
+        body.len(),
+        AUDIT_JOB.len(),
+        "ci.yml `audit` is not the form this test knows: {body:#?}"
     );
+    let mut ignored = BTreeSet::new();
+    for (got, want) in body.iter().zip(AUDIT_JOB) {
+        if *want == "        run: cargo audit" {
+            let rest = got.strip_prefix(want).unwrap_or_else(|| {
+                panic!("ci.yml `audit` runs `{got}` where `{want}` was expected")
+            });
+            let words: Vec<&str> = rest.split(' ').skip(1).collect();
+            assert!(
+                (rest.is_empty() || rest.starts_with(' ')) && words.len().is_multiple_of(2),
+                "ci.yml `cargo audit` line `{got}`: only `--ignore RUSTSEC-YYYY-NNNN` pairs"
+            );
+            for pair in words.chunks(2) {
+                let id = pair[1];
+                let digits =
+                    |p: &str, n: usize| p.len() == n && p.bytes().all(|b| b.is_ascii_digit());
+                let well_formed = id
+                    .strip_prefix("RUSTSEC-")
+                    .and_then(|r| r.split_once('-'))
+                    .is_some_and(|(y, n)| digits(y, 4) && digits(n, 4));
+                assert!(
+                    pair[0] == "--ignore" && well_formed,
+                    "ci.yml `cargo audit` takes `{} {id}`: only `--ignore RUSTSEC-YYYY-NNNN`",
+                    pair[0]
+                );
+                ignored.insert(id.to_string());
+            }
+        } else {
+            assert_eq!(
+                got, want,
+                "ci.yml `audit` differs from the form this test knows (update AUDIT_JOB \
+                 with the change, after checking it cannot make cargo-audit skip an advisory)"
+            );
+        }
+    }
     let listed: BTreeSet<String> = AUDIT_IGNORES.iter().map(|r| r.0.to_string()).collect();
     assert_eq!(
         ignored, listed,
