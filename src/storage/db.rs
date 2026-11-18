@@ -5122,8 +5122,9 @@ mod tests {
 
     /// The `-wal`'s identity comes from the path the open was given, made
     /// absolute: rusqlite names the database file only when its path is UTF-8,
-    /// and a project directory need not be (review R1, L2).
-    #[cfg(unix)]
+    /// and a project directory need not be (review R1, L2). Linux only: macOS
+    /// refuses such a name.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_wal_replaced_under_a_non_utf8_path_is_noticed() {
         use std::os::unix::ffi::OsStrExt;
