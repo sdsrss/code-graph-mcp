@@ -8,8 +8,9 @@ compared on CPython 3.14's standard library, nltk 3.9.2, flask 3.1.0, this
 repository and a private application). What changes is the incremental
 update — `incremental-index`, and the MCP server's refresh, which runs the
 same code. An index an earlier version updated incrementally can still hold
-edges a rebuild does not have; they go when the files involved are indexed
-again, or all at once with `code-graph-mcp rebuild-index --confirm`.
+edges a rebuild does not have, or lack some it has; they are corrected when
+the file the edge starts from is indexed again, or all at once with
+`code-graph-mcp rebuild-index --confirm`.
 Moving or swapping files now takes longer (below). To pin the binary back:
 `npm i -g @sdsrs/code-graph@0.200.0`, then delete
 `~/.cache/code-graph/bin/code-graph-mcp` and set
@@ -45,27 +46,43 @@ Measured with random edit sequences on small Python projects, each step's
 incremental index compared edge for edge with a fresh index of the same
 files: 497 of 4,500 sequences differed (2,090 edges in all) and now
 15 do (21 edges); with a second generator (classes, methods, star and
-conditional imports), 278 of 1,500 (1,417 edges) and now 56 (120). No
-sequence differs that did not before, and every edge that still differs
-did at the same step before.
+conditional imports), 278 of 1,500 (1,417 edges) and now 56 (120); with a
+third that moves and swaps files, 420 of 1,500 (1,862 edges) and now 25
+(44). No sequence differs that did not before, and every edge that still
+differs did at the same step before.
+
+### fix: a Go `pkg.F()` call is no longer moved onto a method
+
+A call through an imported package runs a function of that package, never
+a method, and a full index binds it so. When an incremental update
+re-extracted the file defining `F`, it moved the call onto every node
+named `F` in that file, a method `K.F` beside the function included, and
+the extra edge stayed until the caller's file changed.
 
 ### change: moving or swapping files re-extracts more callers
 
 Because a definition that moves is now seen as new where it lands, its
 callers are re-extracted, as when one is added. This part applies to every
-language, not only Python: replaying 0.180.0 → 0.198.0 of this repository
-(Rust, JavaScript, Python) re-extracts 102 files where it re-extracted 100.
+language, not only Python: updating this repository's index from 0.180.0 to
+0.198.0 in one run (Rust, JavaScript, Python) re-extracts 102 files where it
+re-extracted 100. Random edit sequences in Go, JavaScript/TypeScript and
+Rust, 1,500 of each, compared step by step with a rebuild as above: 285,
+229 and 205 differed, now 40, 88 and 75, and none differs that did not
+before.
 
 In a copy of the standard library, moving `email`, `json` and `xml` into a
-new directory took 3.6 s and left 1,292 calls only the incremental index
-had and 69 only a rebuild had; it now takes 6.9 s (288 files re-extracted,
-7 before) and no call differs, where a rebuild takes 3.1 s. Swapping `shutil.py` and `tempfile.py`: 1.1 s with
-132 and 4 differing calls and 1 reference, now 3.8 s and none of them.
-Moving `nltk/corpus`: 1.2 s with 14 differing calls, now 2.2 s and none.
-In the same measurement editing one file took 0.25 s and now 0.26 s
-(median of 7), and replaying 200 commits of the private application took
-6.3 s and now 6.2 s, 0.180.0 → 0.198.0 of this repository 3.2 s and now
-3.1 s (medians of 3).
+new directory took 3.4 s and left 1,292 calls only the incremental index
+had and 69 only a rebuild had; it now takes 6.8 s (288 files re-extracted,
+7 before) and no call differs, where a rebuild takes 2.9 s. Swapping
+`shutil.py` and `tempfile.py`: 1.1 s with 132 and 4 differing calls and 1
+reference, now 3.6 s and none of them. Moving `nltk/corpus`: 1.2 s with 14
+differing calls, now 2.1 s and none. Renaming the class `IMAP4` in
+`imaplib.py` re-extracts no other file, as before (1.1 s before and
+after). Editing one file took 0.26 s and now 0.25 s (median of 7); adding
+a line to a file of 20,000 functions took 1.6 s and now 1.7 s. Updating
+the private application's index in one run from a commit to the one 200
+commits later took 6.2 s and now 6.4 s, and this repository's from
+0.180.0 to 0.198.0 3.1 s before and after (medians of 3).
 
 ### Not covered
 

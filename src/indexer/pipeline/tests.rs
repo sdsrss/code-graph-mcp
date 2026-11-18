@@ -19902,6 +19902,47 @@ fn d901_a_same_name_replacement_reaches_its_callers() {
                 ("app/m.py", Some("def a():\n    return 1\n")),
             ]],
         ),
+        (
+            // No `nested` flag outside Python: the node type alone tells the
+            // method from the function it replaced in the same file.
+            "a Go function becomes a method of the same file",
+            &[
+                ("go.mod", "module ex\n\ngo 1.21\n"),
+                (
+                    "pa/a.go",
+                    "package pa\n\nfunc Close() int {\n\treturn 1\n}\n",
+                ),
+                (
+                    "pc/c.go",
+                    "package pc\n\ntype J struct{}\n\nfunc (j *J) Close() int {\n\treturn 2\n}\n",
+                ),
+                (
+                    "pb/b.go",
+                    "package pb\n\nfunc G(x *Unknown) int {\n\treturn x.Close()\n}\n",
+                ),
+            ],
+            &[&[(
+                "pa/a.go",
+                Some("package pa\n\ntype K struct{}\n\nfunc (k *K) Close() int {\n\treturn 1\n}\n"),
+            )]],
+        ),
+        (
+            // Rust has no method type: an `impl` block's `fn a` is a
+            // `function` as a free `fn a` is, and only its qualified name
+            // `K.a` tells it from the free one a bare `a()` reaches (seed 18
+            // of a Rust generator).
+            "a Rust associated function becomes a free function of the same file",
+            &[
+                (
+                    "src/other.rs",
+                    "impl K {\n    pub fn new() -> K {\n        K\n    }\n    \
+                     pub fn a(&self) -> i32 {\n        1\n    }\n}\n",
+                ),
+                ("src/sub/imp.rs", "pub fn a() -> i32 {\n    5\n}\n"),
+                ("src/views.rs", "pub fn go_a() -> i32 {\n    a()\n}\n"),
+            ],
+            &[&[("src/other.rs", Some("pub fn a() -> i32 {\n    5\n}\n"))]],
+        ),
     ]);
 }
 
@@ -19965,4 +20006,171 @@ fn d901_a_nested_def_made_module_level_reaches_its_callers() {
             &[&[("app/n.py", Some("def a():\n    return 3\n"))]],
         ),
     ]);
+}
+
+/// Pre-tag review of 0.201.0, HIGH-1: a Go `pkg.Foo()` call (`"q":"gopkg"`)
+/// runs a function of the package, never a method, and every resolution path
+/// keeps only those (`go_package_candidates`). Phase 0 restored it onto every
+/// node named `Foo` its re-extracted file has, a method `K.Foo` beside the
+/// function included, until the caller's own file changed. An edit of the
+/// file restores it (first case, as 0.200.0 did); D#901's per-path trigger
+/// re-extracts the file in a run that only moves a file defining a name its
+/// ambiguous call reaches (second case).
+#[test]
+fn d901_a_go_package_call_is_not_restored_onto_a_method() {
+    let tree: &[(&str, &str)] = &[
+        ("go.mod", "module ex\n\ngo 1.21\n"),
+        ("pz/z.go", "package pz\n\nfunc Bar() int {\n\treturn 1\n}\n"),
+        ("pw/w.go", "package pw\n\nfunc Bar() int {\n\treturn 2\n}\n"),
+        (
+            "px/x.go",
+            "package px\n\nfunc Foo() int {\n\treturn Bar()\n}\n\n\
+             type K struct{}\n\nfunc (k *K) Foo() int {\n\treturn 1\n}\n",
+        ),
+        (
+            "py/u.go",
+            "package py\n\nimport \"ex/px\"\n\nfunc Go() int {\n\treturn px.Foo()\n}\n",
+        ),
+    ];
+    assert_d901_cases(&[
+        (
+            "the package's file is edited",
+            tree,
+            &[&[(
+                "px/x.go",
+                Some(
+                    "package px\n\nfunc Foo() int {\n\treturn Bar()\n}\n\n\
+                     type K struct{}\n\nfunc (k *K) Foo() int {\n\treturn 3\n}\n",
+                ),
+            )]],
+        ),
+        (
+            "a run moves a file defining a name the package's file calls",
+            tree,
+            &[&[
+                ("pz/z.go", None),
+                (
+                    "pq/z.go",
+                    Some("package pq\n\nfunc Bar() int {\n\treturn 1\n}\n"),
+                ),
+            ]],
+        ),
+    ]);
+}
+
+/// Pre-tag review of 0.201.0, HIGH-2: the fan-out round's snapshot asks of
+/// each Python node whether a `def` or class encloses it. Asked per node as a
+/// subquery over its file, that cost the square of the file's node count on
+/// every incremental run and refresh (a one-line edit of a file of 10,000
+/// `def`s: 0.76 s → 10.8 s). Counted in SQLite VM steps, which do not depend on
+/// the machine: four times the nodes must cost well under sixteen times the
+/// steps.
+#[test]
+fn the_definition_snapshot_grows_near_linearly_with_a_python_files_nodes() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    let steps_for = |defs: usize| -> u64 {
+        let body: String = (0..defs)
+            .map(|i| format!("def f{i}():\n    return {i}\n\n"))
+            .collect();
+        let (_project, db_dir, _db) = fresh_index_of(&[("big.py", body.as_str())]);
+        let mut conn = rusqlite::Connection::open(db_dir.path().join("index.db")).unwrap();
+        let steps = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&steps);
+        conn.progress_handler(
+            100,
+            Some(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        )
+        .unwrap();
+        super::resolve::snapshot_definition_counts(&conn, &["big.py".to_string()]).unwrap();
+        super::resolve::bare_name_callers_of_new_duplicates(&conn, &Default::default()).unwrap();
+        steps.load(Ordering::Relaxed)
+    };
+    let (small, large) = (steps_for(400), steps_for(1_600));
+    assert!(
+        large < 8 * small,
+        "400 defs: {small} x100 steps; 1,600 defs: {large} x100 steps ({:.1}x)",
+        large as f64 / small as f64
+    );
+}
+
+/// Pre-tag review of 0.201.0, MEDIUM-3: renaming a class changes the qualified
+/// name of each of its methods and no caller's edge. Keyed on the qualified
+/// name, the fan-out round re-extracted every `ambiguous` caller of every
+/// method name (`IMAP4` → `IMAP4x` in the standard library: 292 files, 1.1 s →
+/// 5.4 s, against a 3.0 s rebuild). Control: another method of the name in the
+/// same file still pulls the caller. The rename ends where a rebuild does.
+#[test]
+fn a_class_rename_pulls_no_caller_into_the_fanout_round() {
+    let base: &[(&str, &str)] = &[
+        ("a.py", "class K:\n    def close(self):\n        pass\n"),
+        ("c.py", "class J:\n    def close(self):\n        pass\n"),
+        // A value reference by name: `ambiguous` to both methods.
+        ("b.py", "def g():\n    return close\n"),
+    ];
+    let renamed = "class K2:\n    def close(self):\n        pass\n";
+    assert_eq!(
+        fanout_of_run(base, &[("a.py", renamed)]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        fanout_of_run(
+            base,
+            &[(
+                "a.py",
+                "class K:\n    def close(self):\n        pass\n\n\
+                 class L:\n    def close(self):\n        pass\n",
+            )],
+        ),
+        vec!["b.py".to_string()],
+        "control"
+    );
+    assert_d901_cases(&[("a class rename", base, &[&[("a.py", Some(renamed))]])]);
+}
+
+/// Pre-tag review of 0.201.0, LOW-4: an importer this run re-extracts in an
+/// EARLIER batch than the module, which gains a method of the imported name,
+/// resolved its import against the module's old nodes; Phase 0 records it for
+/// the fan-out round as it does an importer outside the run (`done_paths`). A
+/// later batch's importer is left to its own batch. `BATCH_SIZE` changed filler
+/// files put the importer (`a_use.py`) and the module (`z_mod.py`) in two
+/// batches.
+#[test]
+fn d901_an_importer_in_an_earlier_batch_reaches_a_new_namesake() {
+    let fill = |k: usize| -> Vec<(String, String)> {
+        (0..super::index_files::BATCH_SIZE)
+            .map(|i| {
+                (
+                    format!("m_{i:03}.py"),
+                    format!("def filler_{i}():\n    return {}\n", i + k),
+                )
+            })
+            .collect()
+    };
+    let (before, after) = (fill(0), fill(1));
+    let mut tree: Vec<(&str, &str)> = before
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_str()))
+        .collect();
+    tree.push((
+        "a_use.py",
+        "from z_mod import a\n\n\ndef go():\n    return a()\n",
+    ));
+    tree.push(("z_mod.py", "def a():\n    return 0\n"));
+    let mut step: Vec<(&str, Option<&str>)> = after
+        .iter()
+        .map(|(p, b)| (p.as_str(), Some(b.as_str())))
+        .collect();
+    step.push((
+        "a_use.py",
+        Some("from z_mod import a\n\n\ndef go():\n    return a()  # edited\n"),
+    ));
+    step.push((
+        "z_mod.py",
+        Some("def a():\n    return 0\n\n\nclass K:\n    def a(self):\n        return 1\n"),
+    ));
+    assert_d901_cases(&[("the importer is in the first batch", &tree, &[&step])]);
 }

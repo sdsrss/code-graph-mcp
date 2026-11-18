@@ -4074,6 +4074,8 @@ fn restore_inbound_edges(
             // 0.176.0, and the route is unchanged.
             let attr_call = relation.as_str() == REL_CALLS
                 && super::resolve::is_module_attr_call(metadata.as_deref());
+            let go_package_call = relation.as_str() == REL_CALLS
+                && super::resolve::go_package_call_path(metadata.as_deref()).is_some();
             // A `P.X()` call's synthetic import (D#518) that fell back to the
             // module's `<module>` is re-resolved, not rebound by name, when the
             // module now has a node named `X`: it may have gained the
@@ -4138,6 +4140,12 @@ fn restore_inbound_edges(
                     .filter(|(_, q, ty)| {
                         src_lang != "python" || *ty != "method" || *q == target_qualified.as_deref()
                     })
+                    // A Go `pkg.F()` call runs a function of the package, never
+                    // a method, as every resolution path has it
+                    // (`go_package_candidates`): restored onto each node of the
+                    // name, it bound a method `K.F` beside the function until the
+                    // caller's file changed (pre-tag review of 0.201.0, HIGH-1).
+                    .filter(|(_, _, ty)| !go_package_call || *ty != "method")
                     .filter(|(_, _, ty)| !supertype || !matches!(*ty, "function" | "method"))
                     .filter(|(id, _, _)| {
                         relation.as_str() != REL_CALLS
