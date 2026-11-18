@@ -1,6 +1,6 @@
 # 2026-11-18 D#893 + D#895：Python 改名导入不再佐证原名；增量里重新出现的定义要刷新回退导入
 
-状态：**D#893 第三版（只改标签）待 R2 评审后发 0.200.0（第二版 R1 有 MEDIUM，见文末“0.200.0 评审 R1”）；D#895 已发布 0.199.0（tag 在 c4774055，2026-11-18，CI 7/7、Release 10/10 用时 34 分 41 秒；npm 6 个包发布者 GitHub Actions；发布版 linux-x64 md5 c67a84f2 在五个语料上与源码构建逐边相同）**。授权：用户 2026-11-17“把剩余工作都做了，授权清理和发版”，2026-11-18“继续完成剩下的任务”。
+状态：**D#893 第四版（只改无标记边的标签；R2 MEDIUM 后按停止线做只减不增的收窄，不再送第三轮）发 0.200.0；D#895 已发布 0.199.0（tag 在 c4774055，2026-11-18，CI 7/7、Release 10/10 用时 34 分 41 秒；npm 6 个包发布者 GitHub Actions；发布版 linux-x64 md5 c67a84f2 在五个语料上与源码构建逐边相同）**。授权：用户 2026-11-17“把剩余工作都做了，授权清理和发版”，2026-11-18“继续完成剩下的任务”。
 
 ## 为什么
 
@@ -137,3 +137,25 @@
 - 随机序列（第三版 head3 md5 见发版记录；`fuzz_seq.py` 改为每步都比较、记录每步去掉置信度列的增量/全量边集合哈希；`rows_cmp.py` 按步比较两版的分歧行）：自己的生成器 4,500 个种子 0.199.0 分歧 525、新版 497；评审的生成器（`gen_review.py`，4 步）1,500 个种子 218 → 198。全量一侧的边集合在 6,000 个种子的每一步都与 0.199.0 相同（0 个种子不同）；增量一侧 38 + 23 个种子不同（标签影响扇出选择重新抽取的调用方）。新版独有的分歧行忽略置信度后 54 + 12 行，全部是“同一条边在增量与全量里标签不同”，且都出现在 0.199.0 同一步也与重建不一致的状态上（多为同一文件的 imports 边已分歧，改名导入的佐证原先把两边标签拉平）；新的边分歧 0。即新版与重建不一致的状态是 0.199.0 的子集。总分歧行（忽略置信度）2,155 → 2,090、894 → 843。
 - 评审 R1 的复现：cause A（求和抵消）、cause B（`<external>` 占位）、种子 53 在第三版上都与重建一致；去掉改名导入的对照两版同样分歧（已有）。
 - 提交：580e80bd（审计守卫键白名单）、6cef4145（第三版修复，CHANGELOG 重写）。
+
+## 0.200.0 评审 R2（新起的子代理，只审 580e80bd / 6cef4145 / 7d32d0f8）：HIGH 0 / MEDIUM 1 / LOW 4 / NOTE 5
+
+| # | 结论 | 处理 |
+|---|------|------|
+| MEDIUM-1（实测） | 相对导入的模块调用 `from . import m; m.a()` 带 `{"ur":"rel"}`，被当成裸调用，正确的 `m.a` inferred → ambiguous，callgraph 不列被调方；与 R1 LOW-1 同类，只修了绝对形式 | 到停止线（R1、R2 各有 MEDIUM）：只减不增的收窄——只对无 metadata 的边去掉佐证，任何带标记的边（`q`、`ur` rel/attr/local、`pyimp`）保持 0.199.0 标签。改标签的边集合是第三版的子集；用语料与随机序列证明（见下）。不送第三轮 |
+| LOW-1（实测） | 星号导入 + 同模块改名导入：唯一且正确的 `m.a` 变 ambiguous | 写进 Not covered（五个语料都没有） |
+| LOW-2（实测） | 注解 `x: m.A` 的点号尾巴记成无 metadata 的引用，正确引用变 ambiguous | 写进 Not covered |
+| LOW-3（实测） | 存活变异 M4（去掉 ur 判断，非等价）、M13（改名导入挡住同目标普通导入的佐证，非等价）等 | 第四版即 M4 方向；测试 relq.py（相对模块调用保持 inferred）与 both.py（普通导入照常佐证）杀死 N1（把 ur 边重新纳入过滤）与 N2（M13） |
+| LOW-4（实测） | 审计守卫 12 种新绕过（checkout `with: {repository/ref}`、续行、`--deny=x\|\|true`、双引号里 `\t`、顶层 `env :`/`"env":`/`defaults :`、`cargo-audit@…&&…`、node_modules 里的 audit.toml 配合 HOME） | 不再逐项堵：audit 作业与固定文本逐行（含缩进）比较，注释行跳过，动作的 `@<40 位十六进制>[ # tag]` 归一为 `@PIN`，`cargo audit` 行只能追加单空格的 `--ignore RUSTSEC-YYYY-NNNN`；顶层键闭集（name/on/permissions/concurrency/jobs）。评审 47 个变体：所有绕过都失败，现文件与升级 pin 通过，其余改动都失败并提示更新 AUDIT_JOB |
+| NOTE-1 | 守卫误拒的常见写法 | 固定文本的预期代价：改作业就要改 AUDIT_JOB |
+| NOTE-2 | 说明与注释少写了 references 与 `ur` 边；`ur: local` 是 D#789 不是 D10B | 第四版 `ur` 边不再变；CHANGELOG 升级段写“calls and references”，注释改写 |
+| NOTE-3 | `global a; a = b`、try 回退里 `a = _a` 同样变 | 写进 Not covered（实测） |
+| NOTE-4 | “边不变”只对全量成立，增量边集合会因扇出不同 | CHANGELOG 写“a full index” |
+| NOTE-5 | `from app import n as m` + 改名导入 + `m.a()`：错边仍 inferred（两版相同） | 不变，不处理 |
+
+## D#893 第四版（发版内容）
+
+- resolve.rs 相对 v0.199.0：`cg_imports` 多 `alias` 列；置信度佐证 `AND (i.alias IS NULL OR (e.metadata IS NOT NULL AND e.metadata <> ''))`。
+- 实测（base 对 head4）：probe 树与第三版相同（views/rev/only/ref/assign 的无标记边 inferred → ambiguous）；带标记的 relq/selfx/local 边保持 inferred，其无标记孪生边变 ambiguous，callgraph 仍列 `m.a`（隐藏计数 +1）；star/dotted/glob/tryfb 写进 Not covered。
+- 收窄的对照证明（head4 md5 9be108b2，`--no-default-features`）：五个语料与 head3 逐行相同（0 行不同），对 0.199.0 只有私有应用 8 行标签变化，去掉置信度列后五个语料与 0.199.0 相同。随机序列（两个生成器共 6,000 个种子，每步比较）：全量一侧每步与 0.199.0 相同；只有新版与重建不一致的状态 0 个；分歧种子 525 → 497、218 → 198；分歧行 2,155 → 2,090、894 → 843（与 head3 相同）。
+- 停止线：R1、R2 各有 MEDIUM；第四版是第三版改标签集合的子集（只减不增），由上面的差分证明，不送第三轮（发版手册“what closed every deep loop was withdrawal or decline-only narrowing proven by a differential”）。
