@@ -14470,6 +14470,110 @@ fn the_module_import_fanout_pulls_only_importers_a_rebuild_rebinds() {
     );
 }
 
+/// The files one run over `edits` hands the fan-out round, every edit written
+/// between the snapshot and `index_files` as the pipeline does.
+fn fanout_of_run(base: &[(&str, &str)], edits: &[(&str, &str)]) -> Vec<String> {
+    let (project, _d, db) = fresh_index_of(base);
+    let paths: Vec<String> = edits.iter().map(|(p, _)| p.to_string()).collect();
+    super::resolve::snapshot_definition_counts(db.conn(), &paths).unwrap();
+    for (path, body) in edits {
+        let full = project.path().join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, body).unwrap();
+    }
+    index_files(
+        &db,
+        project.path(),
+        &paths,
+        &std::collections::HashMap::new(),
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
+    super::resolve::bare_name_callers_of_new_duplicates(db.conn(), &Default::default()).unwrap()
+}
+
+/// A name's count rises per language: one run adds a Python `x` and drops a
+/// JavaScript `x`, and the Python callers of `x` still learn of the new one.
+/// Summed over both languages the +1 and −1 cancel and no caller is refreshed
+/// (0.199.0 review R2, LOW-4).
+#[test]
+fn a_definition_count_rises_per_language_in_one_run() {
+    let base: &[(&str, &str)] = &[
+        ("a.py", "def x():\n    pass\n"),
+        ("c.py", "def x():\n    pass\n"),
+        ("b.py", "def g():\n    x()\n"),
+        ("m.js", "function x() {}\nmodule.exports = x\n"),
+    ];
+    assert_eq!(
+        fanout_of_run(
+            base,
+            &[
+                ("d.py", "def x():\n    pass\n"),
+                ("m.js", "function y() {}\nmodule.exports = y\n"),
+            ],
+        ),
+        vec!["b.py".to_string()]
+    );
+}
+
+/// The relative-import fallback (D#895) refreshes a module's importers for a
+/// name that rose in the module's own language only: a JavaScript `f` changes
+/// nothing a Python `from .helpers import X` binds. Control: a Python `f` in
+/// the same run pulls them.
+#[test]
+fn the_module_fallback_fanout_ignores_another_languages_rise() {
+    let base: &[(&str, &str)] = &[
+        ("rel/__init__.py", ""),
+        ("rel/helpers.py", "X = 1\n\ndef f():\n    return 1\n"),
+        ("rel/user.py", "from .helpers import X\n"),
+        ("rel/sub.py", "from . import helpers\n"),
+    ];
+    let body_only = ("rel/helpers.py", "X = 1\n\ndef f():\n    return 2\n");
+    let js = fanout_of_run(
+        base,
+        &[
+            body_only,
+            ("lib/more.js", "function f() {}\nmodule.exports = f\n"),
+        ],
+    );
+    assert!(js.is_empty(), "{js:?}");
+    assert_eq!(
+        fanout_of_run(base, &[body_only, ("rel/more.py", "def f():\n    pass\n")]),
+        vec!["rel/sub.py".to_string(), "rel/user.py".to_string()],
+        "control"
+    );
+}
+
+/// The fan-out round's temp tables live on the connection an MCP server keeps
+/// open between runs, so a run drops every one of them, with or without a
+/// round (0.199.0 review R2, LOW-4: not dropping `cg_fanout_up_file` stayed
+/// green).
+#[test]
+fn an_incremental_run_leaves_no_fanout_tables() {
+    let (project, _d, db) = fresh_index_of(&[
+        ("a.py", "def helper():\n    pass\n"),
+        ("b.py", "def caller():\n    helper()\n"),
+        ("c.py", "def helper():\n    pass\n"),
+    ]);
+    let temps = || -> Vec<String> {
+        db.conn()
+            .prepare("SELECT name FROM sqlite_temp_master WHERE name LIKE 'cg_fanout%'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    fs::write(project.path().join("a.py"), "def helper():\n    return 1\n").unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert_eq!(temps(), Vec::<String>::new(), "after a run with no round");
+    fs::write(project.path().join("d.py"), "def helper():\n    pass\n").unwrap();
+    run_incremental_index(&db, project.path(), None, None).unwrap();
+    assert_eq!(temps(), Vec::<String>::new(), "after a round");
+}
+
 // D#517: an `__init__.py` that appears or vanishes makes its directory a
 // package or a plain directory again, which removes or adds the import roots
 // below it. An importer whose text did not change then names another file, or
