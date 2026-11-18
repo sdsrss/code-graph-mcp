@@ -3,18 +3,18 @@
 ## 0.199.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 142 → 143
-because the stored graph changes for unchanged source: Python calls in a
-file with a renamed import (below). The MCP server rebuilds the index when
-it starts. From the command line, a query answers from the old index with
-"This index was built by an older code-graph (index v142, this binary
-v143): answers come from it until it is rebuilt — run: code-graph-mcp
-reindex", and the first `incremental-index` prints "Index version mismatch
-(stored v142 ≠ binary v143): clearing + rebuilding". To pin the binary
-back: `npm i -g @sdsrs/code-graph@0.198.0` (or, from source, `cargo install
---locked --git https://github.com/sdsrss/code-graph-mcp --tag v0.198.0
---features embed-model`), then delete `~/.cache/code-graph/bin/code-graph-mcp`
-and set `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The
-plugin's scripts are unchanged.
+because the stored graph changes for unchanged source: Python calls and
+references in a file with a renamed import (below). The MCP server rebuilds
+the index when it starts. From the command line, a query answers from the
+old index with "This index was built by an older code-graph (index v142,
+this binary v143): answers come from it until it is rebuilt — run:
+code-graph-mcp reindex", and the first `incremental-index` prints "Index
+version mismatch (stored v142 ≠ binary v143): clearing + rebuilding". To pin
+the binary back: `npm i -g @sdsrs/code-graph@0.198.0` (or, from source,
+`cargo install --locked --git https://github.com/sdsrss/code-graph-mcp --tag
+v0.198.0 --features embed-model`), then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set `CODE_GRAPH_NO_AUTO_UPDATE=1`,
+as described under 0.171.0. The plugin's scripts are unchanged.
 
 ### fix: `from m import a as b` no longer counts as an import of `a`
 
@@ -25,30 +25,33 @@ whether the file imports the target, and took the renamed import as an
 import of `a`. It now counts as an import of `b` only, so `a()` binds `n.a`
 alone. Where nothing in the file binds `a`, its by-name edges are
 `ambiguous`; before, the renamed import made `m.a` `inferred` and dropped
-the others. A call of `b` that 0.198.0 left to by-name resolution, such as
-one after `from m import a as b` inside a function, binds `m.a` when `b` is
-the only name the file imports as `b`, as a call through a plain import
-does.
+the others. A call of `b` that 0.198.0 resolves by name (after
+`from m import a as b` inside a function, on a parameter named `b`, or in a
+module that also assigns `b`) loses its edges to other definitions of `b`,
+which the import contradicts, and gains none: 0.198.0 bound each of these
+to an unrelated `def b` of another file.
 
 Measured on five projects, each indexed by 0.198.0 and by this version from
-identical copies, `calls` rows compared with their confidence:
+identical copies, edges of every relation compared with their confidence:
 
-- CPython 3.14's standard library (569 files): 38 rows removed, 1 added.
-  36 bound `_()` in `argparse.py`, `getopt.py` and `optparse.py`, where `_`
-  is `from gettext import gettext as _`, to `importlib/resources/_common.py`'s
-  `_` (`ambiguous`). In `_pyrepl/readline.py`, `Console(...)` lost its edge to
-  `console.Console`: the file binds `Console` to `UnixConsole` or
-  `WindowsConsole` and renames the other with `from .console import Console
-  as ConsoleType`. `random._test_generator` calls `mean()` after
-  `from statistics import stdev, fmean as mean`: it binds `statistics.fmean`
-  instead of `statistics.mean` and `NormalDist.mean`.
-- A private application (1,258 Python files): 4 removed, each a call of `X`
-  in a file that imports `X` and renames another `X` (`AIProvider as
-  AIProviderSchema`, `CL3Signal as CL3SignalModel`), bound to the renamed
-  one; 1 added, `load_active_config()` after a function-level
-  `from ... import load_active_config_standalone as load_active_config`.
+- CPython 3.14's standard library (569 files): 38 `calls` rows removed,
+  none added. 35 bound `_()` in `argparse.py`, `getopt.py` and `optparse.py`,
+  where `_` is `from gettext import gettext as _`, to
+  `importlib/resources/_common.py`'s `_` (`ambiguous`). In
+  `_pyrepl/readline.py`, `Console(...)` lost its edge to `console.Console`:
+  the file binds `Console` to `UnixConsole` or `WindowsConsole` and renames
+  the other with `from .console import Console as ConsoleType`.
+  `random._test_generator` calls `mean()` after
+  `from statistics import stdev, fmean as mean`: its edges to
+  `statistics.mean` and `NormalDist.mean` are gone.
+- A private application (1,258 Python files): 4 `calls` rows removed and 4
+  `references` rows relabelled from `inferred` to `ambiguous`, each to a
+  class the file imports renamed while it imports another of that name:
+  `AIProvider as AIProviderSchema` (2 calls, 1 reference), `CL3Signal as
+  CL3SignalModel` (2 calls, 2 references), `DataSource as
+  ProviderDataSource` (1 reference).
 - nltk 3.9.2 (358 files), flask 3.1.0 and this repository (Rust,
-  JavaScript, Python): no row changed.
+  JavaScript, Python): no edge changed.
 
 ### fix: an import of a definition that moved between files in one run is re-resolved
 
@@ -58,20 +61,30 @@ import a` while `impl.py` was empty) bound to that file's module, so calls
 reaching `a` through it, as through a package's `__init__.py` re-exporting
 it, had no edge until a rebuild. The run decides which names gained a
 definition by counting them over the files it changed, and one added and
-one deleted summed to no change; it counts them per file now. Incremental
-runs over 526 and 669 changed files took 5.71 s and 2.88 s, against 5.96 s
-and 3.05 s for 0.198.0 (one run each).
+one deleted summed to no change. For such an import it counts them per
+file now; everything else it re-resolves is still counted over the run. On
+five runs that moved or swapped standard-library, nltk and private
+application files (57, 1, 56, 53 and 2 files), the run re-extracted as many
+files as 0.198.0 (7, 21, 2, 9 and 2); three runs of the largest took 3.431 s
+median against 3.472 s.
 
 ### Not covered
 
+- Moving or swapping files in one incremental run can leave calls a
+  rebuild does not have, and miss some it has, as in 0.198.0: moving
+  `email/`, `json/` and `xml/` of the standard library into a subdirectory
+  left 1,292 `calls` rows only in the incremental index and 69 only in a
+  rebuild; swapping `shutil.py` and `tempfile.py`, 132 and 5 (4 calls, 1
+  reference). A rebuild
+  (`code-graph-mcp rebuild-index --confirm`) gives the rebuilt answer.
 - The same shape in JavaScript and TypeScript is unchanged: with
   `import { x as z } from './m.js'` and `import { x } from './o.js'`, or
   `import { y } from './re.js'` where `re.js` has `export { x as y } from
   './m.js'`, a call `x()` binds `m.x` and `o.x`, both `inferred`. An `imports`
   edge does not record the local name of `import { x as z }`.
 - A function's renamed import counts for the whole file, as a plain import
-  does: after `def f(): from m import a as b`, a `b()` in another function,
-  where Python raises `NameError`, binds `m.a` too.
+  does: after `def f(): from m import a as b`, a `b()` in another function
+  loses its by-name edges too.
 
 ## 0.198.0
 

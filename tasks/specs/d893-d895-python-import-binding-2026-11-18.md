@@ -40,3 +40,22 @@
 
 - a0e73ed0：D#893（INDEX_VERSION 142 → 143，指纹按只含 D#893 的树重录）。
 - 下一个提交：D#895（指纹按完整树重录，仍为 v143）。
+
+## 评审 R1（新起的子代理，盲审 v0.198.0..44eebf41）：HIGH 0 / MEDIUM 4 / LOW 3 / NOTE 5
+
+| # | 结论 | 处理 |
+|---|------|------|
+| MEDIUM-1（实测） | 绑定阶段（`cg_unique_imports`）按别名登记后，借一条“恰好有个无关的同名 `b`”留下的按名边把 `go → m.a` 绑上；那个 `b` 删掉或改名后增量留着这条边，重建没有（s8/s8c/s18/s22/s24，0.198.0 都 0/0） | 修（只减不增）：绑定阶段不读 Python 改名导入（`$.as IS NULL`）。改名导入的调用归 D#726 的 pyimp；剪枝与置信度仍按别名。评审 16 个序列在修复版上全部 0/0。测试加函数内改名、参数、try 里模块级三种写法及三个增量序列 |
+| MEDIUM-2（实测） | CHANGELOG “`b` 是唯一导入名时 `b()` 绑 `m.a`，和普通导入一样”不成立：没有无关 `b` 时无边，有时是 `ambiguous`，三个阶段对别名边意见不一 | 随 MEDIUM-1 修复后该句删除；改写为实测：这些 `b()` 在 0.198.0 都按名绑到无关的 `other.b`，现在无边（fl/param/tried/另一个函数 4 处，两版实跑） |
+| MEDIUM-3（实测） | D#895 的开销说法不成立：我引的两组运行扇出两版相同（改动没起作用），时间差是构建差异；移动文件时扇出 7 → 285、耗时 3.41 → 6.54 s | 修：只有相对导入回退到 `<module>` 的那一支按文件计数（`cg_fanout_up_file`），其余分支（按名调用方、Python/JS 导入、Rust use 两支、re-export）恢复整次运行求和。先试过“所有导入类分支按文件”（head2）：变异 RB3–RB6 存活，绝对导入 mi1/mi2、JS js1 在 0.198.0 上本来就与重建一致，只有相对回退 mi3 不一致，故收窄到这一支（head3）。head3：五个移动/互换场景扇出与 0.198.0 相同（7、21、2、9、2），标准库三包移动三次中位 3.472 → 3.431 s；评审 16 个序列 + mi1/mi2/mi3/js1 全部 0/0。测试 `an_ordinary_edit_does_not_drag_callers_into_a_fanout_round` 加“定义在文件间移动不重新抽取调用方”一臂 |
+| MEDIUM-4（实测） | “36 条 `_()`”应为 35（argparse 19 + getopt 4 + optparse 12） | 改 CHANGELOG 与 INDEX_VERSION 注释 |
+| LOW-1（实测） | 私有应用还有 4 条 `references` 从 inferred 改为 ambiguous，说明只写了 calls | 改为比较所有关系；写进 CHANGELOG（逐条核对都是改名导入原名上的错边，如 `DataSource as ProviderDataSource`） |
+| LOW-2（实测/读码） | 审计守卫抓不住 `env: CARGO_HOME` + 仓库里的 audit.toml、`make audit`、`rustsec/audit-check` 的 `ignore:` | 开放域，不改；守卫覆盖 `--ignore ID`、`--ignore=ID`、项目 `.cargo/audit.toml` 与 ci.yml 里出现 `audit.toml` 字样，记在发版手册 |
+| LOW-3（实测） | 变异 PM4（绑定阶段不读别名）、FM4（计数下降也扇出）存活 | PM4 即本次修复方向，现由新夹具区分；FM4 是开销，不改 |
+| NOTE-1 | 参数调用 `def go(b): b()` 的 `ur` 边被别名绑定替换 | 随 MEDIUM-1 修复不再绑定；现在该按名边被剪掉（与普通导入同） |
+| NOTE-2 | 按文件计数顺带消除了移动场景下与重建的大量差异（三包移动 873 行） | 修复后回到 0.198.0 的差异（三包移动 1,292/69、互换 132/5、nltk 14），写进 Not covered，记 D#899 |
+| NOTE-3 | `CODE_GRAPH_PARSE_TIMEOUT_MS=1` 时 round-two 测试里一个小 `parse_tree` 失败 | 输入很小，不改 |
+| NOTE-4 | `IMPORT_EDGE_NAME` 落在 `bind_calls_to_imported_targets` 游离文档块下面 | 常量移到游离块之上（游离块本身是旧问题） |
+| NOTE-5 | daagu 增量比重建慢、`references` 差异 | 已有问题（D#898） |
+
+修复后（cg-head2，与最终的 head3 在五个语料上逐行相同）对 0.198.0，所有关系：标准库 −38 calls（35 `_` + `Console` + 2 `mean`），+0；私有应用 −4 calls、4 条 references inferred→ambiguous；nltk、flask、本仓库逐行相同。`fmean`、`load_active_config_standalone` 两条新增边随绑定阶段收窄消失。

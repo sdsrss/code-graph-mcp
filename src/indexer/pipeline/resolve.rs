@@ -864,6 +864,13 @@ pub(super) fn resolve_pending_calls_touching(
     Ok(edges_added)
 }
 
+/// The name an `imports` edge `ie` to node `itn` binds in the importing file,
+/// as SQL: the name a renamed JS re-export's edge imports beside a target of
+/// another name (D#740), else the name a Python `from m import a as b` binds
+/// (`b`, D#893), else the target's own.
+const IMPORT_EDGE_NAME: &str = "COALESCE(json_extract(ie.metadata, '$.imported'), \
+     json_extract(ie.metadata, '$.as'), itn.name)";
+
 /// Positively resolve bare-name `calls` edges to the node an explicit import in
 /// the caller's file binds them to. Runs once after all call edges exist (post
 /// Phase-2 + pending sweep), immediately before
@@ -891,13 +898,6 @@ pub(super) fn resolve_pending_calls_touching(
 ///   edges resolve by proximity, agrees with the call and gains nothing here).
 ///
 /// Returns the number of edges inserted.
-/// The name an `imports` edge `ie` to node `itn` binds in the importing file,
-/// as SQL: the name a renamed JS re-export's edge imports beside a target of
-/// another name (D#740), else the name a Python `from m import a as b` binds
-/// (`b`, D#893), else the target's own.
-const IMPORT_EDGE_NAME: &str = "COALESCE(json_extract(ie.metadata, '$.imported'), \
-     json_extract(ie.metadata, '$.as'), itn.name)";
-
 /// Build a TEMP table of every `imports` edge as (caller file, imported name,
 /// imported target), indexed both ways.
 ///
@@ -1542,6 +1542,7 @@ pub(super) fn drop_fanout_temps(conn: &rusqlite::Connection) -> Result<()> {
          DROP TABLE IF EXISTS temp.cg_fanout_before;
          DROP TABLE IF EXISTS temp.cg_fanout_after;
          DROP TABLE IF EXISTS temp.cg_fanout_up;
+         DROP TABLE IF EXISTS temp.cg_fanout_up_file;
          DROP TABLE IF EXISTS temp.cg_shape_before;",
     )?;
     Ok(())
@@ -1728,13 +1729,18 @@ pub(super) fn importers_of_python_reexport_drift(
 ///
 /// Two halves, both read off state that already exists rather than re-derived:
 ///
-/// * **Which names.** Those whose definition count ROSE in one of this run's
-///   own paths — up only, unlike `scope_names_from_count_drift`'s symmetric
+/// * **Which names.** Those whose definition count inside this run's own paths
+///   ROSE — up only, unlike `scope_names_from_count_drift`'s symmetric
 ///   difference. A name that LOST a definition needs no new edge; the surviving
-///   edges only need the relabel the post passes already do. Per path, not
-///   summed over the run: a run that defines `a` in `impl.py` and deletes
-///   another file's `a` gains a definition an import of `impl.py` can bind,
-///   and the sum, unchanged, hid it (D#895).
+///   edges only need the relabel the post passes already do. Summed over the
+///   run (`cg_fanout_up`), except for a relative import that fell back to its
+///   module's `<module>` node, which is counted per file
+///   (`cg_fanout_up_file`): a run that defines `a` in `impl.py` and deletes
+///   another file's `a` gives `from .impl import a` a definition, and the
+///   unchanged sum hid it (D#895). Per file for every arm re-extracted 285
+///   files instead of 7 when three standard-library packages moved (0.199.0
+///   review R1), and changed no edge in the other arms' moves measured then
+///   (an absolute Python import, a JS import).
 /// * **Which callers.** Files outside the run holding a `calls` edge to that
 ///   name that Phase 2e has just labelled `ambiguous`. `conf_case` assigns that
 ///   label exactly when the target name's count is >1 AND the caller's file does
@@ -1755,9 +1761,9 @@ pub(super) fn bare_name_callers_of_new_duplicates(
 ) -> Result<Vec<String>> {
     use crate::domain::{CONF_AMBIGUOUS, REL_CALLS, REL_IMPORTS, REL_REFERENCES};
 
-    // `(nm, lang)` all the way through, never `nm` alone. Counted per path, so
-    // one pair can rise in two paths: DISTINCT keeps the pairs unique. Carrying
-    // the language is what keeps the round from firing across
+    // `(nm, lang)` all the way through, never `nm` alone. Counted per path and
+    // summed per pair for `cg_fanout_up`; one pair can rise in two paths, so
+    // `cg_fanout_up_file` takes DISTINCT pairs. Carrying the language is what keeps the round from firing across
     // languages: a rise in the JavaScript count of `render` says nothing about a
     // Python caller of `render`, because `conf_case` joins its name count as
     // `nc.lang IS tf.language` and so can never label that pair `ambiguous` in
@@ -1777,12 +1783,22 @@ pub(super) fn bare_name_callers_of_new_duplicates(
          CREATE INDEX cg_fanout_after_k ON cg_fanout_after(path, nm, lang);
          DROP TABLE IF EXISTS temp.cg_fanout_up;
          CREATE TEMP TABLE cg_fanout_up AS
+           SELECT a.nm AS nm, a.lang AS lang
+           FROM (SELECT nm, lang, SUM(cnt) AS cnt FROM cg_fanout_after
+                 GROUP BY nm, lang) a
+           LEFT JOIN (SELECT nm, lang, SUM(cnt) AS cnt FROM cg_fanout_before
+                      GROUP BY nm, lang) b
+             ON b.nm = a.nm AND b.lang IS a.lang
+           WHERE a.cnt > COALESCE(b.cnt, 0);
+         CREATE INDEX cg_fanout_up_k ON cg_fanout_up(nm, lang);
+         DROP TABLE IF EXISTS temp.cg_fanout_up_file;
+         CREATE TEMP TABLE cg_fanout_up_file AS
            SELECT DISTINCT a.nm AS nm, a.lang AS lang
            FROM cg_fanout_after a
            LEFT JOIN cg_fanout_before b
              ON b.path = a.path AND b.nm = a.nm AND b.lang IS a.lang
            WHERE a.cnt > COALESCE(b.cnt, 0);
-         CREATE INDEX cg_fanout_up_k ON cg_fanout_up(nm, lang);",
+         CREATE INDEX cg_fanout_up_file_k ON cg_fanout_up_file(nm, lang);",
     )?;
 
     // BOTH relations `conf_case` can label `ambiguous`, not just `calls`:
@@ -1893,7 +1909,7 @@ pub(super) fn bare_name_callers_of_new_duplicates(
          WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)
            AND EXISTS (
                SELECT 1 FROM nodes n
-               CROSS JOIN cg_fanout_up u ON u.nm = n.name AND u.lang IS tf.language
+               CROSS JOIN cg_fanout_up_file u ON u.nm = n.name AND u.lang IS tf.language
                WHERE n.file_id = tf.id AND n.name <> '<module>'
            )"
     );
@@ -2251,6 +2267,11 @@ pub(super) fn bind_calls_to_imported_targets(
            AND itf.path <> '<external>'
            -- a `P.X()` call's synthetic import binds no bare `X()` (D#518)
            AND json_extract(ie.metadata, '$.attr') IS NULL
+           -- nor does a Python `from m import a as b`: a call of `b` it binds
+           -- is D#726's `pyimp` call, and a bare one has a by-name edge only
+           -- while some unrelated `b` exists, so binding through it left an
+           -- edge a rebuild lacks once that `b` went (0.199.0 review R1)
+           AND json_extract(ie.metadata, '$.as') IS NULL
          GROUP BY 1, 2
          HAVING COUNT(DISTINCT itn.id) = 1"
         ),

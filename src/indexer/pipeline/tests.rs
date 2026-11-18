@@ -9498,6 +9498,19 @@ fn an_ordinary_edit_does_not_drag_callers_into_a_fanout_round() {
         "an edit that adds no same-name definition must not re-extract the caller"
     );
 
+    // Nor does one run moving the definition to another file: the by-name pool
+    // keeps two `helper`s, so the callers are counted over the run, not per
+    // file. Per file, moving three standard-library packages re-extracted 285
+    // files instead of 7 and took 6.60 s against 3.45 s (0.199.0 review R1).
+    fs::remove_file(src.join("a.py")).unwrap();
+    fs::write(src.join("e.py"), "def helper():\n    pass\n").unwrap();
+    run_incremental_index(&db, project_dir.path(), None, None).unwrap();
+    assert_eq!(
+        node_ids_of("src/b.py"),
+        b_before,
+        "a definition moving between files must not re-extract the bare-name caller"
+    );
+
     // Contrast arm, so the assertion above cannot pass by the round being dead:
     // a THIRD `helper` appears, and now b.py must be re-extracted.
     fs::write(src.join("d.py"), "def helper():\n    pass\n").unwrap();
@@ -12746,6 +12759,49 @@ fn test_python_renamed_import_does_not_bind_its_original_name() {
         py_calls_with_confidence(&db, "app/only.py", "go"),
         ["app/n.py:a ambiguous"]
     );
+
+    // Nor does the bind pass read the renamed import under its alias: a bare
+    // `b()` (here one D#726 leaves to by-name resolution) has a by-name edge
+    // only while some unrelated `b` exists, and binding `m.a` through it left
+    // an edge a rebuild lacks once that `b` went (0.199.0 review R1). The
+    // by-name `other.b` is the import's to contradict, so the call has none.
+    let fl = &[
+        ("app/__init__.py", ""),
+        ("app/m.py", "def a():\n    return 1\n"),
+        ("app/n.py", "def a():\n    return 2\n"),
+        ("app/other.py", "def b():\n    return 9\n"),
+        (
+            "app/fl.py",
+            "def go():\n    from app.m import a as b\n    return b()\n",
+        ),
+        (
+            "app/param.py",
+            "def go(b):\n    return b()\n\n\ndef f():\n    from app.m import a as b\n    return 0\n",
+        ),
+        (
+            "app/tried.py",
+            "try:\n    from app.m import a as b\nexcept ImportError:\n    b = None\n\n\n\
+             def go():\n    return b()\n",
+        ),
+    ];
+    let (_p, _d, db) = fresh_index_of(fl);
+    for path in ["app/fl.py", "app/param.py", "app/tried.py"] {
+        assert_eq!(
+            py_calls_with_confidence(&db, path, "go"),
+            Vec::<String>::new(),
+            "{path}"
+        );
+    }
+    for after in [
+        vec![("app/other.py", None)],
+        vec![("app/other.py", Some("def b2():\n    return 9\n"))],
+        vec![
+            ("app/other.py", None),
+            ("app/m.py", Some("def a():\n    return 11\n")),
+        ],
+    ] {
+        assert_incremental_matches_rebuild(fl, &after);
+    }
 }
 
 /// Index `before`, apply each step (None deletes) with an incremental run
