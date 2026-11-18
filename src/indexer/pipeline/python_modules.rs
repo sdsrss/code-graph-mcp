@@ -267,10 +267,16 @@ pub(super) fn py_import_call_targets(
     let Some(files) = project_module_files_from(module, caller_path, python_module_map) else {
         return Ok(None);
     };
+    // A nested `def` or class keeps its bare name as its qualified name, so
+    // only the lines of a definition around it tell it is not the module's
+    // (as `python_import_candidates` tells a nested `def`).
     let mut stmt = conn.prepare_cached(
         "SELECT n.id FROM nodes n JOIN files f ON f.id = n.file_id
          WHERE f.path = ?1 AND n.name = ?2 AND n.type IN ('function', 'class')
-           AND COALESCE(n.qualified_name, n.name) = n.name
+           AND NOT EXISTS (SELECT 1 FROM nodes o
+                           WHERE o.file_id = n.file_id
+                             AND o.type IN ('function', 'method', 'class')
+                             AND o.start_line < n.start_line AND n.end_line <= o.end_line)
          ORDER BY n.id",
     )?;
     let mut ids = Vec::new();

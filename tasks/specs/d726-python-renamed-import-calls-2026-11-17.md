@@ -63,3 +63,20 @@ JS 的改名导入调用（`member::js_renamed_import_call`）被记成导出名
   - P8（inbound 恢复按名）：恢复对带元数据的调用已按限定名过滤；补了“重导出删除且目标文件同时改动”一例仍相等，未找到能区分的输入。
   - P9（pyimp 不豁免置信度降级）：试了一层、两层包重导出加同名函数，导入表已为目标作证，走不到豁免；保留与 JS `imp` 对称。
   - P11（延后阶段空结果不进 pending）：未找到能区分的输入（“export 回来后重新绑上”那一例在变异下也通过）；推测调用方在模块文件改动时经由别的路径被重新解析，未核实。
+
+## 评审 R1（0.198.0 发版前，新起的子代理，盲审，对 e36795da）：HIGH 0 / MEDIUM 1 / LOW 2 / NOTE 8
+
+| # | 结论 | 处理 |
+|---|------|------|
+| MEDIUM-1（实测） | 直接查找的 SQL 用 `COALESCE(qualified_name, name) = name` 当“只要模块级”，但 Python 的嵌套 `def`/类中类的限定名就是平名，条件不起作用：`retry` 里嵌套的 `wrapper`、方法体里的 `class Inner` 都被绑上（我在小夹具上复现：`user.py` 的 `w()` 得到第 1 行和第 6 行两个 `wrapper`） | 修（只减不增）：照 `resolve.rs` `python_import_candidates` 的写法，目标被同文件的 function/method/class 节点按行包含就排除，去掉不起作用的条件。RED：夹具加 `deco` 里嵌套的 `wilson_ci` 与 `Box.Tally`，修前 `go_ci` 两条、`go_tally` 一条；修后通过。v142 未发布，抽取指纹按同一版本重录。四个语料在修复后的构建（nodef md5 1c1685b9）上与修复前逐字节相同 |
+| LOW-1（实测） | `match` 捕获、`type` 语句、类型参数、推导式里的 `:=` 重绑定没被识别，仍绑到导入；CHANGELOG“Only a name … nothing else counts”不成立 | 不改代码（LOW 的修复风险最高）；CHANGELOG 改写绑定条件的说法，并把这四种写进 Not covered（评审用 `ast` 扫描标准库、nltk、flask：0 处） |
+| LOW-2（实测） | 默认构建的依赖也变了 | 我核对：默认依赖树里版本变化的只有 libc 0.2.183→0.2.191、regex-automata 0.4.14→0.4.18、zeroize 1.8.2→1.9.2（constant_time_eq 0.4.2 两边都有，0.6.1 只在 embed）；写进 CHANGELOG |
+| NOTE-1 | 同文件的改名导入边是 `extracted` | CHANGELOG 改为“跨文件 `inferred`、同文件 `extracted`” |
+| NOTE-2 | 漏绑：包里改名再导出、星号再导出等 | 包的改名/星号再导出写进 Not covered；其余（默认参数 `alias=alias`、只有注解、只读 `global`）退回按名，保守，不写 |
+| NOTE-3 | 0.197.0 也按名绑到方法和类 | CHANGELOG 改为“functions, methods and classes” |
+| NOTE-4 | v142 注释说库模块“保留按名解析” | 改为“库模块不建边（以前按名绑到项目同名定义）” |
+| NOTE-5 | 审计守卫只认 `--ignore ID`，`--ignore=ID` 与 `.cargo/audit.toml` 漏过（0.198.0 之前就有） | 不在本次范围；记为延期条目 |
+| NOTE-6 | 评审自造变异 M04（class 不算绑定）、M05（`+=`）、M08（函数内 import/def 当成模块级）等存活 | 夹具加 `class Klass`、`counter += 1`、函数内 `from … import … as ci`，用评审的变异定义重跑：M04/M05/M08 都被杀死；M07/M13/M11/M17/M18 与我的 P4/P5/P6/P9 同类，见上 |
+| NOTE-7 | 标准库新增 27 条里 7 条指向 `operator.py` 的纯 Python 定义，运行时被 `from _operator import *`（`operator.py:422`）替换 | 写进 Not covered 的星号导入一条 |
+| NOTE-8 | `from m import a as b; from n import a` 后 `a()` 两版都没有指向 `n.a` 的边，与 D#726 无关 | 记为延期条目 |
+| 环境 | 评审误在真实仓库目录跑了 `incremental-index`，本仓库 `.code-graph/index.db` 被重建为 v142（含超 1 MiB 的 CHANGELOG.md）；已装的 0.197.0 拒绝写它 | 0.198.0 发布后用它 `rebuild-index --confirm` 重建，不删文件 |

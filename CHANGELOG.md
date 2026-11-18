@@ -23,14 +23,15 @@ plugin's scripts are unchanged.
 ### fix: a Python call through `from m import a as b` binds `a` of module `m`
 
 `b()` after `from m import a as b` was recorded as a call to `b` and bound
-by name: to nothing when no project function is called `b`, else to
-project functions called `b`. It is now a call to `a` in the files of module `m`,
-through a package's `__init__.py` re-export, at `inferred` confidence; a
-module outside the project gives no edge. Only a name the module binds
-through one such import and nothing else counts: a `def`, `class`,
-assignment, loop or `with` target, another import of the name, a function's
-`global` of it, or a parameter or local of the calling function keeps the
-by-name resolution.
+by name: to nothing when the project has nothing called `b`, else to the
+project's functions, methods and classes called `b`. It is now a call to the
+module-level `a` in the files of module `m`, or through a package's
+`__init__.py` re-export, at `inferred` confidence across files (`extracted`
+within one); a module outside the project gives no edge. A name the module
+also binds with a `def`, `class`, assignment (`+=` and `:=` included), loop
+or `with` target or another import, or that a function declares `global`,
+keeps the by-name resolution, and so does a call whose function binds the
+name as a parameter or local, its own import included.
 
 Measured on four projects, each indexed by 0.197.0 and by this version from
 identical copies, call pairs compared by caller and callee:
@@ -55,7 +56,9 @@ identical copies, call pairs compared by caller and callee:
 
 ### deps: candle 0.9.2 → 0.11.1, tokenizers 0.22 → 0.23
 
-candle 0.11.1 depends on zip 9.6.1 instead of 7.2.0. `cargo audit`
+candle 0.11.1 depends on zip 9.6.1 instead of 7.2.0. The lock also moves
+libc 0.2.183 → 0.2.191, regex-automata 0.4.14 → 0.4.18 and zeroize
+1.8.2 → 1.9.2, which the default build (without `embed-model`) uses too. `cargo audit`
 (0.22.2) reports 8 vulnerabilities against 0.197.0's lock, all in zip 7.2.0,
 and none against this one; CI had ignored the 8 (code-graph-mcp loads the
 model from safetensors files and reaches none of the zip code they concern)
@@ -75,8 +78,18 @@ load included; code-graph-mcp does not limit the threads it uses.
 
 - A call written directly in a class body is judged as the module's: a class
   attribute named like the alias does not stop it binding to the import.
+- Rebinding by a `match` capture, a `type` statement, a type parameter
+  (`def f[b]()`) or a `:=` inside a comprehension is not seen: the call still
+  binds to the import. A pre-release review found none of these shapes in the
+  standard library, nltk or flask.
+- A package that re-exports the name under another name or through a star
+  import (`from .impl import _c as c`, `from .impl import *` in
+  `__init__.py`) gives no edge.
 - Star imports are not read, so a name a star import also binds is judged
-  by the renamed import alone. `ntpath.py` binds `islink` with
+  by the renamed import alone. A module that replaces its own definitions
+  with one keeps them as the targets: 7 of the 27 standard-library edges
+  above go to `operator.py`'s `index` and `itemgetter`, which its
+  `from _operator import *` replaces at run time. `ntpath.py` binds `islink` with
   `from genericpath import *`, then inside `try` with
   `from nt import _path_islink as islink`: the call now binds only `nt`'s,
   outside the project, and loses its edge to `genericpath.islink`, which

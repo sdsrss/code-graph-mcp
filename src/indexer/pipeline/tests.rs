@@ -12276,7 +12276,10 @@ const D726_TREE: &[(&str, &str)] = &[
         "app/dates.py",
         "def parse_date_param(v):\n    return v\n\n\nclass Model:\n    def parse_date_param(self):\n        return 1\n",
     ),
-    ("app/stats.py", "def wilson_ci(n):\n    return n\n\n\nhandler = len\n"),
+    (
+        "app/stats.py",
+        "def wilson_ci(n):\n    return n\n\n\nhandler = len\n\n\ndef deco(n):\n    def wilson_ci(x):\n        return x\n\n    return wilson_ci\n\n\nclass Box:\n    class Tally:\n        pass\n",
+    ),
     (
         "app/other.py",
         "def parse_date_param(v):\n    return 2\n\n\ndef helper():\n    return 4\n\n\ndef deep_fn():\n    return 6\n",
@@ -12299,18 +12302,25 @@ from app.stats import wilson_ci as gl\n\
 try:\n    from app.stats import wilson_ci as either\n\
 except ImportError:\n    from app.dates import parse_date_param as either\n\
 from app.stats import handler as hh\n\
+from app.stats import Tally as tally\n\
 from app.stats import wilson_ci as looped\n\
 from app.stats import wilson_ci as withed\n\
 from app.stats import wilson_ci as walrused\n\
 from app.stats import wilson_ci as plain\n\
 from app.stats import wilson_ci as modalias\n\
 from app.stats import wilson_ci as assigned\n\
+from app.stats import wilson_ci as Klass\n\
+from app.stats import wilson_ci as counter\n\
 import plain\n\
 import json as modalias\n\
 for looped in []:\n    pass\n\
 with open(__file__) as withed:\n    pass\n\
 if (walrused := None):\n    pass\n\
 assigned = None\n\
+counter += 1\n\
+\n\
+\n\
+class Klass:\n    pass\n\
 \n\
 \n\
 def wilson_ci(n):\n    return 0\n\n\n\
@@ -12329,12 +12339,16 @@ def go_comp(xs):\n    return [ci() for ci in xs]\n\n\n\
 def go_lambda():\n    return lambda ci: ci()\n\n\n\
 def go_nested():\n    ci = None\n\n    def inner():\n        return ci()\n\n    return inner\n\n\n\
 def go_hh():\n    return hh()\n\n\n\
+def go_tally():\n    return tally()\n\n\n\
 def go_looped():\n    return looped()\n\n\n\
 def go_withed():\n    return withed()\n\n\n\
 def go_walrused():\n    return walrused()\n\n\n\
 def go_plain():\n    return plain()\n\n\n\
 def go_modalias():\n    return modalias()\n\n\n\
-def go_assigned():\n    return assigned()\n",
+def go_assigned():\n    return assigned()\n\n\n\
+def go_klass():\n    return Klass()\n\n\n\
+def go_counter():\n    return counter()\n\n\n\
+def go_localimp():\n    from app.dates import parse_date_param as ci\n\n    return ci()\n",
     ),
 ];
 
@@ -12360,6 +12374,7 @@ fn py_calls_from(db: &Database, path: &str, caller: &str) -> Vec<String> {
 fn check_d726_calls(db: &Database, when: &str) {
     let want: &[(&str, &[&str])] = &[
         ("go_date", &["app/dates.py:function:parse_date_param"]),
+        // The module-level `wilson_ci`, not the one `deco` defines.
         ("go_ci", &["app/stats.py:function:wilson_ci"]),
         // Through the package's re-export.
         ("go_h", &["app/pkg/impl.py:function:helper"]),
@@ -12380,6 +12395,8 @@ fn check_d726_calls(db: &Database, when: &str) {
         ("inner", &[]),
         // Only functions and classes bind: a module-level variable does not.
         ("go_hh", &[]),
+        // A class nested in a class is not the module's: the import fails.
+        ("go_tally", &[]),
         // A loop, `with` and walrus target, a plain import, an `import … as`
         // and an assignment at module level rebind the name too.
         ("go_looped", &[]),
@@ -12388,6 +12405,11 @@ fn check_d726_calls(db: &Database, when: &str) {
         ("go_plain", &[]),
         ("go_modalias", &[]),
         ("go_assigned", &[]),
+        ("go_counter", &[]),
+        // A class of the name: the call is the class's.
+        ("go_klass", &["app/views.py:class:Klass"]),
+        // The function's own import binds `ci`, not the module's.
+        ("go_localimp", &[]),
     ];
     let wrong: Vec<String> = want
         .iter()
