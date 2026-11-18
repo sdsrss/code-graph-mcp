@@ -2601,12 +2601,23 @@ fn audit_ignores_hold_only_while_their_reason_does() {
     const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    // cargo-audit 0.22 takes ignores from `--ignore ID`, `--ignore=ID`, and
+    // the first of `./.cargo/audit.toml` and `$CARGO_HOME/audit.toml` that
+    // exists (`config_path` in its src/commands.rs). Only the flags are read
+    // here, so a config file would ignore advisories this test never sees.
+    assert!(
+        !root.join(".cargo/audit.toml").exists() && !ci.contains("audit.toml"),
+        "an audit.toml would ignore advisories past AUDIT_IGNORES: put each \
+         ignore on ci.yml's `cargo audit` line, with its row here"
+    );
     let mut ignored = BTreeSet::new();
     for line in yaml_directives(workflow_job(&ci, "audit")) {
         let mut words = line.split_whitespace();
         while let Some(w) = words.next() {
             if w == "--ignore" {
                 ignored.insert(words.next().expect("--ignore takes an id").to_string());
+            } else if let Some(id) = w.strip_prefix("--ignore=") {
+                ignored.insert(id.to_string());
             }
         }
     }
