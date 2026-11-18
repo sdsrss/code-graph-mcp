@@ -12289,6 +12289,23 @@ const D726_TREE: &[(&str, &str)] = &[
     ("app/deep/sub/impl.py", "def deep_fn():\n    return 5\n"),
     ("app/pkg/__init__.py", "from .impl import helper\n"),
     ("app/pkg/impl.py", "def helper():\n    return 3\n"),
+    // `rp_fn` sits below another definition of its file and inside the lines
+    // of `long_fn`, another file's: a nesting test that compared any earlier
+    // start, or the definitions of another file, would drop it.
+    (
+        "app/long.py",
+        "def long_fn():\n    x = 1\n    x += 1\n    x += 1\n    x += 1\n    x += 1\n    x += 1\n    x += 1\n    x += 1\n    x += 1\n    return x\n",
+    ),
+    ("app/rp/__init__.py", "from .impl import rp_fn\n"),
+    (
+        "app/rp/impl.py",
+        "def first():\n    return 0\n\n\ndef rp_fn():\n    return 1\n\n\ndef outer():\n    def rp_fn():\n        return 2\n\n    return rp_fn\n\n\nclass K:\n    class rp_fn:\n        pass\n",
+    ),
+    ("app/rq/__init__.py", "from .impl import rq_fn\n"),
+    (
+        "app/rq/impl.py",
+        "def outer():\n    def rq_fn():\n        return 1\n\n    return rq_fn\n\n\nclass K:\n    class rq_fn:\n        pass\n",
+    ),
     (
         "app/views.py",
         "from app.dates import parse_date_param as _parse_date_param\n\
@@ -12311,6 +12328,9 @@ from app.stats import wilson_ci as modalias\n\
 from app.stats import wilson_ci as assigned\n\
 from app.stats import wilson_ci as Klass\n\
 from app.stats import wilson_ci as counter\n\
+from app.rp import rp_fn as rpa\n\
+from app.rp.impl import rp_fn as rpd\n\
+from app.rq import rq_fn as rqa\n\
 import plain\n\
 import json as modalias\n\
 for looped in []:\n    pass\n\
@@ -12348,6 +12368,9 @@ def go_modalias():\n    return modalias()\n\n\n\
 def go_assigned():\n    return assigned()\n\n\n\
 def go_klass():\n    return Klass()\n\n\n\
 def go_counter():\n    return counter()\n\n\n\
+def go_rpa():\n    return rpa()\n\n\n\
+def go_rpd():\n    return rpd()\n\n\n\
+def go_rqa():\n    return rqa()\n\n\n\
 def go_localimp():\n    from app.dates import parse_date_param as ci\n\n    return ci()\n",
     ),
 ];
@@ -12410,6 +12433,12 @@ fn check_d726_calls(db: &Database, when: &str) {
         ("go_klass", &["app/views.py:class:Klass"]),
         // The function's own import binds `ci`, not the module's.
         ("go_localimp", &[]),
+        // Through the package's re-export as from the defining file: the
+        // module-level `rp_fn`, not the one `outer` defines nor `K`'s class.
+        ("go_rpa", &["app/rp/impl.py:function:rp_fn"]),
+        ("go_rpd", &["app/rp/impl.py:function:rp_fn"]),
+        // The re-exported module defines `rq_fn` only nested: the import fails.
+        ("go_rqa", &[]),
     ];
     let wrong: Vec<String> = want
         .iter()
@@ -12498,6 +12527,29 @@ fn test_python_renamed_import_changes_match_rebuild() {
     // The export becomes a variable: nothing binds, also not the variable by
     // its old target's name.
     assert_incremental_matches_rebuild(before, &[("app/x.py", Some("load = len\n"))]);
+    // The re-exported function nested in another, and back: the re-export
+    // binds a module-level definition only.
+    let nested = "def outer():\n    def load():\n        return 3\n\n    return load\n";
+    assert_incremental_matches_rebuild(before, &[("app/pkg/impl.py", Some(nested))]);
+    let nested_before: Vec<(&str, &str)> = before
+        .iter()
+        .map(|&(f, b)| {
+            if f == "app/pkg/impl.py" {
+                (f, nested)
+            } else {
+                (f, b)
+            }
+        })
+        .collect();
+    assert_incremental_matches_rebuild(
+        &nested_before,
+        &[("app/pkg/impl.py", Some("def load():\n    return 3\n"))],
+    );
+    let (_p, _d, db) = fresh_index_of(&nested_before);
+    assert_eq!(
+        py_calls_from(&db, "app/use.py", "go"),
+        ["app/x.py:function:load"]
+    );
     let without: Vec<(&str, &str)> = before
         .iter()
         .map(|&(f, b)| {

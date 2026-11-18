@@ -80,3 +80,16 @@ JS 的改名导入调用（`member::js_renamed_import_call`）被记成导出名
 | NOTE-7 | 标准库新增 27 条里 7 条指向 `operator.py` 的纯 Python 定义，运行时被 `from _operator import *`（`operator.py:422`）替换 | 写进 Not covered 的星号导入一条 |
 | NOTE-8 | `from m import a as b; from n import a` 后 `a()` 两版都没有指向 `n.a` 的边，与 D#726 无关 | 记为延期条目 |
 | 环境 | 评审误在真实仓库目录跑了 `incremental-index`，本仓库 `.code-graph/index.db` 被重建为 v142（含超 1 MiB 的 CHANGELOG.md）；已装的 0.197.0 拒绝写它 | 0.198.0 发布后用它 `rebuild-index --confirm` 重建，不删文件 |
+
+## 评审 R2（只审修复提交 d29c919b，新起的子代理，盲审）：HIGH 0 / MEDIUM 1 / LOW 2 / NOTE 3
+
+| # | 结论 | 处理 |
+|---|------|------|
+| MEDIUM-1（实测） | 重导出路径仍绑嵌套的 def/class：`module_attribute_ids` 只去 method，而 `__init__.py` 的 `imports` 边按名字和文件选目标，嵌套的同名定义也在内（rp1：模块级 + `outer` 里的 + `K` 里的类，三个全绑；rp2/rp3：只有嵌套的，Python `ImportError`，索引仍绑）。R1 修复漏掉的并行路径，e36795da 上相同；三个语料 0 处 | 修（只减不增）：嵌套判断收进 `module_level_definition_ids`（按 id，类型 + 同文件按行包含），直接路径与重导出路径都过它；`module_attribute_ids` 仍供 `P.X()`（`index_files.rs:2199/4716`）用，不动。RED：夹具加 `app/rp`（rp1 形状）、`app/rq`（只有嵌套），修前 `go_rpa` 三条、`go_rqa` 两条，`nested_before` 全量多一条 `pkg/impl.py:load`；修后通过 |
+| LOW-1（实测） | 括号/方括号里的 `with` 目标、默认值或基类列表里的 `:=`（模块级与函数内）没被识别，CHANGELOG 绑定条件那句不全 | 不改解析器；写进 Not covered。我在函数内复测 `match` 捕获、类型参数、推导式 `:=`、`as (x, b)`、内层 def 默认值 `:=`：d29 构建 6 个调用全绑到导入（对照 `go_plain` 同样），与“模块级或调用它的函数里”一致；用评审的 `shapescan.py` 扫四个语料（标准库 569、nltk 358、flask 83、私有应用 1,255 个文件）六类均 0 |
+| LOW-2（实测） | 变异 S06（不比文件）、S09（不比结束行）存活：夹具目标全在第 1 行 | 夹具加 `app/long.py`（`long_fn` 占 1–11 行）与 `rp_fn`（第 5–6 行，前有 `first`）。新函数的 11 个变异（`mutate_r2.py`，lib 的 python 测试 + edge_coverage，每个都跑了 110 个测试）：杀 10；N1（=S06）、N2（=S09）被 `test_python_renamed_import_binds_the_export` 杀死；存活 N8（去掉目标类型条件）为等价——Python 只建 class/function/method/module 节点，method 总被它的 class 按行包含，module 节点名 `<module>` 不会是导出名 |
+| NOTE-1 | `global a` 后在函数里 `def a`（运行后成为模块的）不再绑；`a = make()`、`a = Box.a` 属变量 | 写进 Not covered 的变量那一条 |
+| NOTE-2 | S02、S15 等价 | 无需处理 |
+| NOTE-3 | `del b`（模块级或函数内）仍绑导入；只有注解的 `b: int` 保留按名 | 写进 Not covered。标准库扫到两处 `del`（`dis.py` 的 `_opcodes_all` 从未被调用；`logging` 先调 `StrFormatter()` 再 `del`），都在最后一次使用之后；只有注解的一处（`_pyrepl/readline.py:44` `Console`）同时有两条改名导入，本就按名 |
+
+R2 修复后的构建（nodef md5 c7aa61a6）与 d29 构建在四个语料上的 calls 边（含置信度与 q）逐字节相同：标准库 100,383、nltk 24,054、flask 1,816、私有应用 55,209 行。v142 未发布，抽取指纹按同一版本重录。下一步：只审这次修复提交的 R3（最后一轮；再有 HIGH/MEDIUM 就撤掉对应部分或交用户决定）。

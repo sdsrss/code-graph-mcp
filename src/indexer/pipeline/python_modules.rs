@@ -250,8 +250,9 @@ pub(super) fn module_attribute_ids(
 }
 
 /// What a call through `from m import a as b` binds (D#726): the module-level
-/// `def`s and classes named `a` in the files `m` names, else what those files
-/// re-export as `a` — never a method, never a `def` nested in another. `None`
+/// `def`s and classes named `a` in the files `m` names, else the module-level
+/// ones those files re-export as `a` — never a method, never a `def` or class
+/// nested in another. `None`
 /// when `m` names no project module (a library runs no project code);
 /// `Some(empty)` while the module answers with nothing, which the caller
 /// buffers like an unresolved call. One answer on every path (batch-deferred,
@@ -267,29 +268,48 @@ pub(super) fn py_import_call_targets(
     let Some(files) = project_module_files_from(module, caller_path, python_module_map) else {
         return Ok(None);
     };
-    // A nested `def` or class keeps its bare name as its qualified name, so
-    // only the lines of a definition around it tell it is not the module's
-    // (as `python_import_candidates` tells a nested `def`).
     let mut stmt = conn.prepare_cached(
         "SELECT n.id FROM nodes n JOIN files f ON f.id = n.file_id
-         WHERE f.path = ?1 AND n.name = ?2 AND n.type IN ('function', 'class')
-           AND NOT EXISTS (SELECT 1 FROM nodes o
-                           WHERE o.file_id = n.file_id
-                             AND o.type IN ('function', 'method', 'class')
-                             AND o.start_line < n.start_line AND n.end_line <= o.end_line)
-         ORDER BY n.id",
+         WHERE f.path = ?1 AND n.name = ?2 ORDER BY n.id",
     )?;
-    let mut ids = Vec::new();
+    let mut named = Vec::new();
     for file in &files {
         let rows = stmt.query_map(rusqlite::params![file, export], |r| r.get::<_, i64>(0))?;
-        ids.extend(rows.collect::<rusqlite::Result<Vec<i64>>>()?);
+        named.extend(rows.collect::<rusqlite::Result<Vec<i64>>>()?);
     }
+    let mut ids = module_level_definition_ids(conn, named)?;
     if ids.is_empty() {
         let reexported =
             python_reexport_targets(conn, reexports, &files, export, python_module_map)?;
-        ids = module_attribute_ids(conn, reexported)?;
+        ids = module_level_definition_ids(conn, reexported)?;
     }
     Ok(Some(ids))
+}
+
+/// `ids` less all but the module-level `def`s and classes (D#726). A nested
+/// `def` or class keeps its bare name as its qualified name, so only the lines
+/// of a definition around it tell it is not the module's (as
+/// `python_import_candidates` tells a nested `def`); a re-export's `imports`
+/// edge binds nested namesakes too. An id the index no longer holds is dropped.
+fn module_level_definition_ids(
+    conn: &rusqlite::Connection,
+    ids: Vec<i64>,
+) -> anyhow::Result<Vec<i64>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT 1 FROM nodes n
+         WHERE n.id = ?1 AND n.type IN ('function', 'class')
+           AND NOT EXISTS (SELECT 1 FROM nodes o
+                           WHERE o.file_id = n.file_id
+                             AND o.type IN ('function', 'method', 'class')
+                             AND o.start_line < n.start_line AND n.end_line <= o.end_line)",
+    )?;
+    let mut kept = Vec::with_capacity(ids.len());
+    for id in ids {
+        if stmt.exists([id])? {
+            kept.push(id);
+        }
+    }
+    Ok(kept)
 }
 
 /// How deep a re-export chain is followed: `pkg/__init__.py` re-exporting from

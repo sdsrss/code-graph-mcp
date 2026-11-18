@@ -5,7 +5,7 @@
 # Do not hand-edit the hex — regenerate, so the recorded version is the
 # one that was actually in the tree when the digest was taken.
 
-extraction_fingerprint = 56f3fe500b26407463160da1f321852b6a870180cfba71caea6c7fef9403bf85
+extraction_fingerprint = 88018534faaaed17f1780eb88f39bf3a0af1794afa59306f16eadcfae2be9083
 extraction_recorded_at_index_version = 142
 
 schema_fingerprint = 39243dcb1152c26cdaded70ea7287b31ac28f222645858d894eb2b7985287715

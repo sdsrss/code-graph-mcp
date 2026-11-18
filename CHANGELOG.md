@@ -25,9 +25,10 @@ plugin's scripts are unchanged.
 `b()` after `from m import a as b` was recorded as a call to `b` and bound
 by name: to nothing when the project has nothing called `b`, else to the
 project's functions, methods and classes called `b`. It is now a call to the
-module-level `a` in the files of module `m`, or through a package's
-`__init__.py` re-export, at `inferred` confidence across files (`extracted`
-within one); a module outside the project gives no edge. A name the module
+`def` or class `a` defined at module level in the files of module `m` or, when
+they define none, in the module a package's `__init__.py` re-exports `a` from,
+at `inferred` confidence across files (`extracted` within one); a module
+outside the project gives no edge. A name the module
 also binds with a `def`, `class`, assignment (`+=` and `:=` included), loop
 or `with` target or another import, or that a function declares `global`,
 keeps the by-name resolution, and so does a call whose function binds the
@@ -79,9 +80,17 @@ load included; code-graph-mcp does not limit the threads it uses.
 - A call written directly in a class body is judged as the module's: a class
   attribute named like the alias does not stop it binding to the import.
 - Rebinding by a `match` capture, a `type` statement, a type parameter
-  (`def f[b]()`) or a `:=` inside a comprehension is not seen: the call still
-  binds to the import. A pre-release review found none of these shapes in the
-  standard library, nltk or flask.
+  (`def f[b]()`), a `with` target in parentheses or brackets
+  (`with f() as (x, b):`), or a `:=` inside a comprehension, a default value
+  or a base list (`def g(x=(b := 1))`, `class K((b := object))`) is not seen,
+  at module level or in the calling function: the call still binds to the
+  import. None of these shapes occurs in the standard library, nltk, flask or
+  the private application above.
+- A `del b` is not seen either: a call after it still binds to the import,
+  where Python raises `NameError` (or `UnboundLocalError`, after a `del` in
+  the calling function). The standard library deletes two such names, each
+  after its last use. A name only annotated at module level (`b: int`) keeps
+  the by-name resolution, though the call runs the import.
 - A package that re-exports the name under another name or through a star
   import (`from .impl import _c as c`, `from .impl import *` in
   `__init__.py`) gives no edge.
@@ -99,7 +108,8 @@ load included; code-graph-mcp does not limit the threads it uses.
   name to `m.a` and `n.a`.
 - A renamed import of a module-level variable (`handler = make()`, then
   `from m import handler as h; h()`) gives no edge: the index holds no node
-  for a Python variable.
+  for a Python variable. Neither does a `def a` nested in a function that
+  declares `global a`, which makes it the module's once that function runs.
 - A renamed import inside a function (`def f(): from m import a as b`)
   keeps the by-name resolution.
 
