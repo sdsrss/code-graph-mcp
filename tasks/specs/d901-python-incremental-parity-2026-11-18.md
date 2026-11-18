@@ -103,7 +103,44 @@ L2：修复增量路径使其符合“增量 = 重建”的既有行为（bugfix
 - **RED（两条路径）**：把当前 tests.rs 放进 a1007267 的 `git archive` 副本，单独的 target 目录跑 `cargo test --lib d901_`：5/5 个测试失败，13 个用例 × 2 条路径共 26 处失败，增量运行与刷新一一对应。其中“一个文件加、另一个删”在两条路径上都失败，与上面 RED 记录的“修前已通过”不符；本次是在完整的 a1007267 源码上复跑，以本次为准，早先的出入原因未查。
 - **提交**：84355db5 修复与测试（pre-commit：cargo check、`cargo test` 2,523 通过 / 0 失败 / 7 忽略、fmt、两条分支的 clippy 全部通过）；b8d3452b 模糊测试工具 `--gen` 修复。
 
+## 发版前盲审第 1 轮（6d19ae93）与修复
+
+评审：新开的子代理，空上下文，盲审说明只给提交范围 a1007267..6d19ae93、合约和问题；自己用 `git archive` 构建 base（a1007267，md5 648efa92）与 head（6d19ae93，md5 3618326a）。结论 HIGH 2、MEDIUM 1、LOW 2、NOTE 5。逐条对照代码核对后处理如下。
+
+- **HIGH-1 Go 回归（成立）**：Phase 0 恢复入边时，Go 的 `px.Foo()`（`{"q":"gopkg"}`）被挪到文件里每个叫 `Foo` 的节点上，包括方法 `K.Foo`。`index_files.rs` 恢复过滤里排除方法那一条只对 Python 生效；全量和延迟、待解析三条路径都经过 `go_package_candidates`，后者用 `filter_out_method_ids` 去掉方法（`type <> 'method'`）。编辑定义文件本身时 0.200.0 就会这样；本版逐路径触发后，移动一个“该文件的歧义调用所指名字”的定义文件也会重新抽取它，于是多了一类触发。修：Go 包调用恢复时去掉 `method` 类型的候选，与 `go_package_candidates` 同一条规则。RED：`d901_a_go_package_call_is_not_restored_onto_a_method` 2 个用例 × 2 条路径共 4 处失败（多出 `py/u.go:Go → px/x.go:K.Foo`），修后通过；变异“去掉这条过滤”被它杀死。
+- **HIGH-2 快照平方开销（成立）**：`nested` 用逐节点的 EXISTS 子查询扫同文件所有节点，只有 `idx_nodes_file` 可用，N 个节点 N² 次比较，每次增量运行和每次刷新都付。改为窗口函数：同文件按 `start_line` 排序，取起始行更早的 def/方法/类的最大 `end_line`，不小于本节点 `end_line` 即被包含——与“存在更早开始、结束不早于本节点的 def/类”逐条等价（整数行号，`RANGE … 1 PRECEDING` 即严格更早；无候选时 `IFNULL(…, -1)` 得 0，与 EXISTS 为假相同）。前后两半共用 `DEFINITION_ROWS_SELECT`，`<module>` 过滤仍只在前一半、在窗口之外。RED：`the_definition_snapshot_grows_near_linearly_with_a_python_files_nodes` 用 SQLite 进度回调数虚拟机步数（与机器无关），400 → 1,600 个 def 修前 44,449 → 696,181（×100 步，15.7 倍），修后低于 8 倍阈值通过；变异“窗口帧含本行”“去掉 nested 列”都被 D#901 测试杀死。
+- **MEDIUM-3 改类名扇出（成立，修法与评审建议不同）**：比较键里的限定名让改类名时每个方法名都“上升”，所有 `ambiguous` 调用方被重新抽取，边一条不变。先按评审的 noqn 变体去掉限定名（head3），Python、JS 生成器结果与 head 逐种子相同，但 Rust 生成器有 18 个种子 head 已修好而 head3 又分歧（都在 base 上分歧，不是相对 0.200.0 的回归）。缩小种子 18：`impl K { fn a(&self) }` 变成自由 `fn a()`，Rust 没有 method 类型，两者都是 `function`，只有限定名 `K.a` / `a` 能区分，而裸调用 `a()` 只能到自由函数。定稿（head4）：不比较限定名本身，比较 `scoped`（限定名是否不同于名字，即是否是类型/模块的成员）。改类名时 `K.a → K2.a` 两边都是 scoped，不触发；`K.a → a` 触发。RED：`a_class_rename_pulls_no_caller_into_the_fanout_round`（调用方用 `return close` 这种值引用，对两个方法都是 `ambiguous`；`x.close()` 参数接收者不产生边，最初的写法对照组不成立，已改）修前失败；`d901_a_same_name_replacement_reaches_its_callers` 新增 Rust 用例在 head3 两条路径都失败，加 `scoped` 后通过；变异“去掉 scoped 列”被它杀死。
+- **LOW-4 更早批次的导入方（成立，补测试）**：`done_paths` 那一支（导入方在同一次运行更早的批次里被重新抽取）没有测试；新增 `d901_an_importer_in_an_earlier_batch_reaches_a_new_namesake`（`BATCH_SIZE` 个改动的填充文件，导入方 `a_use.py` 与模块 `z_mod.py` 分在两批），当前代码通过，变异 M3（去掉这一支）被它杀死。
+- **LOW-5 Upgrading 段（成立）**：“相关文件重新索引时消失”只对调用方文件成立。实测：0.200.0 留下过期状态后，用 head3 只编辑 `app/m.py` 或 `app/sub/impl.py`，`go` 的被调列表不变；编辑 `app/views.py` 后与重建一致。CHANGELOG 改为“the file the edge starts from is indexed again”，并补上“或缺边”。
+- **NOTE-6**：“replaying 200 commits”实为一次增量运行从旧树更新到新树；CHANGELOG 改写。
+- **NOTE-7**：Rust 种子 1120 第 2 步的一行是基线第 1 步报错掩盖的已有缺陷，不是回归；CHANGELOG 的“没有新分歧、每条剩余分歧都在基线同一步出现”在 Python 生成器那一段，其他语言的结果另写（见下）。
+- **NOTE-8（更正本 spec）**：上文“`take` 不删表存活，等价”是错的。`drop_fanout_temps` 在 `bare_name_callers_of_new_duplicates` 里运行，位于第一次 `take`（mod.rs:855）与循环（mod.rs:904-921）之间；若 `take` 不删表，循环每轮都拿回同样的路径，扇出轮记录的导入方会被重复抽取至多 8 次——是开销缺陷，不是等价变异。代码本身会删表，这个变异仍无测试固定，记在下面的存活清单。
+- **NOTE-9、NOTE-10**：临时表生命周期与 `--gen` 修复无问题，不需处理。
+
+**变异（修复后，每个变异体确认编译并跑了测试，用备份文件还原）**：杀死——M3、Go 方法过滤、scoped 列、nested 列、窗口帧含本行；存活——`ty` 列（目前找到的类型变化用例里 scoped 同时变化，保留 `ty`，代价几乎为零，无法证明“同名同限定只有类型变化”的情形不存在）、包含类型去掉 `class`（Python 的嵌套类在回退绑定时本来就会被绑上，探针两边相同，视为等价）、M17（去掉 `f.language = 'python'`：窗口函数后对任何语言都是 O(N log N)，只多算一列）、M8（循环里的 `take`：只在刷新路径上扇出轮重新抽取的文件磁盘内容已变时影响正确性，其余为开销）、M10（见 NOTE-8，开销）、M1/M2（被其他检查掩盖）。
+
+**检查（定稿 head4 的同一棵树）**：`cargo fmt --check` 通过；抽取指纹重录后复核通过（INDEX_VERSION 不变）；`cargo clippy --all-targets -- -D warnings` 默认与 `--features embed-model` 都通过；`cargo test --no-fail-fast` 2,527 通过、0 失败、7 忽略（原 2,523 + 新增 4 个测试函数）。
+
+**全量结果不变**（`fulldiff.py`，base 对 head3、base 对 head4）：五个语料（标准库 113,891 条边、nltk 30,258、flask 3,705、本仓库 28,804、daagu 77,250）两边逐条相同。
+
+**模糊测试**（每步比较；Python 三个生成器的 base 是本 spec 的 a1007267 构建 4d56efc8，Go/JS/Rust/Python 移动生成器是评审写的 `gens/gen_*.py`，base 与评审 head 的结果取自评审自建的二进制 648efa92 / 3618326a；head3 05531e57 = 去掉限定名，head4 980aabfc = 定稿）：
+
+| 生成器（种子数） | base 分歧种子 / 行 | 评审 head | head3 | head4 | head4 独有分歧种子 |
+|------|------|------|------|------|------|
+| 自己的（4,500，3 步） | 497 / 2,090 | 15 / 21 | 15 / 21 | 15 / 21 | 0 |
+| 评审生成器（1,500，4 步） | 278 / 1,417 | 56 / 120 | 56 / 120 | 56 / 120 | 0 |
+| Python 移动/互换（1,500） | 420 / 1,862 | 25 / 44 | 25 / 44 | 25 / 44 | 0 |
+| Go（1,500） | 285 / 578 | 176 / 322 | 40 / 64 | 40 / 64 | 0 |
+| JS/TS（1,500） | 229 / 549 | 88 / 143 | 88 / 143 | 88 / 143 | 0 |
+| Rust（1,500） | 205 / 719 | 75 / 271 | 93 / 298 | 75 / 271 | 0 |
+
+head4 的自己生成器与评审生成器结果和 head2 逐种子相同（4,500 / 1,500 个）。“head4 有、base 同一步没有的行”只有 Rust 种子 1120 第 2 步一行；从第 1 步的干净索引复跑（`rs1120.json`），base 与 head4 都少这一行，是已有缺陷（评审 NOTE-7）。
+
+**开销 head4**（`cost.py` 成对，空闲机器，改一个文件 7 次、其余 3 次，中位数）：改一个文件 0.26 → 0.25 s；标准库移动 3.43 → 6.81 s（7 → 288 个文件，重建 2.9 s）；互换 1.08 → 3.60 s（2 → 141）；nltk 移动 1.17 → 2.06 s（2 → 87）；改类名 `IMAP4` 1.11 → 1.10 s、`FakeSession` 0.52 → 0.51 s（都是 0 → 0）；本仓库一次更新 0.180.0 → 0.198.0 3.07 → 3.14 s（100 → 102）；daagu 一次更新 200 个提交 6.25 → 6.39 s（393 → 393）。大文件单行编辑（评审的模板）：2,000 个 def 0.15 → 0.14 s，10,000 个 0.80 → 0.84 s，20,000 个 1.60 → 1.73 s，numpy `__init__.pyi` 0.45 → 0.46 s（评审测的 head 分别是 0.55、10.8、42.7、0.60 s）。错边与 head2 相同：调用差异全部为 0，剩 imports 1/2（已有）、references 0/2,398 与 0/2（D#898）。
+
+**Upgrading 段复核**（head3）：0.200.0 做一次“删 `other.py` 的 `a`、加 `app/m.py` 的 `a`”后，`go` 只列 `app/sub/impl.py`；head3 编辑 `app/m.py`、再编辑 `app/sub/impl.py` 都不变；编辑 `app/views.py` 后列出 `app/m.py`、`app/sub/impl.py`，与重建相同。
+
 ## 进度
 
-- 下一步：版本号升到 0.201.0、CHANGELOG 随发版提交、发版前盲审（评审目录 /var/tmp/agent-tmp-d901-review）、push、CI、tag、Release、发版说明、验证。
-- 延期待记：D#901 与 D#899 关闭；新条目——Not covered 列出的剩余增量形态；全量一侧“导入模块有同名函数与方法、调用方目录另有同名定义时，显式导入的调用丢边”。
+- 0.201.0 发版提交 6d19ae93 之后，盲审第 1 轮修复（上节）。下一步：提交修复、对修复提交做第 2 轮盲审（只审增量），通过后 push、CI、tag、Release、发版说明、验证。
+- 延期待记：D#901 与 D#899 关闭；新条目——Not covered 列出的剩余增量形态（D#903）；全量一侧“导入模块有同名函数与方法、调用方目录另有同名定义时，显式导入的调用丢边”（D#902）；变异存活清单里的 M8、M10、`ty` 列无测试固定。
