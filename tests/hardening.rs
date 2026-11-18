@@ -2610,17 +2610,82 @@ fn audit_ignores_hold_only_while_their_reason_does() {
         "an audit.toml would ignore advisories past AUDIT_IGNORES: put each \
          ignore on ci.yml's `cargo audit` line, with its row here"
     );
-    let mut ignored = BTreeSet::new();
-    for line in yaml_directives(workflow_job(&ci, "audit")) {
-        let mut words = line.split_whitespace();
-        while let Some(w) = words.next() {
-            if w == "--ignore" {
-                ignored.insert(words.next().expect("--ignore takes an id").to_string());
-            } else if let Some(id) = w.strip_prefix("--ignore=") {
-                ignored.insert(id.to_string());
+    // A config file reaches cargo-audit from anywhere its cwd or CARGO_HOME
+    // can be pointed (`working-directory:`, an `env:` at any level), so no
+    // `audit.toml` may exist in the checkout at all, and nothing in ci.yml
+    // may move CARGO_HOME onto one written later.
+    fn find_audit_toml(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in fs::read_dir(dir).expect("read a checkout directory") {
+            let entry = entry.expect("read a directory entry");
+            let name = entry.file_name();
+            let ty = entry.file_type().expect("read a file type");
+            if ty.is_dir() && !matches!(name.to_str(), Some(".git" | "target" | "node_modules")) {
+                find_audit_toml(&entry.path(), out);
+            } else if name == "audit.toml" {
+                out.push(entry.path());
             }
         }
     }
+    let mut configs = Vec::new();
+    find_audit_toml(root, &mut configs);
+    assert!(
+        configs.is_empty() && !ci.contains("CARGO_HOME"),
+        "audit config {configs:?} (or a CARGO_HOME in ci.yml) would let cargo-audit \
+         ignore advisories past AUDIT_IGNORES"
+    );
+    // The ignores read below are the ones on ci.yml's own `cargo audit` line,
+    // so the job may run nothing else that audits: not `make audit` or a
+    // script (its ignores live in another file), not an action such as
+    // `rustsec/audit-check` (its `ignore:` input), not a flag that points the
+    // audit at another lockfile. Each step is one of these, on one line.
+    const AUDIT_ACTIONS: &[&str] = &[
+        "actions/checkout@",
+        "dtolnay/rust-toolchain@",
+        "Swatinem/rust-cache@",
+    ];
+    let mut ignored = BTreeSet::new();
+    let mut audits = 0;
+    for line in yaml_directives(workflow_job(&ci, "audit")) {
+        let line = line.trim_start_matches("- ");
+        if let Some(action) = line.strip_prefix("uses:") {
+            let action = action.trim();
+            assert!(
+                AUDIT_ACTIONS.iter().any(|a| action.starts_with(a)),
+                "ci.yml `audit` uses `{action}`: an action that audits takes \
+                 ignores this test never reads"
+            );
+        } else if let Some(cmd) = line.strip_prefix("run:") {
+            let mut words = cmd.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some("cargo"), Some("install")) => {
+                    assert!(
+                        cmd.trim_end().ends_with(" cargo-audit"),
+                        "ci.yml `audit` installs something besides cargo-audit: `{cmd}`"
+                    );
+                    continue;
+                }
+                (Some("cargo"), Some("audit")) => audits += 1,
+                _ => panic!(
+                    "ci.yml `audit` runs `{}`: only `cargo install … cargo-audit` and \
+                     `cargo audit [--ignore ID]…` are allowed, on one line",
+                    cmd.trim()
+                ),
+            }
+            while let Some(w) = words.next() {
+                if w == "--ignore" {
+                    ignored.insert(words.next().expect("--ignore takes an id").to_string());
+                } else if let Some(id) = w.strip_prefix("--ignore=") {
+                    ignored.insert(id.to_string());
+                } else {
+                    panic!("ci.yml `cargo audit` takes `{w}`: only `--ignore ID` is allowed");
+                }
+            }
+        }
+    }
+    assert_eq!(
+        audits, 1,
+        "ci.yml `audit` must run `cargo audit` exactly once"
+    );
     let listed: BTreeSet<String> = AUDIT_IGNORES.iter().map(|r| r.0.to_string()).collect();
     assert_eq!(
         ignored, listed,
