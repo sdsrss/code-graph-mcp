@@ -12301,6 +12301,19 @@ const D726_TREE: &[(&str, &str)] = &[
         "app/rp/impl.py",
         "def first():\n    return 0\n\n\ndef rp_fn():\n    return 1\n\n\ndef outer():\n    def rp_fn():\n        return 2\n\n    return rp_fn\n\n\nclass K:\n    class rp_fn:\n        pass\n",
     ),
+    // One-line definitions on adjacent lines: `adj_fn` starts the line after
+    // `first` ends, and is not inside it.
+    (
+        "app/adj.py",
+        "def first(): return 0\ndef adj_fn(): return 1\n",
+    ),
+    // The package defines `both_fn` after importing it: its own definition is
+    // what the name holds, so the re-export is not followed.
+    (
+        "app/both/__init__.py",
+        "from .impl import both_fn\n\n\ndef both_fn():\n    return 2\n",
+    ),
+    ("app/both/impl.py", "def both_fn():\n    return 1\n"),
     ("app/rq/__init__.py", "from .impl import rq_fn\n"),
     (
         "app/rq/impl.py",
@@ -12331,6 +12344,8 @@ from app.stats import wilson_ci as counter\n\
 from app.rp import rp_fn as rpa\n\
 from app.rp.impl import rp_fn as rpd\n\
 from app.rq import rq_fn as rqa\n\
+from app.adj import adj_fn as adj\n\
+from app.both import both_fn as bothx\n\
 import plain\n\
 import json as modalias\n\
 for looped in []:\n    pass\n\
@@ -12371,6 +12386,8 @@ def go_counter():\n    return counter()\n\n\n\
 def go_rpa():\n    return rpa()\n\n\n\
 def go_rpd():\n    return rpd()\n\n\n\
 def go_rqa():\n    return rqa()\n\n\n\
+def go_adj():\n    return adj()\n\n\n\
+def go_both():\n    return bothx()\n\n\n\
 def go_localimp():\n    from app.dates import parse_date_param as ci\n\n    return ci()\n",
     ),
 ];
@@ -12439,6 +12456,8 @@ fn check_d726_calls(db: &Database, when: &str) {
         ("go_rpd", &["app/rp/impl.py:function:rp_fn"]),
         // The re-exported module defines `rq_fn` only nested: the import fails.
         ("go_rqa", &[]),
+        ("go_adj", &["app/adj.py:function:adj_fn"]),
+        ("go_both", &["app/both/__init__.py:function:both_fn"]),
     ];
     let wrong: Vec<String> = want
         .iter()

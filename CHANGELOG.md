@@ -26,10 +26,10 @@ plugin's scripts are unchanged.
 by name: to nothing when the project has nothing called `b`, else to the
 project's functions, methods and classes called `b`. It is now a call to the
 `def` or class `a` defined at module level in the files of module `m` or, when
-they define none, in the module a package's `__init__.py` re-exports `a` from,
-at `inferred` confidence across files (`extracted` within one); a module
-outside the project gives no edge. A name the module
-also binds with a `def`, `class`, assignment (`+=` and `:=` included), loop
+they define none, in the module those files import `a` from (as a package's
+`__init__.py` re-exports it), at `inferred` confidence across files
+(`extracted` within one); a module outside the project gives no edge. A name
+the module also binds with a `def`, `class`, assignment (`+=` and `:=` included), loop
 or `with` target or another import, or that a function declares `global`,
 keeps the by-name resolution, and so does a call whose function binds the
 name as a parameter or local, its own import included.
@@ -79,21 +79,30 @@ load included; code-graph-mcp does not limit the threads it uses.
 
 - A call written directly in a class body is judged as the module's: a class
   attribute named like the alias does not stop it binding to the import.
-- Rebinding by a `match` capture, a `type` statement, a type parameter
-  (`def f[b]()`), a `with` target in parentheses or brackets
-  (`with f() as (x, b):`), or a `:=` inside a comprehension, a default value
-  or a base list (`def g(x=(b := 1))`, `class K((b := object))`) is not seen,
-  at module level or in the calling function: the call still binds to the
-  import. None of these shapes occurs in the standard library, nltk, flask or
+- Rebinding by a `match` capture, a `type` statement, a `with` target in
+  parentheses or brackets (`with f() as (x, b):`), or a `:=` inside a
+  comprehension, a default value or a base list (`def g(x=(b := 1))`,
+  `class K((b := object))`), at module level or in the calling function, or
+  by the calling function's own type parameter (`def f[b]()`), is not seen:
+  the call still binds to the import. None of these shapes occurs in the standard library, nltk, flask or
   the private application above.
-- A `del b` is not seen either: a call after it still binds to the import,
-  where Python raises `NameError` (or `UnboundLocalError`, after a `del` in
-  the calling function). The standard library deletes two such names, each
+- A `del b` is not seen either: the call still binds to the import, where
+  Python raises `NameError` after a module-level `del b`, and
+  `UnboundLocalError` anywhere in a function that deletes `b`. The standard library deletes two such names, each
   after its last use. A name only annotated at module level (`b: int`) keeps
   the by-name resolution, though the call runs the import.
 - A package that re-exports the name under another name or through a star
   import (`from .impl import _c as c`, `from .impl import *` in
   `__init__.py`) gives no edge.
+- Through two packages' re-exports (`p/__init__.py` re-exporting `a` from
+  `p.sub`, whose `__init__.py` re-exports it from `p.sub.impl`), the call
+  gives no edge when `p/sub/__init__.py` also defines an `a` nested in a
+  function or class: `p`'s import is taken to bind that nested `a`, and the
+  chain is not followed past it.
+- A module's last binding of `a` is not modelled: every `def` or class `a`
+  defined at module level is bound (two `def a`, or one in each branch of an
+  `if`), and a module that defines `a` and then imports another `a` still
+  binds its own.
 - Star imports are not read, so a name a star import also binds is judged
   by the renamed import alone. A module that replaces its own definitions
   with one keeps them as the targets: 7 of the 27 standard-library edges

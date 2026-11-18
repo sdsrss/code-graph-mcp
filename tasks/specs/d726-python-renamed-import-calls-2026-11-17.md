@@ -93,3 +93,17 @@ JS 的改名导入调用（`member::js_renamed_import_call`）被记成导出名
 | NOTE-3 | `del b`（模块级或函数内）仍绑导入；只有注解的 `b: int` 保留按名 | 写进 Not covered。标准库扫到两处 `del`（`dis.py` 的 `_opcodes_all` 从未被调用；`logging` 先调 `StrFormatter()` 再 `del`），都在最后一次使用之后；只有注解的一处（`_pyrepl/readline.py:44` `Console`）同时有两条改名导入，本就按名 |
 
 R2 修复后的构建（nodef md5 c7aa61a6）与 d29 构建在四个语料上的 calls 边（含置信度与 q）逐字节相同：标准库 100,383、nltk 24,054、flask 1,816、私有应用 55,209 行。v142 未发布，抽取指纹按同一版本重录。下一步：只审这次修复提交的 R3（最后一轮；再有 HIGH/MEDIUM 就撤掉对应部分或交用户决定）。
+
+## 评审 R3（只审 23d03fae，新起的子代理，盲审）：HIGH 0 / MEDIUM 0 / LOW 2 / NOTE 5 → 继续发版
+
+| # | 结论 | 处理 |
+|---|------|------|
+| LOW-1（实测） | 两层包重导出（`p` → `p.sub` → `p.sub.impl`），`p/sub/__init__.py` 另有嵌套的同名 `a` 时，`from p import a as b1; b1()` 无边：`p/__init__.py` 的 imports 边按名绑到那个嵌套的 `a`，验证通过后不再往下走，新过滤又把它丢掉（d29 构建是错边，现在是漏边） | 我用 cg-198b/198c 复现（Python 得 `p/sub/impl.py:1`）。不改代码：修要动 `reexports_of`，会连带普通 `from p import a` 的解析，超出本次范围且评审轮次已用完；写进 Not covered，记延期条目 |
+| LOW-2（实测） | 变异 M19（结束行 `+ 1`）、C11（总是追加重导出结果）存活 | 只加测试：`app/adj.py`（相邻两行的单行定义）、`app/both`（`__init__.py` 先导入再自己 `def both_fn`）；`mutate_r3.py` 重跑：M19、C11 都被 `test_python_renamed_import_binds_the_export` 杀死，对照 N2 同样被杀 |
+| NOTE-1 | 普通模块的重导出也会被跟随，CHANGELOG 只说包的 `__init__.py` | 修复段改为“those files import `a` from (as a package's `__init__.py` re-exports it)” |
+| NOTE-2 | 函数里 `del b` 之前的调用同样 UnboundLocalError | `del` 一条改写 |
+| NOTE-3 | 模块级的类型参数不重绑模块的 `b`（绑导入是对的） | 改为“调用它的函数自己的类型参数”；我另测函数内 `type b2 = int` 也没识别，与该条一致 |
+| NOTE-4 | 某种增量序列（`impl.py` 先清空、再改成 `if True:` 里定义并同时删别的文件）比重建少两条 pyimp 边；d29 上相同，根在 imports 边停在 `<module>` 节点，根因未核实 | 已有问题，记延期条目 |
+| NOTE-5 | 未按“取最后一次绑定”建模：两个 `def a` 都绑，`def a` 后又导入 `a` 仍绑自己的 | 写进 Not covered |
+
+R3 实测（评审自己的数）：标准库、nltk、35 个 dist-packages 包（2,388 个文件）上 calls 边与 d29 逐字节相同；标准库全量索引交替 9 次中位数 2.972 s（d29）对 2.959 s；505 次增量对照重建，除 NOTE-4 的 3 步外相等。
