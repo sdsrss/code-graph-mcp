@@ -1,6 +1,6 @@
 # 2026-11-18 D#893 + D#895：Python 改名导入不再佐证原名；增量里重新出现的定义要刷新回退导入
 
-状态：**D#893 撤回（R2 仍有 MEDIUM，到停止线），仍在延期；D#895 已发布 0.199.0（tag 在 c4774055，2026-11-18，CI 7/7、Release 10/10 用时 34 分 41 秒；npm 6 个包发布者 GitHub Actions；发布版 linux-x64 md5 c67a84f2 在五个语料上与源码构建逐边相同）**。授权：用户 2026-11-17“把剩余工作都做了，授权清理和发版”，2026-11-18“继续完成剩下的任务”。
+状态：**D#893 第二版实现中（改名导入对绑定、剪枝两侧、置信度佐证都不可见；单独发 0.200.0，见文末“D#893 第二版”）；D#895 已发布 0.199.0（tag 在 c4774055，2026-11-18，CI 7/7、Release 10/10 用时 34 分 41 秒；npm 6 个包发布者 GitHub Actions；发布版 linux-x64 md5 c67a84f2 在五个语料上与源码构建逐边相同）**。授权：用户 2026-11-17“把剩余工作都做了，授权清理和发版”，2026-11-18“继续完成剩下的任务”。
 
 ## 为什么
 
@@ -85,3 +85,29 @@
 
 - R1：绑定阶段按别名登记会借无关同名边绑定，增量分歧；R2：剪枝按别名认“矛盾导入”会剪掉调用唯一的边，之后无触发。
 - 候选设计：改名导入对绑定、剪枝（矛盾与保护两边）、置信度三个阶段都不可见。它修 `from m import a as b; from n import a; a()`（`m.a` 不再受保护被剪），不会再按别名剪 `b()`；代价：只有改名导入时的裸 `a()` 会多出 `ambiguous` 的按名边。需单独发版、单独评审，先用评审的 1,500 序列模糊测试对照。
+
+## D#893 第二版（2026-11-18，授权：用户“D#893按你建议执行”）
+
+### 改动
+- `cg_imports` 加一列 `alias = $.as`（只有 Python `from m import a as b` 且 b ≠ a 时写）。
+- 剪枝两侧（“导入了同名的别的节点”的 EXISTS、“导入了这个目标”的 NOT EXISTS）都加 `alias IS NULL`；置信度的导入佐证加 `i.alias IS NULL`；绑定阶段 `cg_unique_imports` 加 `$.as IS NULL`。
+- 不改：字段调用剪枝（`FIELD_CALL_PRUNE_PREDICATE`）与局部值调用（`py_local_value_call`）的“调用方文件从目标文件导入了任何东西”——改名导入仍是从那个文件导入，去掉会改别的行为。
+- 与撤回的第一版的区别：第一版把改名导入按别名 `b` 登记（R1、R2 的分歧都来自按别名绑定/剪枝 `b()`）；这一版既不按 `a` 也不按 `b` 登记，`b()` 的结果与 0.199.0 相同（D#726 的 `pyimp`，否则按名）。
+- INDEX_VERSION 142 → 143（全量结果变：私有应用 12 条）；抽取指纹重录 21812da4。
+
+### 决定
+- 代价：文件里只有改名导入、没有别的 `a` 导入时，裸 `a()` 不再被改名导入保护/佐证，回到按名猜测（两个同名定义时两条 `ambiguous`，0.199.0 是 `m.a` 一条 `inferred`）。Python 语义上 `a` 没被这个导入绑定，按名猜测是诚实的答案。
+- 随机序列里新版独有的分歧全部是已有缺陷被改名导入掩盖（见验证），不在本次修；记为新延期条目（见遗留）。
+
+### 验证记录
+- RED（修前，HEAD 22314a2a 的 resolve.rs）：`test_python_renamed_import_does_not_bind_its_original_name` 失败：views/rev 的 `go` 多 `app/m.py:a inferred`，only.py 只有 `m.a inferred`。GREEN：两个测试通过（第二个是 13 个单步/两步增量对照重建，修前修后都通过，作回归护栏）。
+- 变异（每个都由断言杀死）：M1 剪枝 EXISTS 读别名 → only.py 丢 `n.a`；M2 剪枝 NOT EXISTS 读别名 → views/rev 留 `m.a ambiguous`；M3 置信度读别名 → only.py `m.a inferred`，且增量与重建分歧；M4 绑定读别名 → tests/ 夹具多 `tests/helpers.py:a`。
+- 三种 `b()`（函数内改名导入、参数、try 里模块级）两版实跑相同：`other.b` inferred / ambiguous(ur local) / inferred。
+- 语料（0.199.0 发布版 md5 c67a84f2 对 head1，各自全量 `incremental-index --no-embed`，所有关系，含两端行号、置信度、metadata，保留重复）：标准库 113,891、nltk 30,258、flask 3.1.0（ab81496）3,705、本仓库 22314a2a 28,623 逐行相同；私有应用 daagu 10b3ce5d 77,250 → 77,246：删 4 条 calls（`llm_providers.py` 两个函数里 `AIProvider(...)` 指 db 模型，错绑到 `AIProvider as AIProviderSchema` 的 schema 类；两个测试里 `CL3Signal(...)` 指 types 的类，错绑到 `CL3Signal as CL3SignalModel` 的 db 模型），4 条 references inferred → ambiguous（同三对名字加 `DataSource as ProviderDataSource`），逐条读源码都是改名导入原名上的错边。
+- 随机序列对照（脚本在 `tasks/d893-fuzz/`）：每个种子生成含改名/普通/相对/函数内导入、再导出、嵌套定义、赋值、星号导入、tests/ 目录的小项目，3 步随机修改，每步后增量索引与同状态全量索引比较所有边。种子 0–1499：0.199.0 分歧 171 个，新版 158 个；只有新版分歧 8 个、只有 0.199.0 分歧 21 个。8 个全部是“掩盖”：把各状态里的改名导入行换成 `pass` 后用 0.199.0 重放，在同一步出现同样的分歧行（7 个完全相同，1306 多一行同类）。机理（种子 189）：`from other import a` 所在模块失去 `a` 后改为按名绑定，导入方未改动，它此前被剪掉的裸调用边不会恢复；0.199.0 里改名导入保护着那条边所以看不出来。
+- 种子 1500–4499：0.199.0 分歧 354 个，新版 343 个；只有新版分歧 13 个，全部“掩盖”（同一步、新版的分歧行都在去掉改名导入后 0.199.0 的分歧行里）；只有 0.199.0 分歧 24 个。合计 4,500 个：0.199.0 525（11.7%），新版 501（11.1%），只有新版 21、只有 0.199.0 45。
+- 升级/降级提示（head2 = INDEX_VERSION 143 构建，md5 02650990，对 0.199.0 建的 flask 索引）：查询打印 “This index was built by an older code-graph (index v142, this binary v143): answers come from it until it is rebuilt — run: code-graph-mcp reindex”；`incremental-index` 打印 “Index version mismatch (stored v142 ≠ binary v143): clearing + rebuilding …”，退出 0；MCP 服务启动后 `application_id` 142 → 143 并重建（带一次查询的会话结束时 3,705 条边）。0.199.0 对 143 的索引：查询警告 “index built by a newer code-graph (v143 > binary v142); leaving it intact” 并照常回答；`incremental-index` 退出 1，提示先删 `.code-graph/index.db*`。
+
+### 遗留
+- D#900（新延期）：普通导入因模块失去该名字而改为按名绑定时，导入方此前被剪掉的裸调用不恢复。0.199.0 已有；随机序列里新版独有的 21 个分歧都是它。
+- JS 同类（D#897）不在本次：JS 改名导入的 imports 边不记本地别名，要改解析器。
