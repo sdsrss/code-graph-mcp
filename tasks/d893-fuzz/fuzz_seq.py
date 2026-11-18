@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Random-sequence differential test: incremental index vs a fresh index.
 
-usage: fuzz_seq.py <binary> <first-seed> <count> <out.jsonl> [--steps N] [--jobs J]
+usage: fuzz_seq.py <binary> <first-seed> <count> <out.jsonl> [--steps N] [--jobs J] [--gen gen.py]
 
 Each seed builds a small Python project out of renamed / plain / relative /
 function-local imports, re-exports and bare calls, then applies N random edit
 steps. After every step the working copy is refreshed with `incremental-index`
 and a copy of the same state is indexed from scratch; every edge (relation,
 both endpoints, confidence, metadata, duplicates kept) must match. One JSON
-line per seed: the first step that diverged and the diff, or ok.
+line per seed: every step's diff (`diffs`, the first also as `step` /
+`inc_only` / `fresh_only`) and per step a hash of the incremental and the
+fresh edge sets with the confidence column dropped (`hashes`), or ok.
 
 Workflow: run it for a base and a head binary over the same seeds, then
 `cmp.py base.jsonl head.jsonl` lists seeds only one of them diverges on, and
@@ -17,7 +19,8 @@ seed on base with renamed imports turned into `pass` (`masked` = base then
 diverges the same way). `show.py` prints a seed's states, `repro.py` replays
 one and prints the edges matching a pattern. Work dirs go under $FUZZ_WORK.
 """
-import json, os, random, shutil, sqlite3, subprocess, sys, tempfile
+import hashlib, json, os, random, shutil, sqlite3, subprocess, sys, tempfile
+from collections import Counter
 from multiprocessing import Pool
 
 ROOT = os.environ.get("FUZZ_WORK", "/var/tmp/agent-tmp-fuzz-work")
@@ -168,6 +171,7 @@ def run_seed(args):
         subprocess.run(["git", "init", "-q"], cwd=inc, check=True)
         stamp = 1_700_000_000
         prev = None
+        diffs, hashes, first = [], [], None
         for i, st in enumerate(states):
             stamp += 10
             write_state(inc, st, prev, stamp)
@@ -182,23 +186,47 @@ def run_seed(args):
             index(binary, fresh)
             a, b = dump(inc), dump(fresh)
             shutil.rmtree(fresh)
+            # edge sets with the confidence column dropped, per step
+            hashes.append([hashlib.sha1("\n".join(strip_conf(a)).encode()).hexdigest()[:12],
+                           hashlib.sha1("\n".join(strip_conf(b)).encode()).hexdigest()[:12]])
             if a != b:
-                sa, sb = set(a), set(b)
-                only_inc = [x for x in a if x not in sb] or [f"(dup) {x}" for x in a if a.count(x) != b.count(x)]
-                only_fresh = [x for x in b if x not in sa]
-                return {"seed": seed, "step": i, "inc_only": only_inc, "fresh_only": only_fresh,
-                        "states": states[: i + 1]}
-        return {"seed": seed, "ok": True}
+                sb, sa = Counter(b), Counter(a)
+                only_inc = sorted((sa - sb).elements())
+                only_fresh = sorted((sb - sa).elements())
+                diffs.append({"step": i, "inc_only": only_inc, "fresh_only": only_fresh})
+                if first is None:
+                    first = i
+        if first is None:
+            return {"seed": seed, "ok": True, "hashes": hashes}
+        d0 = diffs[0]
+        return {"seed": seed, "step": first, "inc_only": d0["inc_only"], "fresh_only": d0["fresh_only"],
+                "diffs": diffs, "hashes": hashes, "states": states}
     except Exception as e:  # noqa: BLE001
         return {"seed": seed, "error": str(e)}
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
 
+def strip_conf(rows):
+    out = []
+    for r in rows:
+        f = r.split(" | ")
+        out.append(" | ".join(f[:3] + f[4:]))
+    return sorted(out)
+
+
 def main():
     binary, first, count, out = os.path.abspath(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
     steps = int(sys.argv[sys.argv.index("--steps") + 1]) if "--steps" in sys.argv else 3
     jobs = int(sys.argv[sys.argv.index("--jobs") + 1]) if "--jobs" in sys.argv else 8
+    if "--gen" in sys.argv:
+        # another generator module's `initial(rng)` / `step(state, rng)`; workers fork after this
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("gen", sys.argv[sys.argv.index("--gen") + 1])
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        global initial, step
+        initial, step = mod.initial, mod.step
     os.makedirs(ROOT, exist_ok=True)
     bad = err = 0
     with Pool(jobs) as pool, open(out, "w") as fh:
