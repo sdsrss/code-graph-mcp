@@ -29,4 +29,14 @@
 
 - RED（修前）：`test_python_renamed_import_does_not_bind_its_original_name`：views/rev 的 `go` 各多一条 `app/m.py:a inferred`，only.py 只有 `m.a inferred`（应为两条 `ambiguous`）。`test_python_reexport_chain_refilled_matches_rebuild`：两步后增量 `[]`，重建两条 pyimp。
 - GREEN：两测试通过；D#893 测试含 7 种单步增量与“n.py 后到”“改名导入后到”两种序列，D#895 测试含评审序列、只删同名文件、同一定义在文件间移动三种。
-- 变异（每个跑完整 lib 套件）：M1（`cg_imports` 不用别名）、M2（剪枝不比名字）、M3（佐证不比名字）、N0 对照（别名完全不进名字）均被杀；M4（`cg_unique_imports` 不用别名）首轮存活，补 tests/ 夹具（按名优先非测试文件，只有绑定阶段会加错边）；M5/M6 存活，见决定。
+- 变异（每个跑完整 lib 套件）：M1（`cg_imports` 不用别名）、M2（剪枝不比名字）、M3（佐证不比名字）、N0 对照（别名完全不进名字）均被杀；M4（`cg_unique_imports` 不用别名）首轮存活，补 tests/ 夹具（按名优先非测试文件，只有绑定阶段会加错边）后被杀；M5/M6 存活，见决定。D#895：P1（`cg_fanout_up` 改回整次运行求和）被杀；P2（去掉 DISTINCT）存活，下游是 EXISTS 或去重后的路径集合，输出等价，保留 DISTINCT。
+- 语料（`/var/tmp/agent-tmp-d893/`，0.198.0 发布版 md5 606829a7 对本分支 nodef，各自 `incremental-index --no-embed`，calls 行含置信度与 metadata）：标准库 569 个 .py 100,389 → 100,352（−38/+1）；nltk 24,060、flask 3.1.0（ab814966）1,836、本仓库 3cc4f480（Rust/JS/Python）14,092 逐行相同；私有应用 daagu 10b3ce5d 55,351 → 55,348（−4/+1）。逐条读源码：删掉的 42 行都是按改名导入原名绑上的错边（argparse/getopt/optparse 的 `_` 36 行，`_pyrepl/readline.py` 的 `Console`，random 的 `mean` 两行，daagu 的 `AIProvider as AIProviderSchema`、`CL3Signal as CL3SignalModel` 4 行），新增 2 行都是别名指向的定义（`fmean as mean`、`load_active_config_standalone as load_active_config`）。v143 构建与 v142 构建在五个语料上逐行相同。
+- 升级提示（v143 构建对 0.198.0 建的 flask 索引）：查询打印 “This index was built by an older code-graph (index v142, this binary v143) …”，`incremental-index` 打印 “Index version mismatch (stored v142 ≠ binary v143): clearing + rebuilding …”，与 CHANGELOG 一致。
+- 增量开销（各一次）：daagu HEAD~200 → HEAD（526 个文件，20 个改名、17 个删除）5.964 → 5.706 s；本仓库 v0.180.0 → v0.198.0（669 个文件）3.049 → 2.878 s。两边与全量重建的差距相同（daagu 2 条、本仓库 2,389 条，全是 `references`，已有问题，记 D#898）。
+- D#894 量级：四个语料里 Python imports 边绑到嵌套定义的：标准库 11 条（都是 `from os import fsencode/fsdecode`，os.py 用 `fsencode, fsdecode = _fscodec()` 把嵌套函数绑到模块级，这 11 条是对的），flask 12 条（测试函数里的 `class Module`，错），nltk、daagu 0。D#894 建议的“imports 边跳过嵌套节点”会丢掉标准库这 11 条，故不做，留延期。
+- 函数内改名导入（新构建）：`def f(): from app.m import a as b; return b()` 与另一函数 `g` 里的 `b()` 都绑 `m.a`（0.198.0 都按名绑 `other.b`），写进 Not covered。
+
+## 提交
+
+- a0e73ed0：D#893（INDEX_VERSION 142 → 143，指纹按只含 D#893 的树重录）。
+- 下一个提交：D#895（指纹按完整树重录，仍为 v143）。

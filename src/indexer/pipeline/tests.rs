@@ -12748,6 +12748,96 @@ fn test_python_renamed_import_does_not_bind_its_original_name() {
     );
 }
 
+/// Index `before`, apply each step (None deletes) with an incremental run
+/// after it, and require the calls and edges a fresh index of the result has.
+fn assert_steps_match_rebuild(before: &[(&str, &str)], steps: &[&[(&str, Option<&str>)]]) {
+    let (project, _d, db) = fresh_index_of(before);
+    let mut tree: Vec<(String, String)> = before
+        .iter()
+        .map(|(p, b)| (p.to_string(), b.to_string()))
+        .collect();
+    for step in steps {
+        for (path, body) in *step {
+            tree.retain(|(p, _)| p != path);
+            let abs = project.path().join(path);
+            match body {
+                Some(b) => {
+                    fs::create_dir_all(abs.parent().unwrap()).unwrap();
+                    fs::write(&abs, b).unwrap();
+                    tree.push((path.to_string(), b.to_string()));
+                }
+                None => fs::remove_file(&abs).unwrap(),
+            }
+        }
+        run_incremental_index(&db, project.path(), None, None).unwrap();
+    }
+    let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+    let (_p2, _d2, control) = fresh_index_of(&files);
+    assert_eq!(
+        call_edges_with_confidence(&db),
+        call_edges_with_confidence(&control),
+        "calls after {steps:?} must equal a rebuild"
+    );
+    assert_eq!(
+        edge_set(&db),
+        edge_set(&control),
+        "edges after {steps:?} must equal a rebuild"
+    );
+}
+
+/// D#895: a re-export chain's defining file emptied, then defining `a` again
+/// in a run that deletes another file's `a`. The run's count of `a` did not
+/// rise, so `p/sub/__init__.py`'s import kept the `<module>` node it fell back
+/// to and both calls lost their edge. The `if` and the second package of the
+/// review's sequence play no part: an unimported namesake's deletion is enough.
+#[test]
+fn test_python_reexport_chain_refilled_matches_rebuild() {
+    let before: &[(&str, &str)] = &[
+        ("p/__init__.py", "from .sub import a\n"),
+        ("p/sub/__init__.py", "from .impl import a\n"),
+        ("p/sub/impl.py", "def a():\n    return 1\n"),
+        ("q/__init__.py", "from .impl import a\n"),
+        ("q/impl.py", "def a():\n    return 2\n"),
+        ("r.py", "def a():\n    return 3\n"),
+        (
+            "use.py",
+            "from p import a as b1\nfrom p.sub import a as b2\n\n\n\
+             def go_b1():\n    return b1()\n\n\ndef go_b2():\n    return b2()\n",
+        ),
+    ];
+    let emptied: &[(&str, Option<&str>)] = &[("p/sub/impl.py", Some(""))];
+    let refill =
+        |gone: &'static str, body: &'static str| -> Vec<(&'static str, Option<&'static str>)> {
+            vec![("p/sub/impl.py", Some(body)), (gone, None)]
+        };
+    let plain = "def a():\n    return 1\n";
+    // The review's sequence, then the namesake alone, then the same definition
+    // moving between files in one run.
+    assert_steps_match_rebuild(
+        before,
+        &[
+            emptied,
+            &refill("q/impl.py", "if True:\n    def a():\n        return 1\n"),
+        ],
+    );
+    assert_steps_match_rebuild(before, &[emptied, &refill("r.py", plain)]);
+    assert_steps_match_rebuild(
+        before,
+        &[
+            &[("p/sub/impl.py", Some("")), ("r.py", Some(plain))],
+            &refill("r.py", plain),
+        ],
+    );
+    // Not vacuous: the rebuild binds both calls.
+    let (_p, _d, db) = fresh_index_of(before);
+    for caller in ["go_b1", "go_b2"] {
+        assert_eq!(
+            py_calls_from(&db, "use.py", caller),
+            ["p/sub/impl.py:function:a"]
+        );
+    }
+}
+
 /// D#120 F1: the export renamed away. The requeued edge must not be bound by
 /// name in another file (`y.js:load`), and a later sweep must not either.
 #[test]

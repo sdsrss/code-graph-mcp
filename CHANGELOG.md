@@ -50,6 +50,18 @@ identical copies, `calls` rows compared with their confidence:
 - nltk 3.9.2 (358 files), flask 3.1.0 and this repository (Rust,
   JavaScript, Python): no row changed.
 
+### fix: an import of a definition that moved between files in one run is re-resolved
+
+An incremental run that defined `a` in one file and deleted another file's
+`a` left an import that had found no `a` in the first file (`from .impl
+import a` while `impl.py` was empty) bound to that file's module, so calls
+reaching `a` through it, as through a package's `__init__.py` re-exporting
+it, had no edge until a rebuild. The run decides which names gained a
+definition by counting them over the files it changed, and one added and
+one deleted summed to no change; it counts them per file now. Incremental
+runs over 526 and 669 changed files took 5.71 s and 2.88 s, against 5.96 s
+and 3.05 s for 0.198.0 (one run each).
+
 ### Not covered
 
 - The same shape in JavaScript and TypeScript is unchanged: with

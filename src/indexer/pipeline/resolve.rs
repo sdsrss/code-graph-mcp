@@ -1115,8 +1115,8 @@ pub(super) fn drop_scope_temps(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
-/// Snapshot `(name, language) -> definition count` for `paths`, before an
-/// `index_files` run mutates them. Pair with
+/// Snapshot `(path, name, language) -> definition count` for `paths`, before
+/// an `index_files` run mutates them. Pair with
 /// [`bare_name_callers_of_new_duplicates`] after.
 ///
 /// Deliberately NOT [`snapshot_scope_name_counts`], which this otherwise
@@ -1161,13 +1161,13 @@ pub(super) fn snapshot_definition_counts(
     // target.
     conn.execute_batch(
         "CREATE TEMP TABLE cg_fanout_before AS
-           SELECT n.name AS nm, f.language AS lang, COUNT(*) AS cnt
+           SELECT f.path AS path, n.name AS nm, f.language AS lang, COUNT(*) AS cnt
            FROM nodes n
            JOIN files f ON f.id = n.file_id
            JOIN cg_fanout_paths p ON p.path = f.path
            WHERE n.name <> '<module>'
-           GROUP BY n.name, f.language;
-         CREATE INDEX cg_fanout_before_k ON cg_fanout_before(nm, lang);",
+           GROUP BY f.path, n.name, f.language;
+         CREATE INDEX cg_fanout_before_k ON cg_fanout_before(path, nm, lang);",
     )?;
     conn.execute_batch(&format!(
         "CREATE TEMP TABLE cg_shape_before AS {CLASS_SHAPE_SELECT};"
@@ -1728,10 +1728,13 @@ pub(super) fn importers_of_python_reexport_drift(
 ///
 /// Two halves, both read off state that already exists rather than re-derived:
 ///
-/// * **Which names.** Those whose definition count inside this run's own paths
-///   ROSE — up only, unlike `scope_names_from_count_drift`'s symmetric
+/// * **Which names.** Those whose definition count ROSE in one of this run's
+///   own paths — up only, unlike `scope_names_from_count_drift`'s symmetric
 ///   difference. A name that LOST a definition needs no new edge; the surviving
-///   edges only need the relabel the post passes already do.
+///   edges only need the relabel the post passes already do. Per path, not
+///   summed over the run: a run that defines `a` in `impl.py` and deletes
+///   another file's `a` gains a definition an import of `impl.py` can bind,
+///   and the sum, unchanged, hid it (D#895).
 /// * **Which callers.** Files outside the run holding a `calls` edge to that
 ///   name that Phase 2e has just labelled `ambiguous`. `conf_case` assigns that
 ///   label exactly when the target name's count is >1 AND the caller's file does
@@ -1752,9 +1755,9 @@ pub(super) fn bare_name_callers_of_new_duplicates(
 ) -> Result<Vec<String>> {
     use crate::domain::{CONF_AMBIGUOUS, REL_CALLS, REL_IMPORTS, REL_REFERENCES};
 
-    // `(nm, lang)` all the way through, never `nm` alone. The pairs are already
-    // unique — `cg_fanout_after` groups by both — so no DISTINCT is needed here,
-    // and carrying the language is what keeps the round from firing across
+    // `(nm, lang)` all the way through, never `nm` alone. Counted per path, so
+    // one pair can rise in two paths: DISTINCT keeps the pairs unique. Carrying
+    // the language is what keeps the round from firing across
     // languages: a rise in the JavaScript count of `render` says nothing about a
     // Python caller of `render`, because `conf_case` joins its name count as
     // `nc.lang IS tf.language` and so can never label that pair `ambiguous` in
@@ -1766,17 +1769,18 @@ pub(super) fn bare_name_callers_of_new_duplicates(
     conn.execute_batch(
         "DROP TABLE IF EXISTS temp.cg_fanout_after;
          CREATE TEMP TABLE cg_fanout_after AS
-           SELECT n.name AS nm, f.language AS lang, COUNT(*) AS cnt
+           SELECT f.path AS path, n.name AS nm, f.language AS lang, COUNT(*) AS cnt
            FROM nodes n
            JOIN files f ON f.id = n.file_id
            JOIN cg_fanout_paths p ON p.path = f.path
-           GROUP BY n.name, f.language;
-         CREATE INDEX cg_fanout_after_k ON cg_fanout_after(nm, lang);
+           GROUP BY f.path, n.name, f.language;
+         CREATE INDEX cg_fanout_after_k ON cg_fanout_after(path, nm, lang);
          DROP TABLE IF EXISTS temp.cg_fanout_up;
          CREATE TEMP TABLE cg_fanout_up AS
-           SELECT a.nm AS nm, a.lang AS lang
+           SELECT DISTINCT a.nm AS nm, a.lang AS lang
            FROM cg_fanout_after a
-           LEFT JOIN cg_fanout_before b ON b.nm = a.nm AND b.lang IS a.lang
+           LEFT JOIN cg_fanout_before b
+             ON b.path = a.path AND b.nm = a.nm AND b.lang IS a.lang
            WHERE a.cnt > COALESCE(b.cnt, 0);
          CREATE INDEX cg_fanout_up_k ON cg_fanout_up(nm, lang);",
     )?;
