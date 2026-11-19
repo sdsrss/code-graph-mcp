@@ -6409,6 +6409,43 @@ fn d905_a_python_reference_follows_the_scope_chain() {
     }
 }
 
+// D#905 pre-tag review round 1: shapes three surviving mutants left unpinned
+// (the first iterable's own comprehension scope, a renamed import named like
+// a builtin, the `X = X` alias), and two defaults that run outside their
+// function or lambda.
+#[test]
+fn d905_review_shapes_around_the_scope_read() {
+    // The inner comprehension is the outer one's first iterable: it runs
+    // outside the outer scope, so `handler` there is the imported one.
+    let refs = python_reference_names(
+        "from m import handler\n\ndef f(z):\n    \
+         return [handler for handler in [use(handler) for _ in z]]\n",
+    );
+    assert!(refs.iter().any(|r| r == "handler"), "{refs:?}");
+    // `from m import a as set`: `set()` runs `m.a`, not the builtin.
+    let calls = python_call_names("from m import a as set\n\ndef f():\n    set()\n");
+    assert!(!calls.is_empty(), "{calls:?}");
+    // `TimeoutError = TimeoutError` keeps the builtin's value under its name.
+    let refs =
+        python_reference_names("TimeoutError = TimeoutError\n\ndef f():\n    use(TimeoutError)\n");
+    assert!(refs.iter().any(|r| r == "TimeoutError"), "{refs:?}");
+    // A lambda's default runs in the module, not on the lambda's parameter.
+    let rels = extract_relations(
+        "def helper():\n    pass\n\nf = lambda helper=helper(): helper\n",
+        "python",
+    )
+    .unwrap();
+    let call = rels
+        .iter()
+        .find(|r| r.relation == REL_CALLS && r.target_name == "helper")
+        .expect("call kept");
+    assert!(call.metadata.is_none(), "{:?}", call.metadata);
+    // `set()` in a default runs the builtin: the parameter `set` is not
+    // bound yet.
+    let calls = python_call_names("def f(set=set()):\n    pass\n");
+    assert!(calls.is_empty(), "{calls:?}");
+}
+
 // D#905's scope read costs the scope nesting, not the syntax depth. Read by
 // climbing each name's ancestors (`Node::parent` descends from the root), a
 // 480 KB file of annotations nested 150 deep indexed in 8.06 s against

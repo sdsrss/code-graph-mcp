@@ -44,13 +44,13 @@ struct PyDefined {
 thread_local! {
     /// Per file: reset by [`reset_python_file`].
     static PY_DEFINED: std::cell::RefCell<PyDefined> = std::cell::RefCell::new(PyDefined::default());
+    /// Per file: [`scope_scan`], filled by [`reset_python_file`].
+    static PY_LOCAL_VALUE_CALLS: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
     /// Per file, keyed by `function_definition` (or `class_definition`) node
     /// id: what each function's own scope (or class body) binds
     /// ([`function_bindings`]). Reset by [`reset_python_file`],
     /// since node ids are only unique within one tree.
-    /// Per file: [`scope_scan`], filled by [`reset_python_file`].
-    static PY_LOCAL_VALUE_CALLS: std::cell::RefCell<std::collections::HashSet<usize>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
     static PY_FN_BINDINGS: std::cell::RefCell<
         std::collections::HashMap<usize, std::rc::Rc<std::collections::HashMap<String, PyBinding>>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -259,8 +259,8 @@ struct ScopeScan<'s> {
 /// name to module level and `nonlocal` to the enclosing function.
 ///
 /// One sweep collects every scope as a byte range and every bare call, then
-/// the calls in source order meet the ranges open at them, innermost on top,
-/// as `treesitter::mark_python_class_body_calls` does. Asking each call's
+/// each call reads the scopes around it from that list ([`PyScopes::read`]:
+/// a binary search and a climb through parents). Asking each call's
 /// ancestors instead costs the depth squared per call (`Node::parent`
 /// descends from the root): `test_python_class_body_marking_stays_linear`
 /// timed out at 60 s.

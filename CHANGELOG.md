@@ -35,20 +35,23 @@ or `references` edge to a function or method of that name. Python's own
 scoping now decides, and these get no edge. A call of a local value
 (`cb()` on a parameter) keeps its edge, labelled as before. A name keeps its
 by-name binding as before when the file defines it (at any depth) or imports
-it, assigns it as an alias of the same name (`Command = commands.Command`),
+it, assigns it at module level, alone, as an alias of the same name
+(`Command = commands.Command`, `TimeoutError = TimeoutError`),
 declares it `global` in a function, or binds it in the class body the name is
 written directly in; and a name that reaches module level keeps it in a file
 with a star import.
 
 Measured on fresh indexes of the same files, 0.202.0 against this version:
 
-- nltk: `callgraph Downloader.list --direction callers --depth 1` listed 197
-  callers and reported its limit hit; the index held 315 calls into the
-  method, 291 of them calls of the builtin `list()`. It now lists 24: the two
+- nltk: `callgraph Downloader.list --direction callers --depth 1 --json`
+  returned 197 callers and reported its limit hit; the index held 315 calls
+  into the method, 291 of them calls of the builtin `list()`. It now returns
+  24: the two
   `self._ds.list(...)` calls in `downloader.py`, and 22 in files that
   star-import (see Not covered).
 - Standard library: `callgraph str --file locale.py --direction callers
-  --depth 1` listed 199 and hit the limit; it now lists 47. `refs prefix`
+  --depth 1 --json` returned 199 callers and hit the limit; it now returns 47
+  (the text answer prints 46 of them). `refs prefix`
   listed `_is_filename_to_skip (_py_warnings.py:423)` and `__init__
   (configparser.py:586)` beside the one real call: both read a comprehension's
   variable `prefix`; it now lists the call alone. `refs T` listed 9
@@ -61,8 +64,8 @@ Measured on fresh indexes of the same files, 0.202.0 against this version:
 Edges removed from a full index (calls / references; in brackets those
 `inferred` or `extracted`, the tiers `callgraph` and `impact` show by
 default): standard library 9,804 (7,673 / 2,131; 1,918), nltk 4,645 (3,697 /
-948; 881), flask 23 (19 / 4; 8), this repository 7,171 (71 / 7,100; 273), the
-private application 2,773 (2,559 / 214; 348). Each removed edge was checked
+948; 881), flask 23 (19 / 4; 8), this repository at 0.202.0's commit 7,171
+(71 / 7,100; 273), the private application 2,773 (2,559 / 214; 348). Each removed edge was checked
 against Python's scoping by a script (`tasks/d905-scope-oracle/`), and the 60
 it could not decide were read in the source: none is a call or reference
 Python makes. The share of Python `references` edges the script accepts went
@@ -76,14 +79,16 @@ under 0.202.0, by the same edges at the same steps. Edit sequences written
 for these cases (a builtin's namesake added, a star import added and removed,
 a comprehension variable's namesake added and removed, a module variable's
 assignment removed and restored, an alias and a `global`): the
-incremental index matched a fresh one at every step.
+incremental index matched a fresh one at every step. The pre-tag review's
+generator for these cases found one sequence the other way (see Not
+covered).
 
 ### change: definitions those edges kept alive may now have none
 
 A definition whose only incoming edges were among those removed now has
 none, and `dead-code` may list it. Python definitions with no incoming edge:
 standard library 5,169 → 5,237, nltk 2,169 → 2,182, flask 745 → 745, this
-repository 239 → 471, the private application 10,600 → 10,681. `dead-code`
+repository at 0.202.0's commit 239 → 471, the private application 10,600 → 10,681. `dead-code`
 returns at most 200 definitions, largest first: on the standard library three
 of them changed, `Executor.map`, `Random.sample` and ElementTree's `indent`
 now among them; on nltk two; on the private application none.
@@ -104,12 +109,39 @@ the standard library's index went from 69.3 MB to 67.3 MB.
   nested definition of that name in the file, `extracted` (flask's tests:
   `view_func=index` beside many nested `def index`; 269 such edges in flask).
   Bare calls already pick by scope.
-- A module-level alias `X = obj.X` counts as the definition of `X` whatever
-  `obj` is, and a `global` name keeps its binding.
+- An incremental update can now miss an edge a rebuild has, where 0.202.0
+  matched: a file reads an imported name (`from lib.defs import T`, then
+  `x: T`) and, in a closure, a local of its enclosing function (`helper = 3`,
+  then `return helper` inside a nested `def`); one update defines both names
+  in another file (a method `T`, a function `helper`). A rebuild binds `x: T`
+  to the new method `T` as well, `ambiguous`; the update does not. 0.202.0's
+  reference to the local `helper` was bound by name and made the update
+  re-read the file, which covered the older gap: without the closure, 0.202.0
+  misses the same edge (an import-vouched reference does not take a new
+  namesake). The edge the update misses names the method where Python reads
+  the imported class. Found by the pre-tag review's random sequences, 1 of
+  600. The two replays of real history 0.202.0 was measured on (this
+  repository from 0.180.0 to 0.198.0 in one update, the private application
+  over 200 commits) still end edge for edge equal to a rebuild.
+- An alias other than a single module-level `X = X` / `X = a.b.X` is read as
+  a value and loses its edge: a tuple (`helper, deco = a.helper, a.deco`), a
+  chain whose first target is the alias (`Model = Model2 = a.Model`), a
+  renamed import assigned back (`handler = _handler`), or an alias in an
+  enclosing function read by a nested one. None of the five corpora lost an
+  edge this way.
+- A module-level `X = obj.X` counts as the definition of `X` whatever `obj`
+  is, and a `global` name keeps its binding.
+- An import or star import nested more than about 15 blocks deep (16
+  `if True:` levels) is not seen, so a builtin's name it imports is read as
+  the builtin: `from pkg.d import open` there loses its call and reference.
+- A project that indexes its own `builtins.pyi` (a typeshed-style stub) loses
+  the edges from builtin names to it.
 - Calls of a module-level variable (`_warn = warnings.warn`, then `_warn()`)
   are unchanged.
-- A Python file with very deeply nested code still costs what it did in
-  0.202.0: 120 KB of calls nested 150 deep took 11.4 s to index (11.6 s now).
+- A Python file with very deeply nested code still costs about what it did
+  in 0.202.0: 120 KB of calls nested 150 deep took 11.4 s to index (11.6 s
+  now). Annotations cost a little more: a 988 KB file of functions nested 100
+  deep, each with 20 annotated parameters, 7.25 s and now 7.94 s (means of 3).
 
 ## 0.202.0
 
