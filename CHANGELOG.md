@@ -1,5 +1,99 @@
 # Changelog
 
+## 0.202.0
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 143 → 144.
+The graph a full index holds is the same as 0.201.0's (every edge, both
+ends, confidence and metadata compared on CPython 3.14's standard library,
+nltk 3.9.2, flask 3.1.0, this repository and a private application). What
+changes is a record the index keeps beside the graph: the references it
+could not bind (below). An index 0.201.0 built has none, and 0.201.0 reads
+the new rows as unresolved calls: run on an index this version wrote, it
+bound one as a `calls` edge where a rebuild has a `references` edge. The
+MCP server rebuilds the index when it starts. From the command line, a
+query answers from the old index with "This index was built by an older
+code-graph (index v143, this binary v144): answers come from it until it
+is rebuilt — run: code-graph-mcp reindex", and the first
+`incremental-index` prints "Index version mismatch (stored v143 ≠ binary
+v144): clearing + rebuilding". 0.201.0 answers queries from an index this
+version wrote but will not write to it: its `incremental-index` exits 1
+and says to delete `.code-graph/index.db*` first. To pin the binary back:
+`npm i -g @sdsrs/code-graph@0.201.0`, then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The plugin's
+scripts are unchanged.
+
+### fix: a reference to a name that a later update defines gets its edge
+
+A `references` edge — a function passed or stored by name, a decorator, a
+type in an annotation — needs a definition of the name in the file's
+language. When no file had one, the reference got no edge, in a rebuild
+too. When a later incremental update defined the name, the referencing
+file kept no edge until it changed itself or the index was rebuilt, which
+binds the new definition. The update now re-extracts that file, as it
+re-extracts the callers of a name that gains another definition. The
+change is in the part of the update no language has its own copy of:
+below it shows in Python, Go, Java and Rust, and a test covers
+TypeScript. The MCP server's refresh runs the same code; a file edited
+since it was indexed is left to the next incremental update, which reads
+the edit.
+
+For example, with `use.py` returning `sorted(xs, key=a)` and no `a`
+anywhere, adding `lib.py` with `def a()`: `refs a` answered "No
+references found for 'a'"; it now lists `go (use.py:1)`, as after a
+rebuild.
+
+Updating this repository's index from 0.180.0 to 0.198.0 in one run left
+2,398 `references` edges that only a rebuild had, and now none; the
+private application's from a commit to the one 200 commits later, 2 and
+now none.
+
+Random edit sequences, each step's incremental index compared edge for
+edge with a fresh index of the same files, 1,500 sequences per generator:
+in Java 32 differed (53 edges) and now none; in Go, with two generators,
+33 and 40, now 10 and 18; in Rust 75, now 69; in Python, with three
+generators, 15 (of 4,500), 56 and 25, now 15, 50 and 22. Of the 149
+`references` edges among them, 4 remain, all of the case under Not
+covered. No sequence differs that did not before, and every edge that
+still differs did at the same step before. The generators for C, C++, C#,
+Dart, JavaScript, TypeScript, Kotlin, PHP, Ruby and Swift give the same
+results as before.
+
+### change: defining such a name re-extracts the files that reference it
+
+The re-extraction above costs time when a name is defined that many files
+reference without a definition. Editing one file of the standard library
+took 0.24 s before and after (median of 7). The name most files there
+reference this way is `int`, which 72 files pass as a value
+(`map(int, xs)`, `isinstance(x, int)`): a new file defining a function
+`int` took 0.43 s and now 2.3 s, where a rebuild takes 3.0 s; one
+defining `exc`, referenced so by 37 files, 0.45 s and now 1.4 s. The two updates above took 3.1 s and 6.0 s before,
+and 3.1 s and 5.9 s now (179 files re-extracted where 102 were, and 394
+where 393; medians of 3). A full index stores one row per such reference:
+3,786 in the standard library (index 68.7 → 69.3 MB), 10,073 in this
+repository (46.9 → 48.1 MB).
+
+### Not covered
+
+- Many of the 2,398 edges above are wrong in the full index itself: a
+  variable is taken for a reference to every definition of its name in
+  the project. All 1,415 edges to `m` among them come from variables named
+  `m` — a generator's (`sum(len(m) for m in dup_marks)`), a module's
+  (`m = collections.defaultdict(set)`), one unpacked in a function
+  (`q, m = q_of(meta)`) — and go to the project's 283 definitions of `m`,
+  all in test fixtures (282 methods and a function). A rebuild has these
+  edges, and now so does an incremental update.
+- A reference to a name the file imports (`from lib.k import b`, then
+  `REFS = [b]`) has one edge, to the definition the import names. When a
+  run defines another `b`, a rebuild adds an `ambiguous` edge to it as
+  well; the update does not: these are the 4 `references` edges above, 3
+  of the 105 that still differ in the second Python generator and 1 of
+  the 39 in the third.
+- The other cases 0.201.0 lists under Not covered still apply: `inherits`
+  to a name a run adds, calls on an attribute, a run that deletes one of
+  several definitions, a definition added beside an import, and imports
+  through a chain of re-exports.
+
 ## 0.201.0
 
 **Upgrading: no rebuild.** `INDEX_VERSION` stays 143: a full index holds

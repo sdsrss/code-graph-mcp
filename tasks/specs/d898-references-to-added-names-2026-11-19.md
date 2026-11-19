@@ -94,3 +94,40 @@ L2：修复增量路径，使其符合“增量 = 重建”的既有行为（bug
     - 写 `def exc()`：0.45 → 1.36 s，扇出 37 个文件。
     - 删掉再加回时，扇出只有 5 个：其余文件由 D#543 的删除记录在运行内重新抽取，不经扇出。
   - 上界：一次运行重新抽取的文件，不超过同语言里引用了它新定义的名字、而当时没有定义的文件数；这些文件在重建里也会得到这些边。
+- **提交 82173486**（pre-commit：`cargo test` 2,533 通过 / 0 失败 / 7 忽略，fmt、两条分支的 clippy 都通过）。改了 `domain.rs`，按 runbook 另跑 JS 套件：1,785 个，1,782 通过、0 失败、3 跳过。
+- **Upgrading 实测**（head3 = 提交后的代码）：
+  - 0.201.0 建的索引（`application_id` 143）：新版查询时给出旧版提示并照常回答；新版 `incremental-index` 清空重建。
+  - MCP 服务器（`serve`，经 `tasks/d435-harness/mcpc.py`）启动后 `application_id` 变成 144，`find_references a` 列出 `go`：0.201.0 增量建的这个索引原来没有这条边。
+  - 例子：`use.py` 里 `sorted(xs, key=a)`，之后加 `lib.py` 的 `def a()`。0.201.0 的 `refs a` 回答“No references found for 'a'”，新版列出 `[references] go (use.py:1) ~inferred`。
+- **全量一侧的错边（D#905）**：重建独有的 2,398 条里，指向 `m` 的 1,415 条（5 个起点 × 283 个名为 `m` 的节点，其中 1,410 条指向方法）全部来自名叫 `m` 的变量，这些变量有三种：
+  - 生成器或推导式的目标：`grade.py` 的 `for d, c, a, m in jobs`、`audit-metrics.py` 的 `for m in dup_marks`、`mutbin.py` 的 `{m[0]: m for m in …}`。
+  - 模块级变量：`modmap.py` 的 `m = collections.defaultdict(set)`。
+  - 元组解包的局部变量：`sim.py` 的 `q, m = q_of(meta)`。
+  - 其余名字（`B`、`A`、`n` 等）没有逐个核对。
+- **模糊测试**（`fuzz_all.sh`，每步比较；base head0、head head3；第一次跑在模板 `gen_multi.py` 处中止，它不是独立的生成器，脚本已跳过它，剩下 6 个用 `ONLY=` 补跑）：
+
+  | 生成器（种子数） | base 分歧种子 / 行 | head | 其中 references 行 base → head | head 独有种子 / 不在 base 同一步的行 |
+  |------|------|------|------|------|
+  | 自己的（4,500，3 步） | 15 / 21 | 15 / 21 | 0 → 0 | 0 / 0 |
+  | 评审（1,500，4 步） | 56 / 120 | 50 / 105 | 18 → 3 | 0 / 0 |
+  | Python 移动（1,500） | 25 / 44 | 22 / 39 | 6 → 1 | 0 / 0 |
+  | Go | 33 / 43 | 10 / 15 | 28 → 0 | 0 / 0 |
+  | Go2 | 40 / 64 | 18 / 29 | 35 → 0 | 0 / 0 |
+  | Java | 32 / 53 | 0 / 0 | 53 → 0 | 0 / 0 |
+  | Rust | 75 / 271 | 69 / 259 | 9 → 0 | 0 / 0 |
+  | JS | 88 / 143 | 88 / 143 | 0 → 0 | 0 / 0 |
+  | TS | 6 / 17 | 6 / 17 | 0 → 0 | 0 / 0 |
+  | PHP | 180 / 522 | 180 / 522 | 0 → 0 | 0 / 0 |
+  | C++ | 1 / 1 | 1 / 1 | 0 → 0 | 0 / 0 |
+  | C、C#、Dart、Kotlin、Ruby、Swift | 0 | 0 | — | 0 / 0 |
+
+  D#901 记的两个 references 种子已与重建一致：88（`REFS = [a, b]`）、229（装饰器 `@a`）。
+- **剩下的 4 行 references（不修，记 D#906）**：评审生成器 265、551，Python 移动生成器 1241，都是同一种形态。
+  - 最小复现：`lib/k.py` 有 `def b`；`use.py` 写 `from lib.k import b`、`REFS = [b]`，边 `use.py → lib/k.py:b` 是 `inferred`（导入作证）。一次运行给 `app/n.py` 加 `def b`，重建多一条 `use.py → app/n.py:b ambiguous`，增量没有。
+  - 原因：扇出只取 `ambiguous` 的 references 边，这条是 `inferred`。
+  - 要修就得取任何置信度的 references 边：任何同名定义新增时，导入了这个名字的文件都要重新抽取。TS、Java、Go 的类型引用若严格跟导入走，这些重新抽取只有开销。开销没测；两段真实回放里这种形态出现 0 次。
+  - 按“A LOW's repair is the riskiest code”的规则，写进 Not covered，记 D#906。
+- **CHANGELOG 0.202.0** 的数字都来自上面各条：
+  - 例子 `refs a` 的修前修后回答是实跑的。
+  - `int` 的两种写法实测都会留下标记行：`map(int, xs)`、`isinstance(x, int)`，两个函数各一行。
+  - 指向 `m` 的 1,415 条边的目标：项目里 283 个名为 `m` 的节点，都在 `tasks/d370g-kit/`，其中方法 282 个、函数 1 个。
