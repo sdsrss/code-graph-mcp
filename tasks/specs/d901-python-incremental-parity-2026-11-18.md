@@ -140,7 +140,21 @@ head4 的自己生成器与评审生成器结果和 head2 逐种子相同（4,50
 
 **Upgrading 段复核**（head3）：0.200.0 做一次“删 `other.py` 的 `a`、加 `app/m.py` 的 `a`”后，`go` 只列 `app/sub/impl.py`；head3 编辑 `app/m.py`、再编辑 `app/sub/impl.py` 都不变；编辑 `app/views.py` 后列出 `app/m.py`、`app/sub/impl.py`，与重建相同。
 
+## 发版前盲审第 2 轮（3529f2ea，只审修复）与处理
+
+评审：新开的子代理，空上下文，只给 3529f2ea 与对照 a1007267、6d19ae93；自建三方二进制，校验和与本 spec 一致（base 648efa92、parent 3618326a、head 980aabfc）。结论 HIGH 0、MEDIUM 1、LOW 2、NOTE 4；16 个生成器、14 种语言相对 0.200.0 无新增错边，五个语料全量不变，`cargo test --no-fail-fast` 2,527/0/7。逐条核对后处理如下（没有代码改动，修的是文字与测试，故不再开第 3 轮）。
+
+- **MEDIUM-1 Upgrading 段（成立）**：第 1 轮改写的“起点文件重新索引时纠正”对经 `__init__.py` 再导出的 Python 导入不成立。自己复现（`upcase.py cases/upgrade_min.json`）：0.200.0 留下的过期状态缺两条 `imports → app/sub/impl.py:K.a`；head 只重索引 `app/__init__.py`，两条都还缺；只重索引 `app/sub/__init__.py`，它自己那条纠正；两者同一次运行则全部纠正。再加一个 `use.py`（`from app import a` 并调用 `a()`）：只重索引 `use.py`，它的导入与调用 `go_a → K.a` 都不纠正，链上每个 `__init__.py` 一起才纠正。自己重跑评审的 `upgrade_check2.py`（默认生成器，base 分歧的种子逐文件重索引）：682 对、1,454 条过期边，剩 21 条（14 个文件）；对照 `up_control.py`：这 14 对 head 从干净索引出发再重索引都与重建相同（head_own_divergence 0），剩下的来自其他文件的过期状态。CHANGELOG 改为“重新索引起点文件纠正大多数：1,454 条中 1,433 条；其余 21 条经过另一个文件的过期边，可能要等那个文件也重新索引——再导出的导入与经它绑定的调用，要等链上每个 `__init__.py` 都重新索引”（不写“仅当”：开放域，只写复现过的形态）。
+- **LOW-2 三个存活变异（成立，补测试）**：M3（Go 过滤扩到所有 Go 调用）、M6（`>=` 改 `>`）、M7（去掉 `PARTITION BY`）。新增三个测试：`d901_a_go_method_call_is_still_restored_onto_a_method`（从评审 M3 变异体的 Go 种子 16 用 `minimize.py` 缩出，`pa/a.go` 在同一次运行加 `K.A` 与调用方 `x.A()`），`d901_a_nested_def_ending_on_its_outers_last_line_is_nested`、`d901_the_nested_flag_is_per_file`（评审写的用例）。head 上 3 个通过；三个变异体各被对应测试杀死、其他两个通过（`mut2.py`，备份还原后 touch）。评审的 Dart 用例杀不死 M10，不加。
+- **LOW-3 改类名的注释（成立）**：“改类名不改任何调用方的边”在标准库外不对：Java `new K()`、PHP `use PA\K` 在类改名成它们已引用的名字时会绑上，parent 因方法限定名变化顺带重抽了这些调用方，head 不会。用评审的数据核对（`fuzzcmp.py` parent 对 head）：每 1,000 个种子 Java 5、PHP 23、TS 3 个是 parent 修好而 head 没修的，都在 0.200.0 同样分歧，head 没有 0.200.0 同一步没有的行——是没修到，不是回归。改注释如实写，不改代码（改回限定名会让 `IMAP4` 改名重抽 292 个文件）。记入 D#903。
+- **NOTE-4 `CLASS_SHAPE_SELECT` 仍是平方**：发版前已有（5,000 个类的文件改一行 base 7.21 s、head 7.32 s）。提交标题的“linear snapshot”只指定义行。记为新延期项。
+- **NOTE-5 `<module>` 注释**：注释说前后两半都排除，实际只有前一半排除，于是每个文件的 `<module>` 都“上升”。五个语料（标准库、nltk、flask、本仓库、daagu）实查指向 `<module>` 的边只有 imports（2,861 / 1,009 / 119 / 425 / 3,007），模块导入那一支本来就过滤 `<module>`，只多付探查开销。改注释，代码不动（0.200.0 相同）。
+- **NOTE-6 移动比重建慢**：CHANGELOG 只给了标准库移动的重建时间。补上互换重建 3.0 s、nltk 移动重建 1.3 s（本 spec 的 cost-h4 实测：3.03 s、1.26 s），Upgrading 段改为“在下面测的三种情形里比重建慢”。
+- **NOTE-7 等价或只影响开销的变异**：M16（scoped 取反，只用 `IS` 比较，等价）、M2（Go 过滤只留 function，requeue 路径会重解析）、M10（`ty` 列）、M11、M12、M15 存活，记录不处理。
+
+**检查（含本轮改动的同一棵树）**：`cargo fmt --check` 通过；抽取指纹重录后复核 7/7 通过（INDEX_VERSION 不变）；`cargo clippy --all-targets -- -D warnings` 默认与 `--features embed-model` 都通过；`cargo test --no-fail-fast` 2,530 通过、0 失败、7 忽略（2,527 + 新增 3 个）。
+
 ## 进度
 
-- 0.201.0 发版提交 6d19ae93 之后，盲审第 1 轮修复（上节）。下一步：提交修复、对修复提交做第 2 轮盲审（只审增量），通过后 push、CI、tag、Release、发版说明、验证。
-- 延期待记：D#901 与 D#899 关闭；新条目——Not covered 列出的剩余增量形态（D#903）；全量一侧“导入模块有同名函数与方法、调用方目录另有同名定义时，显式导入的调用丢边”（D#902）；变异存活清单里的 M8、M10、`ty` 列无测试固定。
+- 盲审第 2 轮处理完（上节），提交后 push、CI、tag、Release、发版说明、验证。
+- 延期待记：D#901 与 D#899 关闭；新条目——Not covered 列出的剩余增量形态与改类名时 Java/PHP/TS 少数调用方（D#903）；全量一侧“导入模块有同名函数与方法、调用方目录另有同名定义时，显式导入的调用丢边”（D#902）；`CLASS_SHAPE_SELECT` 的逐类 EXISTS 平方开销与 `<module>` 在后一半不排除的探查开销；变异存活清单里的 M8、M10、`ty` 列无测试固定。
