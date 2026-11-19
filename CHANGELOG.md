@@ -34,9 +34,9 @@ binds the new definition. The update now re-extracts that file, as it
 re-extracts the callers of a name that gains another definition. The
 change is in the part of the update no language has its own copy of:
 below it shows in Python, Go, Java and Rust, and a test covers
-TypeScript. The MCP server's refresh runs the same code; a file edited
-since it was indexed is left to the next incremental update, which reads
-the edit.
+TypeScript. The MCP server's refresh runs the same code, except that it
+leaves alone a file edited since it was indexed: re-extracting it there
+would read the edit, and the next incremental update would then miss it.
 
 For example, with `use.py` returning `sorted(xs, key=a)` and no `a`
 anywhere, adding `lib.py` with `def a()`: `refs a` answered "No
@@ -61,17 +61,24 @@ results as before.
 
 ### change: defining such a name re-extracts the files that reference it
 
-The re-extraction above costs time when a name is defined that many files
-reference without a definition. Editing one file of the standard library
-took 0.24 s before and after (median of 7). The name most files there
-reference this way is `int`, which 72 files pass as a value
-(`map(int, xs)`, `isinstance(x, int)`): a new file defining a function
-`int` took 0.43 s and now 2.3 s, where a rebuild takes 3.0 s; one
-defining `exc`, referenced so by 37 files, 0.45 s and now 1.4 s. The two updates above took 3.1 s and 6.0 s before,
-and 3.1 s and 5.9 s now (179 files re-extracted where 102 were, and 394
-where 393; medians of 3). A full index stores one row per such reference:
-3,786 in the standard library (index 68.7 → 69.3 MB), 10,073 in this
-repository (46.9 → 48.1 MB).
+The re-extraction above takes time when a name is defined that many files
+reference without a definition, and there is no cap on it: one update can
+take longer than a rebuild. Editing one file of the standard library took
+0.25 s before and after (median of 7). The name most files there reference
+this way is `int`, which 72 files pass as a value (`map(int, xs)`,
+`isinstance(x, int)`): adding a file that defines a function `int` took
+0.55 s and now 3.4 s, where a rebuild takes 3.1 s, and deleting it again
+0.15 s and now 2.7 s; adding one that defines `exc`, referenced so by 37
+files, 0.38 s and now 1.7 s. In the private application, adding a class
+with a method `date` re-extracts 234 files, each of which imports `date`
+from `datetime` (see Not covered): 0.98 s and now 3.7 s, where a rebuild
+takes 4.0 s (medians of 5 and 3, each from the same indexed state). The
+two updates above took 3.05 s and 6.27 s before and 3.18 s and 6.25 s
+now, re-extracting 179 files where they re-extracted 102, and 394 where
+393 (medians of 3). A full index keeps a row for each definition or
+module and each name it references but could not bind: 3,786 in the
+standard library (index 68.7 → 69.3 MB), 10,073 in this repository
+(46.9 → 48.1 MB).
 
 ### Not covered
 
@@ -89,6 +96,17 @@ repository (46.9 → 48.1 MB).
   well; the update does not: these are the 4 `references` edges above, 3
   of the 105 that still differ in the second Python generator and 1 of
   the 39 in the third.
+- The MCP server's refresh, which leaves an edited file to the next
+  incremental update (above): when the edit is undone before that update
+  runs, the file keeps no edge until it changes again. And the refresh
+  still re-extracts an edited file whose call is `ambiguous`, as in
+  0.201.0; a reference the edit adds a definition for then waits for the
+  file holding it to change. Both also happen in 0.201.0.
+- A name imported from a library and then referenced, such as `date`
+  after `from datetime import date`, gets an edge to every project
+  definition of `date`, a method included: 791 `inferred` edges from 234
+  files in the private application once a method `date` is added. A
+  rebuild has these edges, and now so does an incremental update.
 - The other cases 0.201.0 lists under Not covered still apply: `inherits`
   to a name a run adds, calls on an attribute, a run that deletes one of
   several definitions, a definition added beside an import, and imports
