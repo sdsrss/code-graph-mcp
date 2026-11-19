@@ -1140,18 +1140,17 @@ pub(super) fn snapshot_definition_counts(
             stmt.execute([p])?;
         }
     }
-    // `<module>` is excluded here and in the `after` half, so the two stay
-    // symmetric. Every file carries one, which makes it the most duplicated name
-    // in any index by a wide margin — 298 of 5,903 nodes in this repo's own,
-    // where the next most duplicated real name has 7 — so ADDING any file raises
-    // its count and drops it into the trigger set unconditionally. It selects no
-    // caller today (measured: zero `calls` or `references` edges target a
-    // `<module>` node; imports do, and imports are not in this round's relation
-    // set), so the cost is an index probe per module node on every file
-    // addition, paid for nothing. An ordinary EDIT never pays it, which is why
-    // no one-file-edit benchmark can see it. Excluded for the same reason
-    // `<external>` is left out of `paths`: a sentinel name is not a fan-out
-    // target.
+    // `<module>` is excluded from this half only; the `after` half keeps it, so
+    // every file of the run raises it (pre-tag review of 0.201.0, round 2; so
+    // in 0.200.0 too). Every file carries one, which makes it the most
+    // duplicated name in any index by a wide margin — 298 of 5,903 nodes in
+    // this repo's own, where the next most duplicated real name has 7. It
+    // selects no caller: the module-import arm drops it (`u.nm <> '<module>'`),
+    // and no `calls` or `references` edge targets a `<module>` node (measured
+    // on the standard library, nltk, flask, this repository and a private
+    // application; imports do). The cost is an index probe per module node of the run,
+    // paid for nothing. A sentinel name is not a fan-out target, as
+    // `<external>` is left out of `paths`.
     conn.execute_batch(&format!(
         "CREATE TEMP TABLE cg_fanout_before AS
            {DEFINITION_ROWS_SELECT} WHERE nm <> '<module>' GROUP BY 1, 2, 3, 4, 5, 6;
@@ -1790,10 +1789,14 @@ pub(super) fn bare_name_callers_of_new_duplicates(
     // nested `def` by the module's own, one file's by another's in a run that
     // moves it — rises though its count stayed (D#901; summed per pair, those
     // rebuild-only edges stayed until the next rebuild). Not per qualified name
-    // itself: a class rename changes each method's and no caller's edge, and
-    // re-extracted every `ambiguous` caller of every method name (292 files for
-    // `IMAP4` → `IMAP4x` in the standard library; pre-tag review of 0.201.0,
-    // MEDIUM-3). `cg_fanout_up_file` sums the rows per path, for
+    // itself: keyed on it, a class rename raised every method name and
+    // re-extracted every `ambiguous` caller of each (292 files for `IMAP4` →
+    // `IMAP4x` in the standard library, and no edge changed; pre-tag review of
+    // 0.201.0, MEDIUM-3). A caller whose edge does follow the class name is
+    // left as 0.200.0 left it: Java's `new K()` and PHP's `use PA\K` once a
+    // class is renamed to `K`, and some TypeScript member calls (5, 23 and 3
+    // of 1,000 random sequences that end at a rebuild with the qualified name
+    // and do not without it; round 2). `cg_fanout_up_file` sums the rows per path, for
     // the relative-import arm below. One pair can rise in two paths, so both
     // take DISTINCT pairs. Carrying the language is what keeps the round from firing across
     // languages: a rise in the JavaScript count of `render` says nothing about a

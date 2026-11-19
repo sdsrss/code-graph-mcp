@@ -8,10 +8,16 @@ compared on CPython 3.14's standard library, nltk 3.9.2, flask 3.1.0, this
 repository and a private application). What changes is the incremental
 update — `incremental-index`, and the MCP server's refresh, which runs the
 same code. An index an earlier version updated incrementally can still hold
-edges a rebuild does not have, or lack some it has; they are corrected when
-the file the edge starts from is indexed again, or all at once with
-`code-graph-mcp rebuild-index --confirm`.
-Moving or swapping files now takes longer (below). To pin the binary back:
+edges a rebuild does not have, or lack some it has. Indexing the file an
+edge starts from again corrects most of them: of the 1,454 such edges
+0.200.0 leaves in the first set of random edit sequences below, 1,433.
+The other 21 go through another file's stale edges, which can keep an
+edge until that file is indexed again too: a Python import of a name that
+a package `__init__.py` re-exports, and a call bound through that import,
+stay until each `__init__.py` on the way is.
+`code-graph-mcp rebuild-index --confirm` corrects all of them at once.
+Moving or swapping files now takes longer, in the three cases measured
+below longer than a rebuild. To pin the binary back:
 `npm i -g @sdsrs/code-graph@0.200.0`, then delete
 `~/.cache/code-graph/bin/code-graph-mcp` and set
 `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The plugin's
@@ -75,8 +81,9 @@ new directory took 3.4 s and left 1,292 calls only the incremental index
 had and 69 only a rebuild had; it now takes 6.8 s (288 files re-extracted,
 7 before) and no call differs, where a rebuild takes 2.9 s. Swapping
 `shutil.py` and `tempfile.py`: 1.1 s with 132 and 4 differing calls and 1
-reference, now 3.6 s and none of them. Moving `nltk/corpus`: 1.2 s with 14
-differing calls, now 2.1 s and none. Renaming the class `IMAP4` in
+reference, now 3.6 s and none of them, where a rebuild takes 3.0 s. Moving
+`nltk/corpus`: 1.2 s with 14 differing calls, now 2.1 s and none, where a
+rebuild takes 1.3 s. Renaming the class `IMAP4` in
 `imaplib.py` re-extracts no other file, as before (1.1 s before and
 after). Editing one file took 0.26 s and now 0.25 s (median of 7); adding
 a line to a file of 20,000 functions took 1.6 s and now 1.7 s. Updating

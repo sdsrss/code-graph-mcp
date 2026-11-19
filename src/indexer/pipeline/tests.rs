@@ -20174,3 +20174,102 @@ fn d901_an_importer_in_an_earlier_batch_reaches_a_new_namesake() {
     ));
     assert_d901_cases(&[("the importer is in the first batch", &tree, &[&step])]);
 }
+
+/// Pre-tag review of 0.201.0, round 2: the HIGH-1 filter is for a Go package
+/// call alone. A method call `x.A()` reaches each method `A` (`ambiguous`),
+/// and restored onto the re-extracted file it must keep the method. Here
+/// `pa/a.go` gains a second `K.A` in the run that adds the caller, so the
+/// fan-out round re-extracts `pa/a2.go` and restores the new call's edge.
+/// Reduced from a Go random sequence (seed 16).
+#[test]
+fn d901_a_go_method_call_is_still_restored_onto_a_method() {
+    assert_d901_cases(&[(
+        "a file gains a namesake method in the run that adds its caller",
+        &[
+            ("go.mod", "module ex\n\ngo 1.21\n"),
+            ("pa/a.go", "package pa\n"),
+            (
+                "pa/a2.go",
+                "package pa\n\nfunc (k *K) A() int {\n\treturn 1\n}\n\n\
+                 func (k K) Run() int {\n\treturn k.A()\n}\n\n\
+                 func A() int {\n\treturn 2\n}\n",
+            ),
+            ("pe/e.go", "package pe\n"),
+        ],
+        &[&[
+            (
+                "pa/a.go",
+                Some("package pa\n\nfunc (k *K) A() int {\n\treturn 1\n}\n"),
+            ),
+            (
+                "pe/e.go",
+                Some("package pe\n\nfunc Go() int {\n\treturn x.A()\n}\n"),
+            ),
+        ]],
+    )]);
+}
+
+/// Pre-tag review of 0.201.0, round 2: a `def` that is the last statement of
+/// its outer function ends on the outer's last line, and is nested all the
+/// same (the snapshot's `>=`, not `>`).
+#[test]
+fn d901_a_nested_def_ending_on_its_outers_last_line_is_nested() {
+    let nested = "def outer_a():\n    def a():\n        return 1\n";
+    assert_d901_cases(&[
+        (
+            "an import parked on the sentinel, nested def last in its outer",
+            &[
+                ("app/m.py", nested),
+                (
+                    "app/views.py",
+                    "def go_local():\n    from other import a as a\n    return a()\n",
+                ),
+                ("other.py", ""),
+            ],
+            &[&[("app/m.py", Some("def a():\n    return 3\n"))]],
+        ),
+        (
+            "an import bound to another file's namesake, nested def last in its outer",
+            &[
+                ("app/__init__.py", ""),
+                ("app/n.py", nested),
+                (
+                    "app/views.py",
+                    "from app import a\n\ndef go_a():\n    return a()\n",
+                ),
+                ("tests/helpers.py", "def a():\n    return 9\n"),
+            ],
+            &[&[("app/n.py", Some("def a():\n    return 3\n"))]],
+        ),
+    ]);
+}
+
+/// Pre-tag review of 0.201.0, round 2: whether a `def` is nested is asked
+/// within its own file (the snapshot's `PARTITION BY`). A long `def` of
+/// another file in the same run must not count as enclosing it.
+#[test]
+fn d901_the_nested_flag_is_per_file() {
+    let nested = "def outer_a():\n    def a():\n        return 1\n    return a\n";
+    let long: String = std::iter::once("def outer_z():\n".to_string())
+        .chain((0..30).map(|i| format!("    x{i} = {i}\n")))
+        .chain(std::iter::once("    return 1\n".to_string()))
+        .collect();
+    let long2 = format!("{long}\n\nY = 2\n");
+    assert_d901_cases(&[(
+        "a nested def made module level beside an edit of a long def elsewhere",
+        &[
+            ("app/__init__.py", ""),
+            ("app/n.py", nested),
+            ("app/big.py", long.as_str()),
+            (
+                "app/views.py",
+                "from app import a\n\ndef go_a():\n    return a()\n",
+            ),
+            ("tests/helpers.py", "def a():\n    return 9\n"),
+        ],
+        &[&[
+            ("app/n.py", Some("X = 1\n\n\ndef a():\n    return 3\n")),
+            ("app/big.py", Some(long2.as_str())),
+        ]],
+    )]);
+}
