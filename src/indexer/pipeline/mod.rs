@@ -857,6 +857,7 @@ fn fan_out_to_new_duplicate_definitions(
     let typed = resolve::typed_callers_of_class_drift(db.conn())?;
     let bare = resolve::bare_name_callers_of_new_duplicates(
         db.conn(),
+        project_root,
         &resolve::collect_rust_crates(project_root),
     )?;
     // Importers of a Python module whose re-exports the run moved (D#370(a)),

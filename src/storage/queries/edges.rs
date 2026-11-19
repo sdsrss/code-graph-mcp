@@ -107,13 +107,15 @@ pub fn insert_pending_unresolved_call(
     Ok(())
 }
 
-/// Stream all pending rows. Caller does the per-row resolution + edge insert.
+/// Stream all pending calls. Caller does the per-row resolution + edge insert.
+/// A dropped `references` row (`PENDING_REFERENCE_MARK`) is no call to bind.
 pub fn list_pending_unresolved_calls(conn: &Connection) -> Result<Vec<PendingCallRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, source_id, target_name, source_language, metadata FROM pending_unresolved_calls"
+        "SELECT id, source_id, target_name, source_language, metadata FROM pending_unresolved_calls
+         WHERE metadata IS NOT ?1",
     )?;
     let rows = stmt
-        .query_map([], |row| {
+        .query_map([crate::domain::PENDING_REFERENCE_MARK], |row| {
             Ok(PendingCallRow {
                 id: row.get(0)?,
                 source_id: row.get(1)?,
@@ -148,10 +150,13 @@ pub fn delete_pending_unresolved_call(conn: &Connection, id: i64) -> Result<()> 
 /// until the next INDEX_VERSION wipe. Returns the number of evicted rows.
 /// A re-parse of the caller file resets the clock naturally: cascade delete +
 /// re-buffer inserts a fresh row with attempts = 0.
+///
+/// A dropped `references` row does not age: the sweep never resolves it, so an
+/// attempt counts nothing, and it lives exactly as long as its file's index.
 pub fn age_and_evict_pending_unresolved_calls(conn: &Connection) -> Result<usize> {
     conn.execute(
-        "UPDATE pending_unresolved_calls SET attempts = attempts + 1",
-        [],
+        "UPDATE pending_unresolved_calls SET attempts = attempts + 1 WHERE metadata IS NOT ?1",
+        [crate::domain::PENDING_REFERENCE_MARK],
     )?;
     let evicted = conn.execute(
         "DELETE FROM pending_unresolved_calls WHERE attempts >= ?1",
@@ -160,13 +165,15 @@ pub fn age_and_evict_pending_unresolved_calls(conn: &Connection) -> Result<usize
     Ok(evicted)
 }
 
-/// Diagnostic: number of buffered unresolved calls. Useful in tests + a future
-/// `code-graph-mcp health-check` warning when the table grows unbounded.
+/// Diagnostic: number of buffered unresolved calls (dropped `references` rows
+/// are not calls). Useful in tests + a future `code-graph-mcp health-check`
+/// warning when the table grows unbounded.
 pub fn count_pending_unresolved_calls(conn: &Connection) -> Result<i64> {
-    let count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM pending_unresolved_calls", [], |row| {
-            row.get(0)
-        })?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pending_unresolved_calls WHERE metadata IS NOT ?1",
+        [crate::domain::PENDING_REFERENCE_MARK],
+        |row| row.get(0),
+    )?;
     Ok(count)
 }
 

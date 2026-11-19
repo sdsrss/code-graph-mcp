@@ -319,9 +319,10 @@ pub(super) fn resolve_pending_calls_touching(
             "SELECT n.id, n.name, COALESCE(f.language, ''), f.path
              FROM nodes n JOIN files f ON f.id = n.file_id
              WHERE f.language IS NOT NULL
-               AND n.name IN (SELECT DISTINCT target_name FROM pending_unresolved_calls)",
+               AND n.name IN (SELECT DISTINCT target_name FROM pending_unresolved_calls
+                              WHERE metadata IS NOT ?1)",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map([crate::domain::PENDING_REFERENCE_MARK], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -1775,6 +1776,7 @@ pub(super) fn importers_of_python_reexport_drift(
 /// Drops its own temps: unlike the scope tables, nothing downstream reads these.
 pub(super) fn bare_name_callers_of_new_duplicates(
     conn: &rusqlite::Connection,
+    root: &std::path::Path,
     crates: &RustCrates,
 ) -> Result<Vec<String>> {
     use crate::domain::{CONF_AMBIGUOUS, REL_CALLS, REL_IMPORTS, REL_REFERENCES};
@@ -1934,6 +1936,24 @@ pub(super) fn bare_name_callers_of_new_duplicates(
          WHERE u.nm <> '<module>'
            AND f.path NOT IN (SELECT path FROM cg_fanout_paths)"
     );
+    // A `references` relation the deferred pass dropped because no file of its
+    // language defined the name (`PENDING_REFERENCE_MARK`, D#898): it has no
+    // edge for the half above to find, and a rebuild binds the definition this
+    // run added. Not a file whose content on disk is no longer what was
+    // indexed: a query-time refresh runs this round too, and an edit it read
+    // would look unchanged to the next incremental run, which owes that edit
+    // its own fan-out (D#543's rule for a deleted file's dependents).
+    let dropped_reference_sql = format!(
+        "SELECT DISTINCT f.path, f.blake3_hash
+         FROM cg_fanout_up u
+         CROSS JOIN pending_unresolved_calls p ON p.target_name = u.nm
+                                               AND p.source_language = u.lang
+                                               AND p.metadata = '{}'
+         CROSS JOIN nodes src ON src.id = p.source_id
+         CROSS JOIN files f ON f.id = src.file_id
+         WHERE f.path NOT IN (SELECT path FROM cg_fanout_paths)",
+        crate::domain::PENDING_REFERENCE_MARK
+    );
     // D10A's fallback: `from .helpers import url_for` binds `helpers.py`'s
     // `<module>` while that file defines no `url_for`, and the edge keeps no
     // name to look for. Re-extract such importers of a file of this run that
@@ -1985,6 +2005,18 @@ pub(super) fn bare_name_callers_of_new_duplicates(
         let mut paths: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let dropped: Vec<(String, String)> = conn
+            .prepare(&dropped_reference_sql)?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !dropped.is_empty() {
+            paths.extend(dropped.into_iter().filter_map(|(path, hash)| {
+                (crate::indexer::merkle::hash_file(&root.join(&path)).ok() == Some(hash))
+                    .then_some(path)
+            }));
+            paths.sort_unstable();
+            paths.dedup();
+        }
         let reexported: Vec<ReexportRow> = conn
             .prepare(&reexport_sql)?
             .query_map([], |row| {

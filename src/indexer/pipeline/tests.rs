@@ -5446,10 +5446,15 @@ fn pending_set(db: &Database) -> Vec<String> {
                  || COALESCE(p.metadata, '') \
              FROM pending_unresolved_calls p \
              JOIN nodes n ON n.id = p.source_id JOIN files f ON f.id = n.file_id \
+             WHERE p.metadata IS NOT ?1 \
              ORDER BY 1",
         )
         .unwrap();
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    let rows = stmt
+        .query_map([crate::domain::PENDING_REFERENCE_MARK], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap();
     rows.filter_map(Result::ok).collect()
 }
 
@@ -9703,8 +9708,12 @@ fn a_second_fanout_round_finds_nothing_to_do() {
         before_ids > 0 && node_count_of(&db, "src/b.py") == before_ids,
         "precondition: b.py was re-extracted and still holds the same symbols"
     );
-    let next = super::resolve::bare_name_callers_of_new_duplicates(db.conn(), &Default::default())
-        .unwrap();
+    let next = super::resolve::bare_name_callers_of_new_duplicates(
+        db.conn(),
+        project_dir.path(),
+        &Default::default(),
+    )
+    .unwrap();
     assert!(
         next.is_empty(),
         "the fan-out round is not a fixed point — a third round would re-extract {next:?}"
@@ -10612,6 +10621,7 @@ fn test_rust_reexport_fanout_only_for_an_admissible_definition() {
         .unwrap();
         super::resolve::bare_name_callers_of_new_duplicates(
             db.conn(),
+            project.path(),
             &super::resolve::collect_rust_crates(project.path()),
         )
         .unwrap()
@@ -14694,7 +14704,12 @@ fn the_module_import_fanout_pulls_only_importers_a_rebuild_rebinds() {
             None,
         )
         .unwrap();
-        super::resolve::bare_name_callers_of_new_duplicates(db.conn(), &Default::default()).unwrap()
+        super::resolve::bare_name_callers_of_new_duplicates(
+            db.conn(),
+            project.path(),
+            &Default::default(),
+        )
+        .unwrap()
     };
     // `app.py` found `url_for` in `pkg.helpers`; `web.js` is JavaScript.
     assert_eq!(
@@ -14744,7 +14759,12 @@ fn fanout_of_run(base: &[(&str, &str)], edits: &[(&str, &str)]) -> Vec<String> {
         None,
     )
     .unwrap();
-    super::resolve::bare_name_callers_of_new_duplicates(db.conn(), &Default::default()).unwrap()
+    super::resolve::bare_name_callers_of_new_duplicates(
+        db.conn(),
+        project.path(),
+        &Default::default(),
+    )
+    .unwrap()
 }
 
 /// A name's count rises per language: one run adds a Python `x` and drops a
@@ -20086,7 +20106,12 @@ fn the_definition_snapshot_grows_near_linearly_with_a_python_files_nodes() {
         )
         .unwrap();
         super::resolve::snapshot_definition_counts(&conn, &["big.py".to_string()]).unwrap();
-        super::resolve::bare_name_callers_of_new_duplicates(&conn, &Default::default()).unwrap();
+        super::resolve::bare_name_callers_of_new_duplicates(
+            &conn,
+            db_dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
         steps.load(Ordering::Relaxed)
     };
     let (small, large) = (steps_for(400), steps_for(1_600));
@@ -20272,4 +20297,202 @@ fn d901_the_nested_flag_is_per_file() {
             ("app/big.py", Some(long2.as_str())),
         ]],
     )]);
+}
+
+/// D#898: a `references` edge whose name no file of the language defined when
+/// its file was indexed. The deferred pass drops such a reference, and a later
+/// run that defines the name re-extracted none of the files holding one, so the
+/// edge stayed missing until each was edited or the index rebuilt (this
+/// repository's 0.180.0 → 0.198.0 tree in one run: 2,398 edges, all from
+/// unchanged files to names the run added).
+#[test]
+fn d898_a_reference_reaches_a_name_a_later_run_defines() {
+    let def_a = "def a(f=None):\n    return f\n";
+    assert_d898_cases(&[
+        (
+            "a decorator named before any file defines it",
+            &[
+                ("use.py", "@a\ndef go():\n    return 1\n"),
+                ("lib.py", "X = 1\n"),
+            ],
+            &[&[("lib.py", Some(def_a))]],
+        ),
+        (
+            "a callback passed before any file defines it",
+            &[
+                ("use.py", "def go(xs):\n    return sorted(xs, key=a)\n"),
+                ("lib.py", "X = 1\n"),
+            ],
+            &[&[("lib.py", Some(def_a))]],
+        ),
+        (
+            "a callback to a name a new file defines as a method",
+            &[("use.py", "def go(xs):\n    return sorted(xs, key=m)\n")],
+            &[&[(
+                "fx/a.py",
+                Some("class C:\n    def m(self):\n        return 1\n"),
+            )]],
+        ),
+        (
+            "the definition deleted, then defined again",
+            &[
+                ("use.py", "def go(xs):\n    return sorted(xs, key=a)\n"),
+                ("lib.py", def_a),
+            ],
+            &[&[("lib.py", None)], &[("lib2.py", Some(def_a))]],
+        ),
+        (
+            "a TypeScript callback before any file defines it",
+            &[
+                (
+                    "src/use.ts",
+                    "export function getSession() {\n  return wrap(session);\n}\n",
+                ),
+                ("src/other.ts", "export const X = 1;\n"),
+            ],
+            &[&[(
+                "src/test/user.test.ts",
+                Some("export function session() {\n  return 1;\n}\n"),
+            )]],
+        ),
+    ]);
+}
+
+/// [`assert_d901_cases`], also requiring that each case's final state HAS a
+/// `references` edge — else a reference the extractor stopped emitting would
+/// pass as "the run matches the rebuild".
+fn assert_d898_cases(cases: &[D901Case]) {
+    for (label, before, steps) in cases {
+        let mut tree: Vec<(String, String)> = before
+            .iter()
+            .map(|(p, b)| (p.to_string(), b.to_string()))
+            .collect();
+        for step in *steps {
+            for (path, body) in *step {
+                tree.retain(|(p, _)| p != path);
+                if let Some(b) = body {
+                    tree.push((path.to_string(), b.to_string()));
+                }
+            }
+        }
+        let files: Vec<(&str, &str)> = tree.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
+        let (_p, _d, control) = fresh_index_of(&files);
+        assert!(
+            edge_rows(&control)
+                .iter()
+                .any(|r| r.starts_with("references |")),
+            "{label}: the rebuild has no references edge, so the case tests nothing: {:#?}",
+            edge_rows(&control)
+        );
+    }
+    assert_d901_cases(cases);
+}
+
+/// D#898: the files a run that defines a name hands the fan-out round for the
+/// references dropped while no file of their language defined it — one of
+/// that language only, and not one whose file changed on disk since it was
+/// indexed (a query-time refresh runs this round too, and the edit is the next
+/// incremental run's).
+#[test]
+fn d898_the_fanout_takes_a_dropped_reference_of_the_language_from_an_indexed_file() {
+    let base: &[(&str, &str)] = &[
+        ("use.py", "def go(xs):\n    return sorted(xs, key=a)\n"),
+        (
+            "use.js",
+            "function go(xs) {\n  return xs.map(b)\n}\nmodule.exports = go\n",
+        ),
+        ("lib.py", "X = 1\n"),
+    ];
+    let def_a = "def a():\n    return 1\n";
+    assert_eq!(
+        fanout_of_run(base, &[("lib.py", def_a)]),
+        vec!["use.py".to_string()]
+    );
+    // A JavaScript `a` binds no Python reference, a Python `b` no JavaScript one.
+    let js_a = fanout_of_run(base, &[("lib.js", "function a() {}\nmodule.exports = a\n")]);
+    assert!(js_a.is_empty(), "{js_a:?}");
+    let py_b = fanout_of_run(base, &[("lib.py", "def b():\n    return 1\n")]);
+    assert!(py_b.is_empty(), "{py_b:?}");
+    // `use.py` edited on disk and not indexed yet: left to the next run.
+    let (project, _d, db) = fresh_index_of(base);
+    let paths = vec!["lib.py".to_string()];
+    super::resolve::snapshot_definition_counts(db.conn(), &paths).unwrap();
+    fs::write(project.path().join("lib.py"), def_a).unwrap();
+    fs::write(
+        project.path().join("use.py"),
+        "def go(xs):\n    return sorted(xs, key=a)\n\n\ndef c():\n    return 2\n",
+    )
+    .unwrap();
+    index_files(
+        &db,
+        project.path(),
+        &paths,
+        &std::collections::HashMap::new(),
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
+    let edited = super::resolve::bare_name_callers_of_new_duplicates(
+        db.conn(),
+        project.path(),
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(edited.is_empty(), "{edited:?}");
+}
+
+/// D#898: a dropped reference's row is no buffered call. The sweep binds no
+/// `calls` edge for it when the name appears (0.201.0 did, reading an index
+/// this version wrote: `calls go -> a` where a rebuild has `references`), does
+/// not age it out, and health-check's pending count leaves it out.
+#[test]
+fn d898_a_dropped_reference_row_is_not_a_pending_call() {
+    use crate::domain::{PENDING_CALL_MAX_ATTEMPTS, PENDING_REFERENCE_MARK};
+    use crate::storage::queries::{
+        age_and_evict_pending_unresolved_calls, count_pending_unresolved_calls,
+    };
+    let (_p, _d, db) = fresh_index_of(&[
+        ("use.py", "def go(xs):\n    return sorted(xs, key=a)\n"),
+        ("lib.py", "X = 1\n"),
+    ]);
+    let marked = |db: &Database| -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM pending_unresolved_calls WHERE metadata = ?1",
+                [PENDING_REFERENCE_MARK],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let all: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM pending_unresolved_calls", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(marked(&db), 1, "the dropped `key=a` reference");
+    assert_eq!(
+        count_pending_unresolved_calls(db.conn()).unwrap(),
+        all - 1,
+        "the count is of calls"
+    );
+    // A definition of `a` the sweep can see, with no run to re-extract `use.py`.
+    db.conn()
+        .execute(
+            "INSERT INTO nodes (file_id, type, name, qualified_name, start_line, end_line, code_content)
+             SELECT id, 'function', 'a', 'a', 1, 2, 'def a():' FROM files WHERE path = 'lib.py'",
+            [],
+        )
+        .unwrap();
+    super::resolve::resolve_pending_calls(&db, &Default::default()).unwrap();
+    let calls: Vec<String> = edge_rows(&db)
+        .into_iter()
+        .filter(|r| r.starts_with("calls |"))
+        .collect();
+    assert!(calls.is_empty(), "{calls:?}");
+    for _ in 0..PENDING_CALL_MAX_ATTEMPTS + 1 {
+        age_and_evict_pending_unresolved_calls(db.conn()).unwrap();
+    }
+    assert_eq!(marked(&db), 1, "never aged out");
 }

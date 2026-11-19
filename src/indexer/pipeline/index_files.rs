@@ -5568,7 +5568,19 @@ fn resolve_deferred_relations(
         } else if !same_language_targets.is_empty() {
             refine_ambiguous_targets(&same_language_targets, &d.rel_path, &node_id_to_path)
         } else if d.relation == REL_REFERENCES {
-            continue; // precision over recall, as at batch time
+            // Precision over recall, as at batch time — but remembered: a
+            // later run that defines the name re-extracts this file, as a
+            // rebuild would bind it then (D#898).
+            for &src_id in &source_ids {
+                crate::storage::queries::insert_pending_unresolved_call(
+                    db.conn(),
+                    src_id,
+                    &d.target_name,
+                    &d.language,
+                    Some(crate::domain::PENDING_REFERENCE_MARK),
+                )?;
+            }
+            continue;
         } else {
             cross_file
                 .iter()
