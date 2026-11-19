@@ -1,5 +1,102 @@
 # Changelog
 
+## 0.204.0
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 145 → 146.
+The full index of a project with Python code changes: it loses the edges
+described below, and gains none (checked edge for edge, relation, both ends
+with their start lines, confidence and metadata, on CPython 3.14's standard
+library, nltk 3.9.2, flask 3.1.0, this repository at 0.202.0's commit and a
+private application). The MCP server rebuilds the index when it starts.
+From the command line, a query answers from the old index with "This index
+was built by an older code-graph (index v145, this binary v146): answers
+come from it until it is rebuilt — run: code-graph-mcp reindex", and the
+first `incremental-index` prints "Index version mismatch (stored v145 ≠
+binary v146): clearing + rebuilding". 0.203.0 answers queries from an index
+this version wrote but will not write to it: its `incremental-index` exits
+1 and says to delete `.code-graph/index.db*` first to rebuild at its
+version. To pin the binary back: `npm i -g @sdsrs/code-graph@0.203.0`, then
+delete `~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The plugin's
+scripts are unchanged.
+
+### fix: a Python name binds the definition of its own file that its scope sees
+
+A Python name read as a value (`view_func=index`, `return handler`,
+`@deco`) or written in an annotation (`x: Row`) was bound to every
+definition of that name in its own file, `extracted`, the tier every query
+shows. flask's tests each define a nested `def index` and pass it to
+`add_url_rule`, and each such reference was bound to the `index` of every
+other test in its file as well. A bare call has picked by scope since
+0.185.0; a name read as a value or in an annotation now picks the same way:
+of the file's definitions of the name, the ones its scope sees, and the
+innermost of those. A function's nested definition shadows a module-level
+one, and a closure sees its enclosing function's. Once the name sees such a
+definition outside a class body, a method of that name in the file is no
+target either; code written directly in a class body keeps that body's
+methods. A parameter's or return annotation is read around its `def`, where
+Python evaluates it. A name that sees none of the file's definitions keeps
+all of them, as before, and so does the tail of `mod.Row`. A Python `class`
+now binds its name where it stands, as a `def` does, so a bare call `Row()`
+in a function that defines its own `class Row` binds that class.
+
+Measured on fresh indexes of the same files, 0.203.0 against this version:
+
+- flask: `refs --node-id <id>` for the nested `index` that
+  `tests/test_basic.py` defines at line 31 listed 4 entries:
+  `test_provide_automatic_options_kwarg`, `test_url_mapping` and
+  `test_werkzeug_routing`, each of which passes its own nested `index`, and
+  its `routes_to` entry. It now lists the `routes_to` entry alone.
+  (`refs index --file tests/test_basic.py` names the file's 34 `index`
+  definitions and asks for `--node-id`, in both versions.)
+
+Edges removed from a full index (calls / references), all `extracted`:
+standard library 257 (8 / 249), nltk 28 (0 / 28), flask 271 (2 / 269), this
+repository at 0.202.0's commit 26 (0 / 26), the private application 682
+(56 / 626). Each was checked against Python's scoping by the script that
+checked 0.203.0's (`tasks/d905-scope-oracle/`), which judges 1,263 of them
+wrong. It accepts the last one, the standard library's module-level
+`_time_class = time` bound to the method `datetime.time` beside the class
+`time`, only because it reads a class body without regard to order; read
+in the source, that edge is wrong as well.
+
+Random edit sequences of Python projects, each step's incremental index
+compared edge for edge with a fresh index of the same files (4,500
+sequences of one generator and 1,500 of each of two more): the same
+sequences differ as under 0.203.0, by the same edges at the same steps.
+Edit sequences written for these cases (a sibling function's nested
+definition added, a function's own removed, a module-level class moved to
+another file, a method namesake, a decorator's definition removed): the
+incremental index matched a fresh one at every step.
+
+### change: definitions those edges kept alive may now have none
+
+Python definitions with no incoming edge: standard library 5,237 → 5,256,
+nltk 2,182 → 2,183, flask 745 → 766, this repository 471 → 471, the
+private application 10,681 → 10,686. `dead-code --min-lines 1 --no-ignore`
+returns the same definitions as 0.203.0 on all five.
+
+A full index (means of 3 runs, alternating with 0.203.0) took 3.00 s and
+now 3.00 s on the standard library, 3.99 s and now 4.12 s on the private
+application. Files written to stress the scope reads: 480 KB of
+annotations nested 150 generics deep, 1.03 s and now 1.12 s; 988 KB of
+functions nested 100 deep with 20 annotated parameters each, 8.30 s and
+now 8.12 s; 120 KB of parameters nested 150 deep, 11.67 s and now 11.84 s.
+
+### Not covered
+
+- A name that sees none of its file's definitions of it keeps every one of
+  them: `return h` in a function that defines no `h`, in a file where two
+  other functions each define one, binds both.
+- A bare call in a `def`'s header still sees that function's own
+  definitions, as since 0.185.0: `def f(x=make())` whose body defines
+  `make` binds the nested `make`, not the module-level one Python calls.
+- Three nested `wrapper` functions of the standard library's
+  `functools.py` lost their only incoming edges, which came from another
+  function, and now have none: the `return wrapper` of the function that
+  defines them binds nothing, since `wrapper.cache_info = …` beside it
+  makes an older rule read the name as a local value.
+
 ## 0.203.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 144 → 145.
