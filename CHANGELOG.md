@@ -1,5 +1,116 @@
 # Changelog
 
+## 0.203.0
+
+**Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 144 → 145.
+The full index of a project with Python code changes: it loses the edges
+described below, and gains none (checked edge for edge, relation, both ends,
+confidence and metadata, on CPython 3.14's standard library, nltk 3.9.2,
+flask 3.1.0, this repository and a private application). The MCP server
+rebuilds the index when it starts. From the command line, a query answers
+from the old index with "This index was built by an older code-graph (index
+v144, this binary v145): answers come from it until it is rebuilt — run:
+code-graph-mcp reindex", and the first `incremental-index` prints "Index
+version mismatch (stored v144 ≠ binary v145): clearing + rebuilding".
+0.202.0 answers queries from an index this version wrote but will not write
+to it: its `incremental-index` exits 1 and says to delete
+`.code-graph/index.db*` first. To pin the binary back:
+`npm i -g @sdsrs/code-graph@0.202.0`, then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The plugin's
+scripts are unchanged.
+
+### fix: a Python name that runs a builtin, a local value or a module variable binds no project definition
+
+A bare Python name was bound by name to the project's definitions of that
+name, in its own file or another. For a name passed, stored or returned as a
+value, or written in an annotation, only the parameters of the functions
+around it and the assignment and `for` targets of the innermost one kept it
+from binding; a bare call of a builtin had no check at all. So a call of a builtin (`set(xs)`, `list(...)`, `open(p)`), a builtin
+passed or tested as a value (`isinstance(x, int)`, `map(str, xs)`,
+`@property`), and as a value a comprehension's or lambda's variable, a
+`with … as`, `except … as` or `:=` target, a value an enclosing function
+binds, or a module-level variable (`T = TypeVar("T")`) each became a `calls`
+or `references` edge to a function or method of that name. Python's own
+scoping now decides, and these get no edge. A call of a local value
+(`cb()` on a parameter) keeps its edge, labelled as before. A name keeps its
+by-name binding as before when the file defines it (at any depth) or imports
+it, assigns it as an alias of the same name (`Command = commands.Command`),
+declares it `global` in a function, or binds it in the class body the name is
+written directly in; and a name that reaches module level keeps it in a file
+with a star import.
+
+Measured on fresh indexes of the same files, 0.202.0 against this version:
+
+- nltk: `callgraph Downloader.list --direction callers --depth 1` listed 197
+  callers and reported its limit hit; the index held 315 calls into the
+  method, 291 of them calls of the builtin `list()`. It now lists 24: the two
+  `self._ds.list(...)` calls in `downloader.py`, and 22 in files that
+  star-import (see Not covered).
+- Standard library: `callgraph str --file locale.py --direction callers
+  --depth 1` listed 199 and hit the limit; it now lists 47. `refs prefix`
+  listed `_is_filename_to_skip (_py_warnings.py:423)` and `__init__
+  (configparser.py:586)` beside the one real call: both read a comprehension's
+  variable `prefix`; it now lists the call alone. `refs T` listed 9
+  references, 5 of them `typing.py`'s annotations of its `T =
+  TypeVar('T')`, bound to `encodings/punycode.py`'s function `T`; it now
+  lists 4.
+- The MCP tool `find_references` for a method `Cache.set`, with another
+  file calling `set(xs)`: 1 reference, now 0.
+
+Edges removed from a full index (calls / references; in brackets those
+`inferred` or `extracted`, the tiers `callgraph` and `impact` show by
+default): standard library 9,804 (7,673 / 2,131; 1,918), nltk 4,645 (3,697 /
+948; 881), flask 23 (19 / 4; 8), this repository 7,171 (71 / 7,100; 273), the
+private application 2,773 (2,559 / 214; 348). Each removed edge was checked
+against Python's scoping by a script (`tasks/d905-scope-oracle/`), and the 60
+it could not decide were read in the source: none is a call or reference
+Python makes. The share of Python `references` edges the script accepts went
+from 50.4% to 80.2% on the standard library and from 41.6% to 75.4% on nltk;
+the number it accepts is the same before and after (2,889 and 882).
+
+Random edit sequences of Python projects, each step's incremental index
+compared edge for edge with a fresh index of the same files (4,500 sequences
+of one generator and 1,500 of each of two more): the same sequences differ as
+under 0.202.0, by the same edges at the same steps. Edit sequences written
+for these cases (a builtin's namesake added, a star import added and removed,
+a comprehension variable's namesake added and removed, a module variable's
+assignment removed and restored, an alias and a `global`): the
+incremental index matched a fresh one at every step.
+
+### change: definitions those edges kept alive may now have none
+
+A definition whose only incoming edges were among those removed now has
+none, and `dead-code` may list it. Python definitions with no incoming edge:
+standard library 5,169 → 5,237, nltk 2,169 → 2,182, flask 745 → 745, this
+repository 239 → 471, the private application 10,600 → 10,681. `dead-code`
+returns at most 200 definitions, largest first: on the standard library three
+of them changed, `Executor.map`, `Random.sample` and ElementTree's `indent`
+now among them; on nltk two; on the private application none.
+
+A full index took 2.82 s and now 2.66 s on the standard library, 1.14 s and
+1.10 s on nltk, 3.61 s and 3.62 s on the private application (one run each);
+the standard library's index went from 69.3 MB to 67.3 MB.
+
+### Not covered
+
+- A file with a star import (`from m import *`) keeps every by-name binding:
+  `m` may define the name, and that is another file's state. The nltk
+  example above keeps 22 callers so.
+- Builtins whose names start with `_` are not read as builtins: the standard
+  library's 24 `__import__(...)` calls still bind
+  `importlib/_bootstrap.py`'s `__import__`.
+- A reference to a function's own nested definition also binds every other
+  nested definition of that name in the file, `extracted` (flask's tests:
+  `view_func=index` beside many nested `def index`; 269 such edges in flask).
+  Bare calls already pick by scope.
+- A module-level alias `X = obj.X` counts as the definition of `X` whatever
+  `obj` is, and a `global` name keeps its binding.
+- Calls of a module-level variable (`_warn = warnings.warn`, then `_warn()`)
+  are unchanged.
+- A Python file with very deeply nested code still costs what it did in
+  0.202.0: 120 KB of calls nested 150 deep took 11.4 s to index (11.6 s now).
+
 ## 0.202.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 143 → 144.

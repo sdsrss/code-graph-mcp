@@ -149,25 +149,25 @@ calls：
   | daagu | 77,250 → 74,477 | 0 | 2,773（2,559 / 214） | 348 | 10,600 → 10,681 | 95.2 → 93.8 | 3.61 → 3.62 |
 
   - base 独有的边全部过判定器：判为“正确”的 0 条。
-  - 判定器拿不准的 62 条逐条看过源码，都是错边：
+  - 判定器拿不准的 60 条逐条看过源码，都是错边：
     - 标准库 calls 2 条：`formatargvalues` 参数默认值里 lambda 中的 `repr(value)`，内建。
     - references 6 条“不确定”：doctest 的局部 `encoding = save_stdout.encoding` 5 条；turtle 模块级 `except ImportError as msg` 1 条。
-    - references 47 条“没找到出现位置”：
-      - 方法上的 `@property` 装饰器 41 条；
-      - `field(default_factory=list)` 4 条；
-      - typing 的 `T = TypeVar('T')` 1 条，加上“其他”2 条，这 3 条都绑到 `encodings/punycode.py` 的函数 `T`。
+    - references 47 条“没找到出现位置”：方法上的 `@property` 装饰器 42 条，`field(default_factory=list)` 4 条，typing 的 `T = TypeVar('T')` 1 条。
     - nltk calls 5 条：参数默认值里的 `dict()`、`set()`。
+    - 另外，判定器判为“绑到别的定义”的 typing.py `T` 2 条也人工看过：与上面那条 `T` 一样，都绑到 `encodings/punycode.py` 的函数 `T`。
   - head 的正确边数与 base 相同：标准库 references 2,889、calls 5,676；nltk 882、2,799。
   - Python references 的正确率：标准库 50.4% → 80.2%，nltk 41.6% → 75.4%。
 - **零入边定义与 dead-code**：
-  - 新增的零入边定义丢掉的都是上面这些错边。例：nltk 的 `Downloader.list` 原来有 315 条 `calls` 边，几乎都来自内建 `list()`。
+  - 新增的零入边定义，原来的入边全都在被删的边里：head 不加边，被删的边又都判为错边。
   - `dead-code` 一次最多返回 200 条（`DEAD_CODE_SCAN_LIMIT`），这个窗口里的变化：
     - 标准库换进 3 个（`Executor.map`、`Random.sample`、ElementTree 的 `indent`）、换出 3 个；
     - nltk 换进 2 个、换出 2 个；
     - daagu 不变。
   - 换进的都是项目里没有调用方的公开 API，原来靠内建调用或局部变量的错边“活着”。
 - **用户可见的例子**：
-  - nltk `callgraph Downloader.list --direction callers --depth 1`：197 个调用方（`limit_hit`）→ 24 个。剩下的 24 个都在有星号导入的文件里。
+  - nltk `callgraph Downloader.list --direction callers --depth 1`：197 个调用方（`limit_hit`）→ 24 个。
+    - 0.202.0 的索引里指向它的 `calls` 有 315 条，head 剩 24 条，去掉的 291 条都是内建 `list()`（calls 规则只删内建调用）。
+    - 剩下的 24 个调用方：2 个是 `downloader.py` 里真实的 `self._ds.list(...)`；22 个在 12 个有星号导入的文件里（逐个文件 grep 过）。
   - 标准库 `callgraph str --file locale.py --direction callers --depth 1`：199（`limit_hit`）→ 47。
   - `refs prefix`：3 → 1，去掉的两条是 `_py_warnings.py:423`、`configparser.py:586` 的推导式变量。
   - `refs T`：9 → 4，去掉 typing.py 的 5 条注解。
@@ -196,5 +196,7 @@ calls：
 - [x] 实现（含上面三处修正）
 - [x] 判定器 A/B、零入边、耗时、对抗输入
 - [x] 随机序列（Python 三个生成器，两边）
-- [ ] 提交、CHANGELOG
+- [x] 提交 f1d2cb8a（pre-commit：`cargo test` 2,536 通过 / 0 失败 / 7 忽略，fmt、两条 clippy）；JS 套件 1,785 个：1,782 通过、0 失败、3 跳过
+- [x] 延期：D#909（同文件嵌套同名）、D#910（裸名绑到别的文件的方法）、D#911（旧排除的开销）、D#912（星号导入与 `_` 开头的内建名）
+- [x] CHANGELOG 0.203.0 与升版提交（每条数字都对照本 spec 的实测核对过；改掉了核对时发现的 4 处错句：星号导入对局部值无效、拿不准的是 60 条不是 62 条、剩下 24 个调用方里有 2 个是真实调用、“裸名绑到别的文件的方法”没有实例，删掉）
 - [ ] 发版前盲审
