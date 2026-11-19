@@ -17319,6 +17319,30 @@ fn d909_a_python_reference_binds_the_same_file_definition_its_scope_sees() {
              def c():\n    return h\n",
             &["c@11 -> h@2", "c@11 -> h@7"],
         ),
+        // A parameter's or return annotation is evaluated around its `def`,
+        // where the function's own nested definitions do not exist yet.
+        (
+            "annotation: a parameter and the return of a function that nests the name",
+            "class Row:\n    pass\n\n\ndef a(x: Row) -> Row:\n    class Row:\n        pass\n    return x\n",
+            &["a@5 -> Row@1"],
+        ),
+        (
+            "annotation: a nested function's parameter reads its outer function's class",
+            "def outer():\n    class Row:\n        pass\n    def inner(x: Row):\n        class Row:\n            pass\n        \
+             return x\n    return inner\n",
+            &["inner@4 -> Row@2", "outer@1 -> inner@4"],
+        ),
+        (
+            "annotation: a generic parameter and one with a default",
+            "class Row:\n    pass\n\n\ndef a(xs: list[Row], y: Row = None):\n    class Row:\n        pass\n    \
+             return xs, y\n",
+            &["a@5 -> Row@1"],
+        ),
+        (
+            "annotation: a def at the file's first byte",
+            "def a(x: Row):\n    class Row:\n        pass\n    return x\n\n\nclass Row:\n    pass\n",
+            &["a@1 -> Row@7"],
+        ),
         (
             "annotation: an attribute's tail (kept)",
             "import mod\n\n\ndef a():\n    class Row:\n        pass\n    x: mod.Row = None\n    return x\n\n\n\

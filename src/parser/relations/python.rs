@@ -66,6 +66,10 @@ thread_local! {
         std::cell::RefCell::new(PyModuleScope::default());
     /// Per file: its scopes ([`scope_scan`]), filled by [`reset_python_file`].
     static PY_SCOPES: std::cell::RefCell<PyScopes> = std::cell::RefCell::new(PyScopes::default());
+    /// Per file: every `def`'s header ([`ScopeScan::headers`]), filled by
+    /// [`reset_python_file`].
+    static PY_DEF_HEADERS: std::cell::RefCell<Vec<(usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// What the module scope binds ([`collect_module_bindings`]), and the names a
@@ -126,14 +130,21 @@ impl PyModuleScope {
 pub(super) fn reset_python_file(root: tree_sitter::Node, source: &str, family: &str) {
     PY_FN_BINDINGS.with(|b| b.borrow_mut().clear());
     collect_defined(root, source, family);
-    let (local_calls, renamed_calls, builtin, module, scopes) = if family == "python" {
+    let (local_calls, renamed_calls, builtin, module, scopes, headers) = if family == "python" {
         let scan = scope_scan(root, source);
         let mut module = PyModuleScope::default();
         collect_module_bindings(root, source, &mut module, 0);
         module.globals = scan.globals.iter().map(|g| g.to_string()).collect();
         let renamed = renamed_import_calls(&scan, &module);
         let builtin = PY_DEFINED.with(|d| builtin_calls(&scan, &module, &d.borrow()));
-        (scan.local_values, renamed, builtin, module, scan.scopes)
+        (
+            scan.local_values,
+            renamed,
+            builtin,
+            module,
+            scan.scopes,
+            scan.headers,
+        )
     } else {
         Default::default()
     };
@@ -142,6 +153,7 @@ pub(super) fn reset_python_file(root: tree_sitter::Node, source: &str, family: &
     PY_BUILTIN_CALLS.with(|c| *c.borrow_mut() = builtin);
     PY_MODULE.with(|m| *m.borrow_mut() = module);
     PY_SCOPES.with(|s| *s.borrow_mut() = scopes);
+    PY_DEF_HEADERS.with(|h| *h.borrow_mut() = headers);
 }
 
 /// [`PY_DEFINED`] for the file.
@@ -247,6 +259,10 @@ struct ScopeScan<'s> {
     /// Every name a `global` statement anywhere in the file declares.
     globals: std::collections::HashSet<&'s str>,
     scopes: PyScopes,
+    /// Every `def` from its start to its body's start (name, parameters,
+    /// return annotation), in start order. No `def` is written inside
+    /// another's header, so the ranges are disjoint.
+    headers: Vec<(usize, usize)>,
 }
 
 /// One sweep of the file's scopes ([`ScopeScan`]): which bare calls are on
@@ -289,6 +305,7 @@ fn scope_scan<'s>(root: tree_sitter::Node, source: &'s str) -> ScopeScan<'s> {
         id("global_statement"),
     ];
     let mut globals = std::collections::HashSet::new();
+    let mut headers = Vec::new();
     let mut cursor = root.walk();
     'walk: loop {
         let n = cursor.node();
@@ -310,6 +327,9 @@ fn scope_scan<'s>(root: tree_sitter::Node, source: &'s str) -> ScopeScan<'s> {
             // function's: a class has no `parameters` field.
             "function_definition" | "class_definition" => {
                 if let Some(body) = n.child_by_field_name("body") {
+                    if kind == "function_definition" {
+                        headers.push((n.start_byte(), body.start_byte()));
+                    }
                     scopes.push(scope(
                         body.start_byte(),
                         body.end_byte(),
@@ -396,6 +416,7 @@ fn scope_scan<'s>(root: tree_sitter::Node, source: &'s str) -> ScopeScan<'s> {
         module_level,
         globals,
         scopes,
+        headers,
     }
 }
 
@@ -918,6 +939,26 @@ fn is_annotation_type_name(node: &tree_sitter::Node) -> bool {
 /// Base classes (`class Foo(Base)`) are NOT reached here — they live under
 /// `argument_list`, never a `type` node — so the existing inherits edge is not
 /// double-emitted.
+/// D#909: where a bare annotation name is evaluated, for picking among the
+/// file's same-named definitions by scope. An annotation in a `def`'s header
+/// (a parameter's, the return's) runs around that `def`, so it reads from the
+/// byte just before it, which no range of the function's own nested
+/// definitions holds (`usize::MAX`, held by no function, for a `def` at byte
+/// 0). Any other annotation reads where it stands. A binary search over the
+/// file's headers ([`ScopeScan::headers`]): climbing to the `def` through
+/// `Node::parent` cost 1.05 -> 3.77 s on 480 KB of annotations nested 150
+/// generics deep, since each `parent` descends from the root.
+fn py_annotation_at(node: &tree_sitter::Node) -> usize {
+    let at = node.start_byte();
+    PY_DEF_HEADERS.with(|h| {
+        let h = h.borrow();
+        match h.partition_point(|&(start, _)| start <= at).checked_sub(1) {
+            Some(i) if at < h[i].1 => h[i].0.checked_sub(1).unwrap_or(usize::MAX),
+            _ => at,
+        }
+    })
+}
+
 pub(super) fn extract_python_type_reference(
     node: &tree_sitter::Node,
     source: &str,
@@ -944,10 +985,11 @@ pub(super) fn extract_python_type_reference(
         source_language: String::new(),
         source_line: None,
         // A bare name picks among the file's definitions by scope, as a bare
-        // call does (D#909, D#714).
-        call_at: bare
-            .then(|| crate::parser::treesitter::bare_call_at(node, "python"))
-            .flatten(),
+        // call does (D#909, D#714), from where Python evaluates it.
+        call_at: bare.then(|| crate::parser::treesitter::BareCall {
+            at: py_annotation_at(node),
+            reaches_members: false,
+        }),
     })
 }
 
