@@ -95,12 +95,21 @@ fn lexical_scope_kinds(
 /// there gets None, so it narrows nothing: sloppy code also binds it in the
 /// enclosing function once the block has run. A `var` declarator goes on up
 /// to its function.
+///
+/// A Python `def` binds what its body defines in that body only: its
+/// defaults, annotations and decorators run around it, so the scope is the
+/// body's range, not the `def`'s (pre-tag review of 0.204.0: `def f(x=Row())`
+/// beside a module `class Row` bound only the `Row` that `f` defines).
 pub(crate) fn lexical_scope(def: &tree_sitter::Node, language: &str) -> Option<LexicalScope> {
     let (functions, members) = lexical_scope_kinds(language)?;
     let mut cur = def.parent();
     while let Some(n) = cur {
         if functions.contains(&n.kind()) {
-            return Some(LexicalScope::Within(n.start_byte(), n.end_byte()));
+            let range = match n.child_by_field_name("body") {
+                Some(body) if language == "python" => body,
+                _ => n,
+            };
+            return Some(LexicalScope::Within(range.start_byte(), range.end_byte()));
         }
         if members.contains(&n.kind()) {
             return None;
@@ -690,7 +699,59 @@ pub fn extract_nodes_from_tree(
         0,
         file_is_test,
     );
+    if language == "python" {
+        python_rebound_names_are_not_local(root, source, &mut nodes);
+    }
     nodes
+}
+
+/// A Python `def` or `class` whose name its function declares `global` or
+/// `nonlocal` binds that name outside the function, so its scope is no
+/// narrower than as before D#909: it gets none, and every same-file reference
+/// keeps it as a candidate (pre-tag review of 0.204.0: `global h; def h()` in
+/// `f` lost the edge from another function's `return h`). Decided per file,
+/// by name, from one walk: a file that declares a name `global` anywhere
+/// leaves every nested definition of that name unscoped.
+fn python_rebound_names_are_not_local(
+    root: tree_sitter::Node,
+    source: &str,
+    nodes: &mut [ParsedNode],
+) {
+    let language = root.language();
+    let wanted = [
+        language.id_for_node_kind("global_statement", true),
+        language.id_for_node_kind("nonlocal_statement", true),
+    ];
+    let mut rebound: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut cursor = root.walk();
+    'walk: loop {
+        let n = cursor.node();
+        if wanted.contains(&n.kind_id()) {
+            for i in 0..n.named_child_count() {
+                if let Some(c) = n.named_child(i).filter(|c| c.kind() == "identifier") {
+                    rebound.insert(node_text(&c, source));
+                }
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    if rebound.is_empty() {
+        return;
+    }
+    for node in nodes.iter_mut() {
+        if matches!(node.lexical_scope, Some(LexicalScope::Within(..)))
+            && rebound.contains(node.name.as_str())
+        {
+            node.lexical_scope = None;
+        }
+    }
 }
 
 /// Whether the whole file is test code by its own text: a Rust file that

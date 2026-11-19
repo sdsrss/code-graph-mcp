@@ -100,6 +100,26 @@ def main():
             if v in ("ok", "unknown", "unmatched", "parse-fail", "other-lang-or-relation"):
                 for s in ss:
                     print(f"     {rel} {v}: {s}")
+        # The same verdicts for head-only edges, read on the head copy (a rule
+        # that also gains edges must show each one is right).
+        hfiles = sorted({r[1] for r in rh if r[15] == "python"} | {r[7] for r in rh})
+        hcorpus = Corpus(os.path.join(work, f"{n}-head"), [f for f in hfiles if f.endswith(".py")])
+        hverdicts = Counter()
+        hleft = Counter(head_only)
+        for r in rh:
+            k = key(r)
+            if hleft[k] <= 0:
+                continue
+            hleft[k] -= 1
+            rel, sp, st, sn, sq, s0, s1, tp, tt, tn, tq, t0, t1, conf, meta, lang = r
+            if lang != "python" or rel not in ("calls", "references"):
+                hverdicts[(rel, "other-lang-or-relation")] += 1
+                continue
+            v, info = classify(hcorpus, sp, st, sn, s0, s1, tp, tn, tq, tt, t0, t1, rel)
+            hverdicts[(rel, v)] += 1
+            print(f"     head-only {rel} {v}: {sp}:{sq} -> {tp}:{tq}({tt}) {conf} [{info}]")
+        if hverdicts:
+            print("   oracle on head-only:", dict(sorted(hverdicts.items())))
         newly = sorted(oh - ob)
         for o in newly[:12]:
             print("   NEW ORPHAN", o)

@@ -6,8 +6,8 @@ python edges of the last state so a reader sees the rule acted."""
 import os, shutil, sqlite3, subprocess, sys
 
 ENV = dict(os.environ, CODE_GRAPH_NO_AUTO_UPDATE="1", CODE_GRAPH_DISABLE_MODEL_DOWNLOAD="1")
-DUMP = """SELECT e.relation||' '||e.confidence||' '||sf.path||':'||COALESCE(sn.qualified_name,sn.name)||' -> '||
- tf.path||':'||COALESCE(tn.qualified_name,tn.name)||' '||COALESCE(e.metadata,'')
+DUMP = """SELECT e.relation||' '||e.confidence||' '||sf.path||':'||COALESCE(sn.qualified_name,sn.name)||'@'||sn.start_line||' -> '||
+ tf.path||':'||COALESCE(tn.qualified_name,tn.name)||'@'||tn.start_line||' '||COALESCE(e.metadata,'')
  FROM edges e JOIN nodes sn ON sn.id=e.source_id JOIN files sf ON sf.id=sn.file_id
  JOIN nodes tn ON tn.id=e.target_id JOIN files tf ON tf.id=tn.file_id WHERE e.relation IN ('calls','references')"""
 
@@ -37,6 +37,16 @@ CASES = {
         {"a.py": "class C:\n    def h(self):\n        pass\n\n\ndef a():\n    return h\n"},
         {"b.py": "def h():\n    pass\n"},
         {"a.py": "class C:\n    def h(self):\n        pass\n\n\ndef h():\n    pass\n\n\ndef a():\n    return h\n"},
+    ],
+    "a def its function declares global, then the declaration removed": [
+        {"a.py": "def h():\n    pass\n\n\ndef f():\n    global h\n    def h():\n        pass\n\n\ndef g():\n    return h\n"},
+        {"a.py": "def h():\n    pass\n\n\ndef f():\n    def h():\n        pass\n\n\ndef g():\n    return h\n"},
+        {"a.py": "def h():\n    pass\n\n\ndef f():\n    global h\n    def h():\n        pass\n\n\ndef g():\n    return h\n"},
+    ],
+    "a call in a default to a class the def nests, module class removed": [
+        {"a.py": "class Row:\n    pass\n\n\ndef f(x=Row()):\n    class Row:\n        pass\n    return x\n"},
+        {"a.py": "def f(x=Row()):\n    class Row:\n        pass\n    return x\n", "b.py": "class Row:\n    pass\n"},
+        {"b.py": None},
     ],
     "decorator a function nests, sibling added and own removed": [
         {"a.py": "def a():\n    def deco(f):\n        return f\n    @deco\n    def g():\n        pass\n    return g\n"},

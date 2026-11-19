@@ -17036,6 +17036,35 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
              def b():\n    return Row()\n",
             &["a@5 -> Row@6", "b@11 -> Row@1"],
         ),
+        // Pre-tag review of 0.204.0: a default argument runs around its
+        // `def`, which sees none of the definitions in its own body; a name
+        // its function declares `global` binds outside it; a JS class is no
+        // lexical binding (as before).
+        (
+            "py: a call in a default to a class the def nests",
+            "m.py",
+            "class Row:\n    pass\n\n\ndef f(x=Row()):\n    class Row:\n        pass\n    return x\n",
+            &["f@5 -> Row@1"],
+        ),
+        (
+            "py: a call in a default to a def the def nests",
+            "m.py",
+            "def make():\n    pass\n\n\ndef f(x=make()):\n    def make():\n        pass\n    return x\n",
+            &["f@5 -> make@1"],
+        ),
+        (
+            "py: a class its function declares global (kept)",
+            "m.py",
+            "class Row:\n    pass\n\n\ndef setup():\n    global Row\n    class Row:\n        pass\n\n\n\
+             def use():\n    return Row()\n",
+            &["use@11 -> Row@1", "use@11 -> Row@7"],
+        ),
+        (
+            "js: a module class and a nested one (kept)",
+            "m.js",
+            "class Row {}\n\nfunction a() {\n  class Row {}\n  return Row();\n}\n\nfunction b() {\n  return Row();\n}\n",
+            &["a@3 -> Row@1", "a@3 -> Row@4", "b@8 -> Row@1", "b@8 -> Row@4"],
+        ),
         (
             "rs: nested fns in sibling fns",
             "src/lib.rs",
@@ -17342,6 +17371,36 @@ fn d909_a_python_reference_binds_the_same_file_definition_its_scope_sees() {
             "annotation: a def at the file's first byte",
             "def a(x: Row):\n    class Row:\n        pass\n    return x\n\n\nclass Row:\n    pass\n",
             &["a@1 -> Row@7"],
+        ),
+        // Pre-tag review of 0.204.0: a `def`'s header runs around it wherever
+        // the `def` stands (first in a body too), and a name a function
+        // declares `global` / `nonlocal` binds outside it.
+        (
+            "annotation: a nested def's header, first in a method",
+            "class Row:\n    pass\n\n\nclass C:\n    def Row(self):\n        pass\n    def m(self):\n        \
+             def inner(x: Row):\n            pass\n        return inner\n",
+            &["inner@9 -> Row@1", "m@8 -> inner@9"],
+        ),
+        (
+            "annotation: a method's header, first in its class (kept)",
+            "class Row:\n    pass\n\n\nclass C:\n    def m(self, x: Row):\n        pass\n    def Row(self):\n        pass\n",
+            &["m@6 -> Row@1", "m@6 -> Row@8"],
+        ),
+        (
+            "value: a def its function declares global (kept)",
+            "def h():\n    pass\n\n\ndef f():\n    global h\n    def h():\n        pass\n\n\ndef g():\n    return h\n",
+            &["g@11 -> h@1", "g@11 -> h@7"],
+        ),
+        (
+            "value: a def its function declares nonlocal (kept)",
+            "def outer():\n    def h():\n        pass\n    def inner():\n        nonlocal h\n        def h():\n            \
+             pass\n    inner()\n    return h\n",
+            &["outer@1 -> h@2", "outer@1 -> h@6"],
+        ),
+        (
+            "value: a decorator runs around its def",
+            "def deco(f):\n    return f\n\n\n@deco\ndef g():\n    def deco():\n        pass\n    return deco\n",
+            &["g@5 -> deco@1", "g@5 -> deco@7"],
         ),
         (
             "annotation: an attribute's tail (kept)",
