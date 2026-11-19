@@ -17021,6 +17021,21 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
             "def h():\n    pass\n\n\ndef a():\n    def h():\n        pass\n    h()\n\n\ndef b():\n    h()\n",
             &["a@5 -> h@6", "b@11 -> h@1"],
         ),
+        // D#909: a `class` binds its name where it stands, as a `def` does.
+        (
+            "py: nested classes in sibling functions",
+            "m.py",
+            "def a():\n    class Row:\n        pass\n    return Row()\n\n\n\
+             def b():\n    class Row:\n        pass\n    return Row()\n",
+            &["a@1 -> Row@2", "b@7 -> Row@8"],
+        ),
+        (
+            "py: a nested class shadows a module class",
+            "m.py",
+            "class Row:\n    pass\n\n\ndef a():\n    class Row:\n        pass\n    return Row()\n\n\n\
+             def b():\n    return Row()\n",
+            &["a@5 -> Row@6", "b@11 -> Row@1"],
+        ),
         (
             "rs: nested fns in sibling fns",
             "src/lib.rs",
@@ -17223,6 +17238,98 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
     for (label, path, code, want) in table {
         let (_p, _d, db) = fresh_index_of(&[(path, code)]);
         let got = same_file_call_lines(&db);
+        if got != *want {
+            failures.push(format!("{label}: got {got:?}\n    want {want:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Every same-file `references` edge as `source@line -> target@line`, sorted.
+fn same_file_reference_lines(db: &Database) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT ns.name || '@' || ns.start_line || ' -> ' || nt.name || '@' || nt.start_line \
+             FROM edges e \
+             JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON nt.id = e.target_id \
+             WHERE e.relation = 'references' AND ns.file_id = nt.file_id ORDER BY 1",
+        )
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.filter_map(Result::ok).collect()
+}
+
+/// D#909: a Python name read as a value or written in an annotation binds, of
+/// the same-named definitions of its file, the ones its lexical scope sees and
+/// the innermost of those, as a bare call does (D#714 A3): `view_func=index` in
+/// each of flask's test functions binds that function's nested `def index`, not
+/// every one in the file. A method is no candidate once the name sees a lexical
+/// definition outside a class body; code in a class body keeps that body's
+/// methods; a name that sees no definition keeps every candidate; the tail of
+/// `mod.Row` is no bare name and is left as it was.
+#[test]
+fn d909_a_python_reference_binds_the_same_file_definition_its_scope_sees() {
+    #[allow(clippy::type_complexity)]
+    let table: &[(&str, &str, &[&str])] = &[
+        (
+            "value: nested defs in sibling functions",
+            "def a(app):\n    def index():\n        pass\n    app.add_url_rule(\"/\", view_func=index)\n\n\n\
+             def b(app):\n    def index():\n        pass\n    app.add_url_rule(\"/\", view_func=index)\n",
+            &["a@1 -> index@2", "b@7 -> index@8"],
+        ),
+        (
+            "annotation: nested classes in sibling functions",
+            "def a():\n    class Row:\n        pass\n    x: Row = None\n    return x\n\n\n\
+             def b():\n    class Row:\n        pass\n    y: Row = None\n    return y\n",
+            &["a@1 -> Row@2", "b@8 -> Row@9"],
+        ),
+        (
+            "value: a nested def shadows a module function",
+            "def h():\n    pass\n\n\ndef a():\n    def h():\n        pass\n    return h\n\n\n\
+             def b():\n    return h\n",
+            &["a@5 -> h@6", "b@11 -> h@1"],
+        ),
+        (
+            "value: a closure reads its outer function's def",
+            "def outer():\n    def h():\n        pass\n    def inner():\n        return h\n    return inner\n\n\n\
+             def other():\n    def h():\n        pass\n    return h\n",
+            &["inner@4 -> h@2", "other@9 -> h@10", "outer@1 -> inner@4"],
+        ),
+        (
+            "value: a method of that name once a nested def is seen",
+            "class C:\n    def h(self):\n        pass\n\n\ndef a():\n    def h():\n        pass\n    return h\n",
+            &["a@6 -> h@7"],
+        ),
+        (
+            "value: a decorator a function nests",
+            "def a():\n    def deco(f):\n        return f\n    @deco\n    def g():\n        pass\n\n\n\
+             def b():\n    def deco(f):\n        return f\n",
+            &["g@4 -> deco@2"],
+        ),
+        (
+            "value: in a class body, the body's method (kept)",
+            "def helper():\n    pass\n\n\nclass C:\n    def helper(self):\n        pass\n    \
+             x = staticmethod(helper)\n",
+            &["<module>@1 -> helper@1", "<module>@1 -> helper@6"],
+        ),
+        (
+            "value: no definition visible (kept)",
+            "def a():\n    def h():\n        pass\n\n\ndef b():\n    def h():\n        pass\n\n\n\
+             def c():\n    return h\n",
+            &["c@11 -> h@2", "c@11 -> h@7"],
+        ),
+        (
+            "annotation: an attribute's tail (kept)",
+            "import mod\n\n\ndef a():\n    class Row:\n        pass\n    x: mod.Row = None\n    return x\n\n\n\
+             def b():\n    class Row:\n        pass\n",
+            &["a@4 -> Row@12", "a@4 -> Row@5"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, code, want) in table {
+        let (_p, _d, db) = fresh_index_of(&[("m.py", code)]);
+        let got = same_file_reference_lines(&db);
         if got != *want {
             failures.push(format!("{label}: got {got:?}\n    want {want:?}"));
         }

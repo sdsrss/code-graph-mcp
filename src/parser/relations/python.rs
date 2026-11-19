@@ -927,11 +927,12 @@ pub(super) fn extract_python_type_reference(
         return None;
     }
     let name = node_text(node, source);
+    // `Type` of `mod.Type` is an attribute of `mod`, not a bare read.
+    let bare = !is_attribute_tail(node);
     if name.is_empty()
         || name == "_"
         || PYTHON_TYPE_REFERENCE_NOISE.contains(&name)
-        // `Type` of `mod.Type` is an attribute of `mod`, not a bare read.
-        || (!is_attribute_tail(node) && py_read_names_no_definition(*node, name))
+        || (bare && py_read_names_no_definition(*node, name))
     {
         return None;
     }
@@ -942,7 +943,11 @@ pub(super) fn extract_python_type_reference(
         metadata: None,
         source_language: String::new(),
         source_line: None,
-        call_at: None,
+        // A bare name picks among the file's definitions by scope, as a bare
+        // call does (D#909, D#714).
+        call_at: bare
+            .then(|| crate::parser::treesitter::bare_call_at(node, "python"))
+            .flatten(),
     })
 }
 
@@ -1038,7 +1043,10 @@ pub(super) fn extract_python_value_reference(
         metadata: None,
         source_language: String::new(),
         source_line: None,
-        call_at: None,
+        // Every slot above holds a bare identifier: it picks among the file's
+        // definitions by scope, as a bare call does (D#909, D#714). A
+        // decorator's name is where it is evaluated, around its `def`.
+        call_at: crate::parser::treesitter::bare_call_at(node, "python"),
     })
 }
 

@@ -28,7 +28,11 @@ ORPHANS = """SELECT f.path, n.type, COALESCE(n.qualified_name, n.name), n.start_
 
 def key(r):
     rel, sp, st, sn, sq, s0, s1, tp, tt, tn, tq, t0, t1, conf, meta, lang = r
-    return (rel, f"{sp}:{sq}:{st}", f"{tp}:{tq}:{tt}", conf, meta)
+    # Start lines too: same-named nested definitions of one file share path,
+    # name and type, and without the line a removed edge to one of them was
+    # counted against the row of another (D#909: the oracle then judged the
+    # kept, right edge).
+    return (rel, f"{sp}:{sq}:{st}@{s0}", f"{tp}:{tq}:{tt}@{t0}", conf, meta)
 
 
 def run(binary, src, dest):

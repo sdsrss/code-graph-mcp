@@ -1148,7 +1148,12 @@ fn extract_nodes(
                     return_type: None,
                     param_types: None,
                     is_test: node_is_test,
-                    lexical_scope: None,
+                    // A Python `class` binds its name where it stands, as a
+                    // `def` does: a class nested in a function is that
+                    // function's (D#909).
+                    lexical_scope: (language == "python")
+                        .then(|| lexical_scope(&node, language))
+                        .flatten(),
                 });
                 extract_children(
                     node,
