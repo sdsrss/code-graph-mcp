@@ -251,5 +251,11 @@ calls：
 - [x] 评审的序列、用例、变异脚本存进 `tasks/d905-scope-oracle/review-r1/`（b8fe5963）；`/var/tmp/d905-review` 已删除
 - [x] 修复提交 8cb3621b（pre-commit：`cargo test` 2,537 通过 / 0 失败 / 7 忽略）
 - [x] 用户决定的事项：F1 照现状发版（见上节“决定”）。修复提交 8cb3621b 在 `src` 里只挪了一处声明、改了两段注释，二进制行为与评审过的 455f3cb0 相同，所以按 0.202.0 的先例不做第 2 轮评审。
-- [ ] 发版：推送 main、CI、打 tag、Release、npm、第 3 个信号。
+- [x] 发版 0.203.0（2026-11-19 UTC）：
+  - 插件从干净克隆安装：Skills 2、Agents 1、Hooks 6、MCP 1，版本 0.203.0。
+  - main CI 44586558168 7/7（15m38s）；4 个 d905 测试和改过的 2 个 edge_coverage 测试在 macOS、Windows 日志里都是 `ok`。
+  - tag v0.203.0 = d8139387；Release 44589471564 10/10（28m54s）；发版说明 = CHANGELOG 本节，回读一致；14 个附件。
+  - npm 六个包都是 0.203.0，`_npmUser` GitHub Actions、trustedPublisher github；真实安装 `added 2 packages`，linux-x64 二进制 md5 bdd83f21。
+  - 第 3 个信号：发布的二进制与 d8139387 的源码构建（md5 4df442e8）在五个语料上边和 pending 行都相同（标准库 104,087 条边、nltk 25,613、flask 3,682、本仓库 22,331、daagu 74,477，差异 0）；这次构建与评审用的 head（dac88a40）也相同。
+  - 延期：D#906 由 D#913 接替（重建一侧按形状收窄，含上面的类规模与抽样）。
 - 旧记录：两个 release 二进制（base md5 12719af8、head md5 dac88a40，代码同 f1d2cb8a）在本会话的 scratchpad，发版时用来做第 3 个信号（发布二进制与源码构建逐边相同）
