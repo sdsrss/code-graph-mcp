@@ -1076,9 +1076,14 @@ fn python_resolution_fixture() -> (TempDir, Database) {
         "dotted.py",
         "import pkg.models\nimport pkg.views\n\n\ndef run():\n    pkg.models.load()\n    return pkg.views.render()\n",
     );
-    // 6. A project function whose name shadows a Python builtin.
+    // 6. A project function whose name shadows a Python builtin: called where
+    //    its file is imported, and where nothing binds the name (the builtin).
     w("shadow.py", "def open(path):\n    return 8\n");
     w("caller.py", "def call_it():\n    return open('x')\n");
+    w(
+        "caller_imp.py",
+        "from shadow import open\n\n\ndef call_imported():\n    return open('y')\n",
+    );
 
     let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
     std::fs::create_dir_all(&db_dir).unwrap();
@@ -1172,9 +1177,11 @@ fn python_resolution_tier_inventory_is_pinned() {
         // A constructor call inside one file.
         "calls extracted builder.py:make_builder -> builder.py:Builder",
         // The import-mediated calls, plus the project `def open` that shadows
-        // the builtin.
+        // the builtin where `from shadow import open` binds it. `caller.py`'s
+        // `open('x')` imports nothing and runs the builtin: it bound
+        // `shadow.py:open` by name until D#905, an edge Python never takes.
         "calls inferred app.py:go -> builder.py:make_builder",
-        "calls inferred caller.py:call_it -> shadow.py:open",
+        "calls inferred caller_imp.py:call_imported -> shadow.py:open",
         // `self.helper()` in `Child(Base)` binds the `helper` it inherits,
         // decided (v77). It was a bare-name fan-out that also reached the
         // unrelated `other.py:Other.helper`, both edges `ambiguous`.
@@ -1187,6 +1194,8 @@ fn python_resolution_tier_inventory_is_pinned() {
         "calls inferred use_alias.py:build -> cache.py:Cache",
         "imports extracted app.py:<module> -> builder.py:<module>",
         "imports extracted app.py:<module> -> builder.py:make_builder",
+        "imports extracted caller_imp.py:<module> -> shadow.py:<module>",
+        "imports extracted caller_imp.py:<module> -> shadow.py:open",
         "imports extracted child.py:<module> -> base.py:<module>",
         "imports extracted child.py:<module> -> base.py:Base",
         "imports extracted dotted.py:<module> -> pkg/models.py:<module>",
@@ -1263,14 +1272,22 @@ fn python_resolution_converges_incrementally_to_a_rebuild() {
     // The call sites come first, so pass 2 is the run that changes what they
     // should resolve to without touching the files that contain them.
     let seed: &[(&str, &str)] = &[
-        ("caller.py", "def call_it():\n    return open('x')\n"),
+        (
+            "caller.py",
+            "def call_it():\n    open('x')\n    return fetch('x')\n",
+        ),
         ("uses_helper.py", "def go():\n    return helper()\n"),
         ("helper_a.py", "def helper():\n    return 1\n"),
     ];
-    // Pass 2 adds a project definition shadowing a builtin, and a SECOND
+    // Pass 2 adds a project definition of a name a call already indexed left
+    // unresolved, one shadowing a builtin that call never reaches (D#905:
+    // `open('x')` with nothing binding `open` runs the builtin), and a SECOND
     // definition of a name whose caller is already indexed.
     let added: &[(&str, &str)] = &[
-        ("shadow.py", "def open(path):\n    return 8\n"),
+        (
+            "shadow.py",
+            "def open(path):\n    return 8\n\n\ndef fetch(path):\n    return 9\n",
+        ),
         ("helper_b.py", "def helper():\n    return 2\n"),
     ];
 
@@ -1325,5 +1342,9 @@ fn python_resolution_converges_incrementally_to_a_rebuild() {
     assert!(
         full.iter().any(|row| row.starts_with("calls inferred")),
         "fixture stopped exercising resolution at all: {full:?}"
+    );
+    assert!(
+        !full.iter().any(|row| row.contains("shadow.py:open")),
+        "a builtin's call bound a project namesake: {full:?}"
     );
 }

@@ -6234,6 +6234,273 @@ fn test_python_call_on_a_value_its_scope_binds_is_marked_local() {
     );
 }
 
+/// The names `src` records as Python `references`.
+fn python_reference_names(src: &str) -> Vec<String> {
+    extract_relations(src, "python")
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.relation == REL_REFERENCES)
+        .map(|r| r.target_name)
+        .collect()
+}
+
+/// The names `src` records as Python `calls`.
+fn python_call_names(src: &str) -> Vec<String> {
+    extract_relations(src, "python")
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.relation == REL_CALLS)
+        .map(|r| r.target_name)
+        .collect()
+}
+
+#[test]
+fn d905_a_python_reference_follows_the_scope_chain() {
+    // D#905: a name Python resolves to a local value, a module-level variable
+    // or a built-in names no project definition, yet bound by name it took
+    // every namesake: `sum(len(m) for m in marks)` bound 283 methods `C.m` of
+    // this repository's fixtures; `isinstance(x, int)` and `@property` bound
+    // the standard library's `locale.str`-like namesakes (1,422 such edges
+    // there, 2,250 over five corpora; locals 3,180, module variables 5,638).
+    // Each name below is named for its case.
+    let src = "from m import imported_ref\n\
+        from collections import defaultdict\n\n\
+        def mod_def(): pass\n\
+        def first_iter(): pass\n\
+        def lam_free(): pass\n\
+        def glob_def(): pass\n\
+        def helper_def(): pass\n\
+        class KeptClass: pass\n\n\
+        module_var = defaultdict(set)\n\
+        try:\n    from x import try_imported\nexcept ImportError:\n    try_imported = None\n\n\
+        def comps(xs):\n    \
+            sum(len(gen_var) for gen_var in xs)\n    \
+            d = {dict_var[0]: dict_var for dict_var in xs}\n    \
+            [use(list_var) for list_var in xs]\n    \
+            [use(first_iter) for first_iter in make(first_iter)]\n\n\
+        def lambdas():\n    \
+            f = lambda lam_param: run(lam_param)\n    \
+            g = lambda: run(lam_free)\n\n\
+        def binders(E, p):\n    \
+            with open(p) as with_var:\n        use(with_var)\n    \
+            try:\n        pass\n    except E as exc_var:\n        log(exc_var)\n    \
+            if (walrus_var := get()):\n        use(walrus_var)\n    \
+            a, unpack_var = pair()\n    use(unpack_var)\n\n\
+        def outer():\n    \
+            closure_var = 1\n\n    \
+            def inner():\n        use(closure_var)\n    \
+            nl_var = 1\n\n    \
+            def inner2():\n        nonlocal nl_var\n        use(nl_var)\n\n\
+        def uses_global():\n    global glob_def\n    use(glob_def)\n\n\
+        def uses_module(x, xs):\n    \
+            use(module_var)\n    use(try_imported)\n    use(imported_ref)\n    \
+            use(KeptClass)\n    use(unbound_name)\n    use(mod_def)\n    \
+            isinstance(x, int)\n    map(str, xs)\n    y: memoryview = None\n\n\
+        class C:\n    \
+            @property\n    def p(self):\n        pass\n\n    \
+            x = staticmethod(helper_def)\n";
+    let refs = python_reference_names(src);
+    for name in [
+        "first_iter",
+        "lam_free",
+        "glob_def",
+        "try_imported",
+        "imported_ref",
+        "KeptClass",
+        "unbound_name",
+        "mod_def",
+        "helper_def",
+    ] {
+        assert!(
+            refs.iter().any(|r| r == name),
+            "{name} may name a definition; got: {refs:?}"
+        );
+    }
+    for name in [
+        "gen_var",
+        "dict_var",
+        "list_var",
+        "lam_param",
+        "with_var",
+        "exc_var",
+        "walrus_var",
+        "unpack_var",
+        "closure_var",
+        "nl_var",
+        "module_var",
+        "int",
+        "str",
+        "property",
+        "memoryview",
+    ] {
+        assert!(
+            !refs.iter().any(|r| r == name),
+            "{name} names no project definition; got: {refs:?}"
+        );
+    }
+    // The comprehension's own `first_iter` is its target; only the first
+    // iterable, which runs outside, names the module's `def first_iter`.
+    assert_eq!(
+        refs.iter().filter(|r| *r == "first_iter").count(),
+        1,
+        "{refs:?}"
+    );
+
+    // What keeps a built-in's name a possible definition: the file defines it
+    // at any depth, imports it, star-imports a module, or a class body binds
+    // it for code written directly in that body.
+    for (case, src, name) in [
+        (
+            "nested def",
+            "def o():\n    def str(x):\n        return x\n    return str\n\n\
+             def f(xs):\n    return map(str, xs)\n",
+            "str",
+        ),
+        (
+            "star import",
+            "from m import *\n\ndef f(xs):\n    return map(str, xs)\n",
+            "str",
+        ),
+        (
+            "import",
+            "from m import set\n\ndef f():\n    use(set)\n",
+            "set",
+        ),
+        (
+            "class body",
+            "class D:\n    def property(self):\n        pass\n\n    \
+             @property\n    def q(self):\n        pass\n",
+            "property",
+        ),
+        // A module variable that is the definition of its own name: an alias
+        // (`Command = commands.Command` in `_pyrepl/reader.py`), or a name a
+        // function assigns under `global` (`concurrent.futures.__getattr__`'s
+        // lazy import).
+        (
+            "alias",
+            "from _pyrepl import commands\nCommand = commands.Command\n\n\
+             def f():\n    use(Command)\n",
+            "Command",
+        ),
+        // `b` of an annotation `a.b` is an attribute of `a`, never a bare read.
+        (
+            "annotation attribute, built-in name",
+            "import enum\n\ndef f(x: enum.property):\n    pass\n",
+            "property",
+        ),
+        (
+            "annotation attribute, module variable name",
+            "import models\nHandler = 1\n\ndef f(x: models.Handler):\n    pass\n",
+            "Handler",
+        ),
+        (
+            "global",
+            "def __getattr__(name):\n    global Pool\n    \
+             from .process import Pool as pe\n    Pool = pe\n    return Pool\n\n\
+             def f():\n    use(Pool)\n",
+            "Pool",
+        ),
+    ] {
+        let refs = python_reference_names(src);
+        assert!(
+            refs.iter().any(|r| r == name),
+            "{case}: {name} may name a definition; got: {refs:?}"
+        );
+    }
+}
+
+// D#905's scope read costs the scope nesting, not the syntax depth. Read by
+// climbing each name's ancestors (`Node::parent` descends from the root), a
+// 480 KB file of annotations nested 150 deep indexed in 8.06 s against
+// 0.87 s before the rule; read from the file's scope list, 0.99 s.
+#[test]
+fn d905_a_scope_read_costs_the_scope_nesting_not_the_syntax_depth() {
+    let ann = format!(
+        "def h(x: {}A{}):\n    pass\n",
+        "Dict[A, ".repeat(150),
+        "]".repeat(150)
+    );
+    let code = format!("A = 1\n\n{}", ann.repeat(900_000 / ann.len()));
+    assert!(code.len() < 1 << 20, "{} bytes", code.len());
+    let start = std::time::Instant::now();
+    let refs = extract_within_60s("annotations nested 150 deep", code, |tree, code| {
+        extract_relations_from_tree(tree, code, "python", None)
+            .into_iter()
+            .filter(|r| r.relation == REL_REFERENCES)
+            .count()
+    });
+    // `A` is a module variable: no reference survives, every one was read.
+    assert_eq!(refs, 0);
+    eprintln!("annotations nested 150 deep: {:?}", start.elapsed());
+}
+
+#[test]
+fn d905_a_python_bare_call_of_a_builtin_is_no_call() {
+    // `set()` runs the built-in unless the file binds `set`: bound by name it
+    // took daagu's `TTLCache.set` 313 times, nltk's `Downloader.list` 289
+    // times (`list()`), the standard library's `locale.str` 182 times, all
+    // `inferred`, so `impact` listed them (14,673 such edges over five corpora).
+    let src = "def f(p):\n    \
+        set()\n    range(3)\n    open(p)\n    print(p)\n    super()\n    \
+        [sorted(x) for x in p]\n    g = lambda: len(p)\n\n\
+        class K:\n    \
+            def abs(self):\n        pass\n\n    \
+            def m(self):\n        return abs(-1)\n";
+    let calls = python_call_names(src);
+    for name in [
+        "set", "range", "open", "print", "super", "sorted", "len", "abs",
+    ] {
+        assert!(
+            !calls.iter().any(|c| c == name),
+            "{name}() runs the built-in; got: {calls:?}"
+        );
+    }
+    for (case, src, name) in [
+        (
+            "module def",
+            "def open(p):\n    pass\n\ndef f(p):\n    open(p)\n",
+            "open",
+        ),
+        (
+            "import",
+            "from gzip import open\n\ndef f(p):\n    open(p)\n",
+            "open",
+        ),
+        (
+            "module variable",
+            "import io\nopen = io.open\n\ndef f(p):\n    open(p)\n",
+            "open",
+        ),
+        (
+            "global",
+            "def g():\n    global open\n    open = 1\n\ndef f(p):\n    open(p)\n",
+            "open",
+        ),
+        (
+            "nested def",
+            "def o():\n    def set():\n        pass\n    return set\n\ndef f():\n    set()\n",
+            "set",
+        ),
+        (
+            "star import",
+            "from m import *\n\ndef f():\n    set()\n",
+            "set",
+        ),
+        (
+            "class body",
+            "class K:\n    def set(self):\n        pass\n\n    x = set()\n",
+            "set",
+        ),
+        ("parameter", "def f(set):\n    set()\n", "set"),
+    ] {
+        let calls = python_call_names(src);
+        assert!(
+            calls.iter().any(|c| c == name),
+            "{case}: {name}() may run a definition; got: {calls:?}"
+        );
+    }
+}
+
 #[test]
 fn test_python_annotated_class_attr_emits_references() {
     // `class Service:\n    cache: Cache` — annotated class attribute → reference

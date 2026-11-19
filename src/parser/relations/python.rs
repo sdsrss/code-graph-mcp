@@ -44,8 +44,9 @@ struct PyDefined {
 thread_local! {
     /// Per file: reset by [`reset_python_file`].
     static PY_DEFINED: std::cell::RefCell<PyDefined> = std::cell::RefCell::new(PyDefined::default());
-    /// Per file, keyed by `function_definition` node id: what each function's
-    /// own scope binds ([`function_bindings`]). Reset by [`reset_python_file`],
+    /// Per file, keyed by `function_definition` (or `class_definition`) node
+    /// id: what each function's own scope (or class body) binds
+    /// ([`function_bindings`]). Reset by [`reset_python_file`],
     /// since node ids are only unique within one tree.
     /// Per file: [`scope_scan`], filled by [`reset_python_file`].
     static PY_LOCAL_VALUE_CALLS: std::cell::RefCell<std::collections::HashSet<usize>> =
@@ -57,21 +58,94 @@ thread_local! {
     static PY_RENAMED_IMPORT_CALLS: std::cell::RefCell<
         std::collections::HashMap<usize, (String, String)>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Per file: [`builtin_calls`], filled by [`reset_python_file`].
+    static PY_BUILTIN_CALLS: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+    /// Per file: what the module scope binds, filled by [`reset_python_file`].
+    static PY_MODULE: std::cell::RefCell<PyModuleScope> =
+        std::cell::RefCell::new(PyModuleScope::default());
+    /// Per file: its scopes ([`scope_scan`]), filled by [`reset_python_file`].
+    static PY_SCOPES: std::cell::RefCell<PyScopes> = std::cell::RefCell::new(PyScopes::default());
+}
+
+/// What the module scope binds ([`collect_module_bindings`]), and the names a
+/// `global` statement anywhere in the file declares.
+#[derive(Default)]
+struct PyModuleScope {
+    /// `from m import a as b` with `a` ≠ `b`: `b` → every (`a`, `m`).
+    renamed: std::collections::HashMap<String, std::collections::HashSet<(String, String)>>,
+    /// A `def`, a `class`, any other import, or an alias `X = m.X`.
+    definitions: std::collections::HashSet<String>,
+    /// An assignment, `for`, `with … as`, `except … as`, `case … as` or `:=`
+    /// target.
+    values: std::collections::HashSet<String>,
+    /// `from m import *`: any name may come from `m`.
+    star: bool,
+    globals: std::collections::HashSet<String>,
+}
+
+/// What a name read at module level names, as far as the file shows (D#905).
+#[derive(PartialEq, Eq, Debug)]
+enum PyModuleRead {
+    /// Possibly a project definition: the module defines or imports it
+    /// (`X = m.X` counts), a `def` / `class` of the name sits anywhere in the
+    /// file, a star import may bring it, a function declares it `global`, or
+    /// nothing binds it (left to the by-name resolution).
+    MaybeDefinition,
+    /// A value the module binds and nothing else: an assignment or other
+    /// target. No node holds it.
+    Value,
+    /// A built-in nothing in the file shadows.
+    Builtin,
+}
+
+impl PyModuleScope {
+    fn read(&self, name: &str, defined: &PyDefined) -> PyModuleRead {
+        // A `global` name is bound by a function, which may assign it the
+        // definition of that name (`concurrent.futures.__getattr__`:
+        // `global ProcessPoolExecutor` then the lazily imported class).
+        if self.definitions.contains(name)
+            || self.renamed.contains_key(name)
+            || defined.free.contains(name)
+            || self.star
+            || self.globals.contains(name)
+        {
+            PyModuleRead::MaybeDefinition
+        } else if self.values.contains(name) {
+            PyModuleRead::Value
+        } else if crate::domain::PYTHON_BUILTINS.contains(&name) {
+            PyModuleRead::Builtin
+        } else {
+            PyModuleRead::MaybeDefinition
+        }
+    }
 }
 
 /// Collect the file's `def` / `class` names. MUST run once per file before its
 /// walk.
 pub(super) fn reset_python_file(root: tree_sitter::Node, source: &str, family: &str) {
     PY_FN_BINDINGS.with(|b| b.borrow_mut().clear());
-    let (local_calls, renamed_calls) = if family == "python" {
+    collect_defined(root, source, family);
+    let (local_calls, renamed_calls, builtin, module, scopes) = if family == "python" {
         let scan = scope_scan(root, source);
-        let renamed = renamed_import_calls(root, source, &scan);
-        (scan.local_values, renamed)
+        let mut module = PyModuleScope::default();
+        collect_module_bindings(root, source, &mut module, 0);
+        module.globals = scan.globals.iter().map(|g| g.to_string()).collect();
+        let renamed = renamed_import_calls(&scan, &module);
+        let builtin = PY_DEFINED.with(|d| builtin_calls(&scan, &module, &d.borrow()));
+        (scan.local_values, renamed, builtin, module, scan.scopes)
     } else {
         Default::default()
     };
     PY_LOCAL_VALUE_CALLS.with(|c| *c.borrow_mut() = local_calls);
     PY_RENAMED_IMPORT_CALLS.with(|c| *c.borrow_mut() = renamed_calls);
+    PY_BUILTIN_CALLS.with(|c| *c.borrow_mut() = builtin);
+    PY_MODULE.with(|m| *m.borrow_mut() = module);
+    PY_SCOPES.with(|s| *s.borrow_mut() = scopes);
+}
+
+/// [`PY_DEFINED`] for the file.
+fn collect_defined(root: tree_sitter::Node, source: &str, family: &str) {
     PY_DEFINED.with(|d| {
         let mut defined = d.borrow_mut();
         defined.free.clear();
@@ -149,6 +223,16 @@ pub(super) fn python_renamed_import_call(call: tree_sitter::Node) -> Option<(Str
     PY_RENAMED_IMPORT_CALLS.with(|c| c.borrow().get(&call.id()).cloned())
 }
 
+/// Whether a bare call `f(...)` runs the built-in `f` (D#905): no scope
+/// around it binds `f`, nor the module, nor a `def` / `class` anywhere in
+/// the file, and no star import may bring it. Bound by name it took any
+/// namesake: daagu's `set()` bound `TTLCache.set` 313 times, `inferred`.
+/// [`reset_python_file`] decided it for every call of the file
+/// ([`builtin_calls`]).
+pub(super) fn python_builtin_call(call: tree_sitter::Node) -> bool {
+    PY_BUILTIN_CALLS.with(|c| c.borrow().contains(&call.id()))
+}
+
 /// What one sweep of a file's scopes finds ([`scope_scan`]).
 #[derive(Default)]
 struct ScopeScan<'s> {
@@ -156,10 +240,13 @@ struct ScopeScan<'s> {
     /// binds to a value ([`python_local_value_call_meta`]).
     local_values: std::collections::HashSet<usize>,
     /// Bare calls no function, lambda or comprehension around them binds the
-    /// name of (or that a `global` sends to module level), with that name.
-    module_level: Vec<(usize, &'s str)>,
+    /// name of (or that a `global` sends to module level), with that name,
+    /// and whether the call is written directly in a class body that binds
+    /// the name (Python reads that body first).
+    module_level: Vec<(usize, &'s str, bool)>,
     /// Every name a `global` statement anywhere in the file declares.
     globals: std::collections::HashSet<&'s str>,
+    scopes: PyScopes,
 }
 
 /// One sweep of the file's scopes ([`ScopeScan`]): which bare calls are on
@@ -178,19 +265,22 @@ struct ScopeScan<'s> {
 /// descends from the root): `test_python_class_body_marking_stays_linear`
 /// timed out at 60 s.
 fn scope_scan<'s>(root: tree_sitter::Node, source: &'s str) -> ScopeScan<'s> {
-    enum Binder<'t> {
-        /// Bindings computed on first use ([`function_bindings`]).
-        Function(tree_sitter::Node<'t>),
-        Names(std::rc::Rc<std::collections::HashMap<String, PyBinding>>),
-    }
-    let mut scopes: Vec<(usize, usize, Binder)> = Vec::new();
+    let mut scopes: Vec<PyScope> = Vec::new();
     let mut calls: Vec<(usize, usize, &str)> = Vec::new();
+    let scope = |start: usize, end: usize, names, class| PyScope {
+        start,
+        end,
+        parent: None,
+        names,
+        class,
+    };
     // Every node passes this match: kind ids, not kind strings.
     let language = root.language();
     let id = |kind: &str| language.id_for_node_kind(kind, true);
     let wanted = [
         id("call"),
         id("function_definition"),
+        id("class_definition"),
         id("lambda"),
         id("list_comprehension"),
         id("set_comprehension"),
@@ -216,9 +306,16 @@ fn scope_scan<'s>(root: tree_sitter::Node, source: &'s str) -> ScopeScan<'s> {
                     calls.push((n.start_byte(), n.id(), node_text(&f, source)));
                 }
             }
-            "function_definition" => {
+            // `function_bindings` reads a class body as it reads a
+            // function's: a class has no `parameters` field.
+            "function_definition" | "class_definition" => {
                 if let Some(body) = n.child_by_field_name("body") {
-                    scopes.push((body.start_byte(), body.end_byte(), Binder::Function(n)));
+                    scopes.push(scope(
+                        body.start_byte(),
+                        body.end_byte(),
+                        function_bindings(n, source),
+                        kind == "class_definition",
+                    ));
                 }
             }
             "global_statement" => {
@@ -234,8 +331,12 @@ fn scope_scan<'s>(root: tree_sitter::Node, source: &'s str) -> ScopeScan<'s> {
                         .child_by_field_name("parameters")
                         .map(|p| parameter_bindings(p, source))
                         .unwrap_or_default();
-                    let range = (body.start_byte(), body.end_byte());
-                    scopes.push((range.0, range.1, Binder::Names(std::rc::Rc::new(params))));
+                    scopes.push(scope(
+                        body.start_byte(),
+                        body.end_byte(),
+                        std::rc::Rc::new(params),
+                        false,
+                    ));
                 }
             }
             "list_comprehension"
@@ -264,8 +365,8 @@ fn scope_scan<'s>(root: tree_sitter::Node, source: &'s str) -> ScopeScan<'s> {
                     .map_or((n.end_byte(), n.end_byte()), |r| {
                         (r.start_byte(), r.end_byte())
                     });
-                scopes.push((n.start_byte(), gap_start, Binder::Names(names.clone())));
-                scopes.push((gap_end, n.end_byte(), Binder::Names(names)));
+                scopes.push(scope(n.start_byte(), gap_start, names.clone(), false));
+                scopes.push(scope(gap_end, n.end_byte(), names, false));
             }
             _ => {}
         }
@@ -278,45 +379,110 @@ fn scope_scan<'s>(root: tree_sitter::Node, source: &'s str) -> ScopeScan<'s> {
             }
         }
     }
-    scopes.sort_unstable_by_key(|&(start, end, _)| (start, std::cmp::Reverse(end)));
-    calls.sort_unstable_by_key(|&(at, _, _)| at);
+    let scopes = PyScopes::new(scopes);
     let mut out = std::collections::HashSet::new();
     let mut module_level = Vec::new();
-    let mut open: Vec<&(usize, usize, Binder)> = Vec::new();
-    let mut next = scopes.iter().peekable();
     for (at, id, name) in calls {
-        open.extend(std::iter::from_fn(|| {
-            next.next_if(|&&(start, _, _)| start <= at)
-        }));
-        open.retain(|&&(_, end, _)| end > at);
-        let mut reaches_module = true;
-        for (_, _, binder) in open.iter().rev() {
-            let binding = match binder {
-                Binder::Function(f) => function_bindings(*f, source).get(name).copied(),
-                Binder::Names(names) => names.get(name).copied(),
-            };
-            match binding {
-                Some(PyBinding::Value) => {
-                    out.insert(id);
-                    reaches_module = false;
-                    break;
-                }
-                Some(PyBinding::Definition) => {
-                    reaches_module = false;
-                    break;
-                }
-                Some(PyBinding::Global) => break,
-                Some(PyBinding::Nonlocal) | None => {}
+        match scopes.read(at, name) {
+            (PyScopeRead::Value, _) => {
+                out.insert(id);
             }
-        }
-        if reaches_module {
-            module_level.push((id, name));
+            (PyScopeRead::Definition, _) => {}
+            (PyScopeRead::Module, class_bound) => module_level.push((id, name, class_bound)),
         }
     }
     ScopeScan {
         local_values: out,
         module_level,
         globals,
+        scopes,
+    }
+}
+
+/// One scope of a file as a byte range ([`scope_scan`]): a function's or
+/// lambda's body, a class body, or a comprehension around its first
+/// iterable (which runs outside it).
+struct PyScope {
+    start: usize,
+    end: usize,
+    /// The innermost scope around this one.
+    parent: Option<usize>,
+    names: std::rc::Rc<std::collections::HashMap<String, PyBinding>>,
+    /// A class body: read only by code written directly in it, and then
+    /// only as [`PyScopes::read`]'s flag.
+    class: bool,
+}
+
+/// How the scopes around a read bind its name ([`PyScopes::read`]).
+#[derive(PartialEq, Eq, Debug)]
+enum PyScopeRead {
+    /// A function, lambda or comprehension binds it to a value.
+    Value,
+    /// A function binds it to a definition: a nested `def` / `class`, an
+    /// import, a parameter defaulting to the name.
+    Definition,
+    /// It reaches the module scope (or a `global` sends it there).
+    Module,
+}
+
+/// A file's scopes, sorted by start (the outer first on a tie), each with
+/// its parent: the scopes around any byte are one parent chain, found by a
+/// binary search and a climb, so a read costs the scope nesting, never the
+/// syntax depth (`Node::parent` descends from the root).
+#[derive(Default)]
+struct PyScopes(Vec<PyScope>);
+
+impl PyScopes {
+    fn new(mut scopes: Vec<PyScope>) -> Self {
+        scopes.sort_unstable_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
+        // Scopes are syntax ranges: nested or disjoint.
+        let mut open: Vec<usize> = Vec::new();
+        for i in 0..scopes.len() {
+            while open
+                .last()
+                .is_some_and(|&top| scopes[top].end <= scopes[i].start)
+            {
+                open.pop();
+            }
+            scopes[i].parent = open.last().copied();
+            open.push(i);
+        }
+        PyScopes(scopes)
+    }
+
+    /// The innermost scope holding byte `at`.
+    fn innermost(&self, at: usize) -> Option<usize> {
+        let mut i = self.0.partition_point(|s| s.start <= at).checked_sub(1)?;
+        while self.0[i].end <= at {
+            i = self.0[i].parent?;
+        }
+        Some(i)
+    }
+
+    /// How the scopes around byte `at` bind `name`, innermost first, as
+    /// Python's chain reads them: a class body only for code written
+    /// directly in it (reported as the flag, the chain goes on past it),
+    /// `global` to module level, `nonlocal` outward.
+    fn read(&self, at: usize, name: &str) -> (PyScopeRead, bool) {
+        let mut class_bound = false;
+        let mut at_scope = self.innermost(at);
+        let mut innermost = true;
+        while let Some(i) = at_scope {
+            let scope = &self.0[i];
+            if scope.class {
+                class_bound |= innermost && scope.names.contains_key(name);
+            } else {
+                match scope.names.get(name) {
+                    Some(PyBinding::Value) => return (PyScopeRead::Value, class_bound),
+                    Some(PyBinding::Definition) => return (PyScopeRead::Definition, class_bound),
+                    Some(PyBinding::Global) => break,
+                    Some(PyBinding::Nonlocal) | None => {}
+                }
+            }
+            innermost = false;
+            at_scope = scope.parent;
+        }
+        (PyScopeRead::Module, class_bound)
     }
 }
 
@@ -329,38 +495,51 @@ fn scope_scan<'s>(root: tree_sitter::Node, source: &'s str) -> ScopeScan<'s> {
 /// judged at module level, as [`scope_scan`] judges it; a star import
 /// is not read.
 fn renamed_import_calls(
-    root: tree_sitter::Node,
-    source: &str,
     scan: &ScopeScan,
+    module: &PyModuleScope,
 ) -> std::collections::HashMap<usize, (String, String)> {
-    let mut renamed: std::collections::HashMap<
-        String,
-        std::collections::HashSet<(String, String)>,
-    > = std::collections::HashMap::new();
-    let mut other: std::collections::HashSet<String> = std::collections::HashSet::new();
-    collect_module_bindings(root, source, &mut renamed, &mut other, 0);
-    if renamed.is_empty() {
+    if module.renamed.is_empty() {
         return std::collections::HashMap::new();
     }
     scan.module_level
         .iter()
-        .filter(|(_, name)| !other.contains(*name) && !scan.globals.contains(name))
-        .filter_map(|&(id, name)| {
-            let imports = renamed.get(name)?;
+        .filter(|(_, name, _)| {
+            !module.definitions.contains(*name)
+                && !module.values.contains(*name)
+                && !scan.globals.contains(name)
+        })
+        .filter_map(|&(id, name, _)| {
+            let imports = module.renamed.get(name)?;
             let (export, module) = imports.iter().next().filter(|_| imports.len() == 1)?;
             Some((id, (export.clone(), module.clone())))
         })
         .collect()
 }
 
+/// The bare calls of `scan` that run a built-in ([`python_builtin_call`]),
+/// by node id.
+fn builtin_calls(
+    scan: &ScopeScan,
+    module: &PyModuleScope,
+    defined: &PyDefined,
+) -> std::collections::HashSet<usize> {
+    scan.module_level
+        .iter()
+        .filter(|&&(_, name, class_bound)| {
+            !class_bound && module.read(name, defined) == PyModuleRead::Builtin
+        })
+        .map(|&(id, _, _)| id)
+        .collect()
+}
+
 /// The names the module scope binds, as [`collect_scope_bindings`] reads a
 /// function's: `from m import a as b` (`a` ≠ `b`) into `renamed` as `b` →
-/// (`a`, `m`), every other binding into `other`.
+/// (`a`, `m`), a `def`, `class` or other import into `definitions`, any
+/// other binding into `values`, and whether a star import is among them.
 fn collect_module_bindings(
     node: tree_sitter::Node,
     source: &str,
-    renamed: &mut std::collections::HashMap<String, std::collections::HashSet<(String, String)>>,
-    other: &mut std::collections::HashSet<String>,
+    module: &mut PyModuleScope,
     depth: usize,
 ) {
     if depth > MAX_SUBTREE_DEPTH {
@@ -370,13 +549,15 @@ fn collect_module_bindings(
         if let Some(t) = node.child_by_field_name(field) {
             let mut names = Vec::new();
             pattern_names(t, source, &mut names);
-            other.extend(names);
+            module.values.extend(names);
         }
     };
     match node.kind() {
         "function_definition" | "class_definition" => {
             if let Some(name) = node.child_by_field_name("name") {
-                other.insert(node_text(&name, source).to_string());
+                module
+                    .definitions
+                    .insert(node_text(&name, source).to_string());
             }
             return;
         }
@@ -386,11 +567,14 @@ fn collect_module_bindings(
         | "dictionary_comprehension"
         | "generator_expression" => return,
         "import_statement" | "import_from_statement" => {
-            let module = (node.kind() == "import_from_statement")
+            let from = (node.kind() == "import_from_statement")
                 .then(|| node.child_by_field_name("module_name"))
                 .flatten()
                 .map(|m| node_text(&m, source));
             let mut cursor = node.walk();
+            module.star |= node
+                .named_children(&mut cursor)
+                .any(|c| c.kind() == "wildcard_import");
             for name in node.children_by_field_name("name", &mut cursor) {
                 match name.kind() {
                     "aliased_import" => {
@@ -402,28 +586,39 @@ fn collect_module_bindings(
                         };
                         let (imported, alias) =
                             (node_text(&imported, source), node_text(&alias, source));
-                        match module {
+                        match from {
                             Some(m) if imported != alias => {
-                                renamed
+                                module
+                                    .renamed
                                     .entry(alias.to_string())
                                     .or_default()
                                     .insert((imported.to_string(), m.to_string()));
                             }
                             _ => {
-                                other.insert(alias.to_string());
+                                module.definitions.insert(alias.to_string());
                             }
                         }
                     }
                     // `import a.b` binds `a`; `from m import a` binds `a`.
                     "dotted_name" => {
                         if let Some(first) = name.named_child(0) {
-                            other.insert(node_text(&first, source).to_string());
+                            module
+                                .definitions
+                                .insert(node_text(&first, source).to_string());
                         }
                     }
                     _ => {}
                 }
             }
             return;
+        }
+        // `Command = commands.Command`, `TimeoutError = TimeoutError`: the
+        // value is the definition of that name, as for a parameter default
+        // (`heappush=heapq.heappush`, [`parameter_bindings`]).
+        "assignment" if module_alias(node, source).is_some() => {
+            if let Some(alias) = module_alias(node, source) {
+                module.definitions.insert(alias.to_string());
+            }
         }
         "assignment" | "augmented_assignment" | "for_statement" => targets("left"),
         "named_expression" => targets("name"),
@@ -432,8 +627,23 @@ fn collect_module_bindings(
     }
     let mut cursor = node.walk();
     for c in node.named_children(&mut cursor) {
-        collect_module_bindings(c, source, renamed, other, depth + 1);
+        collect_module_bindings(c, source, module, depth + 1);
     }
+}
+
+/// `X` of an assignment `X = X` or `X = a.b.X`.
+fn module_alias<'s>(assignment: tree_sitter::Node, source: &'s str) -> Option<&'s str> {
+    let left = assignment
+        .child_by_field_name("left")
+        .filter(|l| l.kind() == "identifier")?;
+    let right = assignment.child_by_field_name("right")?;
+    let spelled = match right.kind() {
+        "identifier" => right,
+        "attribute" => right.child_by_field_name("attribute")?,
+        _ => return None,
+    };
+    let name = node_text(&left, source);
+    (node_text(&spelled, source) == name).then_some(name)
 }
 
 /// What `function`'s own scope binds, computed once per function.
@@ -609,6 +819,15 @@ fn collect_scope_bindings(
     }
 }
 
+/// Whether `node` is the `attribute` field of an `attribute` (`b` of `a.b`).
+fn is_attribute_tail(node: &tree_sitter::Node) -> bool {
+    node.parent().is_some_and(|p| {
+        p.kind() == "attribute"
+            && p.child_by_field_name("attribute")
+                .is_some_and(|a| a.id() == node.id())
+    })
+}
+
 /// Whether `node` sits in a class body with no function in between.
 fn in_class_body(node: tree_sitter::Node) -> bool {
     let mut at = node.parent();
@@ -708,7 +927,12 @@ pub(super) fn extract_python_type_reference(
         return None;
     }
     let name = node_text(node, source);
-    if name.is_empty() || name == "_" || PYTHON_TYPE_REFERENCE_NOISE.contains(&name) {
+    if name.is_empty()
+        || name == "_"
+        || PYTHON_TYPE_REFERENCE_NOISE.contains(&name)
+        // `Type` of `mod.Type` is an attribute of `mod`, not a bare read.
+        || (!is_attribute_tail(node) && py_read_names_no_definition(*node, name))
+    {
         return None;
     }
     Some(ParsedRelation {
@@ -796,7 +1020,9 @@ pub(super) fn extract_python_value_reference(
     if name.is_empty() || name == "_" {
         return None;
     }
-    if py_enclosing_fn_local_names(node, source).contains(name) {
+    if py_enclosing_fn_local_names(node, source).contains(name)
+        || py_read_names_no_definition(*node, name)
+    {
         return None;
     }
     // A decorator sits before its `def`, where the walk's scope is still the
@@ -865,6 +1091,28 @@ fn py_enclosing_fn_local_names(
         cur = n.parent();
     }
     names
+}
+
+/// Whether the bare `name` read at `node` names no project definition by
+/// Python's scope chain (D#905): a value some scope around it binds (a
+/// parameter, an assignment, `for`, `with … as`, `except … as`, `:=` or
+/// comprehension target, a lambda's parameter), or at module level a value
+/// the module binds or a built-in nothing in the file shadows
+/// ([`PyModuleRead`]). Bound by name such a read took every namesake:
+/// `sum(len(m) for m in marks)` bound 283 fixture methods `C.m`,
+/// `isinstance(x, int)` and `@property` the standard library's namesakes.
+///
+/// The chain is the one bare calls are read by ([`PyScopes::read`]). A
+/// nested `def` / `class`, an import, or a binding of the class body the
+/// read is written in leaves the name to the by-name resolution it had.
+fn py_read_names_no_definition(node: tree_sitter::Node, name: &str) -> bool {
+    match PY_SCOPES.with(|s| s.borrow().read(node.start_byte(), name)) {
+        (_, true) | (PyScopeRead::Definition, _) => false,
+        (PyScopeRead::Value, _) => true,
+        (PyScopeRead::Module, _) => PY_MODULE.with(|m| {
+            PY_DEFINED.with(|d| m.borrow().read(name, &d.borrow()) != PyModuleRead::MaybeDefinition)
+        }),
+    }
 }
 
 /// Walk a function body collecting assignment / for TARGET names (the `left` field),

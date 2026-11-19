@@ -914,6 +914,11 @@ fn extract_python_call(ctx: &CallCtx, results: &mut Vec<ParsedRelation>) {
     // Undefined callees (print, os.path.join, …) drop at Phase-2 same-language
     // resolution, so this only adds edges to defined same-project functions.
     let scope = ctx.scope_or_module();
+    // `set()` that nothing in the file shadows runs the built-in: no project
+    // definition is its callee (D#905, `python.rs`).
+    if super::python::python_builtin_call(node) {
+        return;
+    }
     // `b()` through `from m import a as b` calls `a` of module `m` (D#726,
     // `python.rs`): bound in `m`'s files, never by name.
     if let Some((export, module)) = super::python::python_renamed_import_call(node) {
