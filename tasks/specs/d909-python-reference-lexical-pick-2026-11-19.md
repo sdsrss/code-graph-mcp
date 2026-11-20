@@ -227,4 +227,4 @@ L2：全量索引的边变化（删掉错边，`fix:`），`INDEX_VERSION` 145 �
 - [x] 修复提交 c52b115c 与第 2 轮盲审：两个 MEDIUM，问用户，选交集
 - [x] 交集修复提交 f06f5e96 与第 3 轮盲审：一个 MEDIUM（耗时），合表原型已测，等用户选
 - [x] 按用户的选择处理 MEDIUM-1、LOW-1 与 Not covered 措辞：e5e00e79，验证见上节
-- [ ] 发版
+- [x] 发版 v0.204.0（2026-11-20，tag 在 71377057）：main CI 7/7（run 44726813542；macOS、Windows 日志里三个作用域测试都是 ok）；Release 10/10（run 44729360311，32 分 57 秒）；release notes 用 CHANGELOG 这一节；npm 六个包 0.204.0，`_npmUser` 都是 GitHub Actions、trustedPublisher github；Release 14 个资产；真装 `added 2 packages`，平台包自己的二进制 `code-graph-mcp 0.204.0`（md5 829f0691）；信号 3：与 e5e00e79 的 `git archive` 构建在五个语料上边和待解析行全同（差异 0），嵌套默认参数例子不出边。插件干净克隆清单 Skills 2 · Agents 1 · Hooks 6 · MCP 1。第 3 轮评审脚本收进 `tasks/d905-scope-oracle/review-d909-r3/`，`mkcost3.py` 逐字节重建 a1/a5/a7。

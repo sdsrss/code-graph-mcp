@@ -1,0 +1,62 @@
+IF = "src/indexer/pipeline/index_files.rs"
+TS = "src/parser/treesitter.rs"
+MUTANTS = [
+ ("M01 no continue on empty intersection", IF,
+  "                    if had_local && visible.is_empty() {\n                        continue;\n                    }\n", ""),
+ ("M02 no second pick", IF,
+  "let before = (rel.relation == REL_CALLS).then(|| innermost(&pf.call_scopes));",
+  "let before: Option<Option<usize>> = None;"),
+ ("M03 second pick for references too", IF,
+  "let before = (rel.relation == REL_CALLS).then(", "let before = (rel.relation == REL_CALLS || rel.relation == REL_REFERENCES).then("),
+ ("M04 second innermost from node_scopes", IF,
+  ".then(|| innermost(&pf.call_scopes));", ".then(|| innermost(&pf.node_scopes));"),
+ ("M05 second keeps reads node_scopes", IF,
+  "keeps(&pf.call_scopes, before, id)", "keeps(&pf.node_scopes, before, id)"),
+ ("M06 call_scope = body", TS,
+  "return (Some(body), Some(whole));", "return (Some(body), Some(body));"),
+ ("M07 lexical_scope = whole", TS,
+  "return (Some(body), Some(whole));", "return (Some(whole), Some(whole));"),
+ ("M08 python class gets call_scope", TS,
+  "                    call_scope: None,\n                });\n                extract_children(",
+  "                    call_scope: (language == \"python\").then(|| lexical_scopes(&node, language).1).flatten(),\n                });\n                extract_children("),
+ ("M09 global/nonlocal clears call_scope", TS,
+  "            node.lexical_scope = None;\n        }", "            node.lexical_scope = None;\n            node.call_scope = None;\n        }"),
+ ("M10 keeps drops sees()", IF,
+  "(Some(innermost), Some(scope)) => scope.sees(call.at) && scope.width() == innermost,",
+  "(Some(innermost), Some(scope)) => scope.width() == innermost,"),
+ ("M11 innermost drops sees()", IF,
+  "            .filter(|scope| scope.sees(call.at))\n", ""),
+ ("M12 no-innermost drops methods", IF,
+  "(None, _) => true,", "(None, _) => !pf.method_ids.contains(id),"),
+ ("M13 unscoped always kept", IF,
+  "(Some(_), None) => call.reaches_members || !pf.method_ids.contains(id),", "(Some(_), None) => true,"),
+ ("M14 call_scopes filled from lexical_scope", IF,
+  "if let Some(scope) = pn.call_scope {", "if let Some(scope) = pn.lexical_scope {"),
+ ("M15 JS arrow call_scope None", TS,
+  "                    lexical_scope,\n                    call_scope,\n", "                    lexical_scope,\n                    call_scope: { let _ = call_scope; None },\n"),
+ ("M16 rust block call_scope None", TS,
+  "\"rust\" => return both(LexicalScope::Within(n.start_byte(), n.end_byte())),",
+  "\"rust\" => return (Some(LexicalScope::Within(n.start_byte(), n.end_byte())), None),"),
+ ("M17 file-level call_scope None", TS,
+  "    both(LexicalScope::File)\n}", "    (Some(LexicalScope::File), None)\n}"),
+ ("M18 JS lexical_declaration call_scope None", TS,
+  "                        return both(LexicalScope::Within(n.start_byte(), n.end_byte()));",
+  "                        return (Some(LexicalScope::Within(n.start_byte(), n.end_byte())), None);"),
+]
+MUTANTS.append(("M01b no continue on empty intersection (guard false)", IF,
+  "if had_local && visible.is_empty() {", "if had_local && visible.is_empty() && false {"))
+MUTANTS.append(("R2M03 body range for every language", TS,
+  "Some(body) if language == \"python\" => {", "Some(body) => {"))
+MUTANTS.append(("R2M08 first name of a global statement only", TS,
+  "            for i in 0..n.named_child_count() {\n                if let Some(c) = n.named_child(i).filter(|c| c.kind() == \"identifier\") {",
+  "            for i in 0..n.named_child_count().min(1) {\n                if let Some(c) = n.named_child(i).filter(|c| c.kind() == \"identifier\") {"))
+MUTANTS.append(("R2M09 File scope cleared too", TS,
+  "if matches!(node.lexical_scope, Some(LexicalScope::Within(..)))", "if node.lexical_scope.is_some()"))
+MUTANTS.append(("R2M10 first global/nonlocal statement only", TS,
+  "                    rebound.insert(node_text(&c, source));\n                }\n            }\n        }\n",
+  "                    rebound.insert(node_text(&c, source));\n                }\n            }\n            if !rebound.is_empty() {\n                break 'walk;\n            }\n        }\n"))
+MUTANTS.append(("M07b lexical_scope = whole (body read)", TS,
+  "return (Some(body), Some(whole));", "return (Some(if body == whole { body } else { whole }), Some(whole));"))
+MUTANTS.append(("M13b unscoped always kept (method_ids read)", IF,
+  "(Some(_), None) => call.reaches_members || !pf.method_ids.contains(id),",
+  "(Some(_), None) => call.reaches_members || !pf.method_ids.contains(id) || true,"))
