@@ -203,6 +203,16 @@ L2：全量索引的边变化（删掉错边，`fix:`），`INDEX_VERSION` 145 �
 
 按评审规则这是第 3 轮仍有 MEDIUM，深度到顶，交给用户决定。
 
+## 用户的决定与合表修复（e5e00e79）
+
+用户选了推荐的“合表后直接发”（2026-11-20）：改用合表，修 LOW-1 注释和 Not covered 措辞，用逐边差分验证，不开第 4 轮评审。
+
+- 代码：`FileParsed.node_scopes: HashMap<i64, NodeScopes>`，`NodeScopes = (Option<LexicalScope>, Option<LexicalScope>)`；`visible_same_file_targets` 一次遍历算两个最内层宽度，过滤时每个候选查一次表；判定式与 f06f5e96 相同。空交集 `continue` 的注释改为延后那轮同文件层不看作用域；测试改名 `a_python_call_its_scopes_rule_out_binds_nothing`。
+- Not covered：第 3 条改为“a name or a call `h` that sees another of the file's definitions of `h` does not bind it”；第 4 条加上“嵌套在定义了自己 `make` 的函数里的默认参数”和 `nonlocal` 的例子。两例在 0.203.0、新构建和 CPython 跟踪上核对过：嵌套默认参数 0.203.0 绑 `f@8 -> make@9`（错），新构建不绑，CPython 运行 `make@6`；`nonlocal` 两版都绑 `h@6`，CPython 调用 `h@4`。
+- 提交 e5e00e79（pre-commit：`cargo test` 2,539 通过 / 0 失败 / 7 忽略，fmt、两条 clippy；第一次被 `index_version_guard` 拦下，因为抽取指纹覆盖 `src/indexer/pipeline/*.rs`，重录后 7/7，`INDEX_VERSION` 仍 146）。
+- `git archive` 构建 md5 3a05a093。与 f06f5e96 逐边相同：五个语料（标准库 103,830、nltk 25,585、flask 3,411、本仓库 22,305、私有应用 73,795 条边，两边独有 0，零入边数相同）；`parity909.py` 7 组 0 个分歧步；`subset_enum.py` gen_scope 1,000×6、fuzz_seq 500×4、gen_review 500×4、gen_pymove 500×4、gen_js 400×4、gen_rs 200×4、gen_dart 200×4，共 15,200 个状态，删 0、多 0、错误 0。所以 CHANGELOG 的语料、零入边、dead-code 数字不变。
+- 耗时（0.203.0 → e5e00e79，3 次交替均值，a5/a6 各 1 次）：标准库 2.96 → 2.94 s；daagu 3.92 → 3.97 s；c14 7.94 → 8.10 s；480 KB 注解 0.99 → 1.12 s；120 KB 嵌套调用 11.06 → 11.21 s；k1b 0.59 → 1.08 s；k1bd 1.57 → 1.58 s；k1c 0.93 → 1.73 s；k2b 0.67 → 0.98 s；g1 4.24 → 4.29 s；g2d 5.42 → 2.83 s；a1 8.28 → 9.61 s；a7（JS）8.25 → 9.53 s；a5 55.64 → 64.40 s；a6 47.38 → 55.75 s（f06f5e96 分别是 12.29、12.11、82.1、67.0 s）。CHANGELOG 耗时段换成这组数字，并写上 a1/a7/a5。
+
 ## 进度
 
 - [x] RED 测试
@@ -216,5 +226,5 @@ L2：全量索引的边变化（删掉错边，`fix:`），`INDEX_VERSION` 145 �
 - [x] 发版前盲审第 1 轮：见上节，修复提交见下
 - [x] 修复提交 c52b115c 与第 2 轮盲审：两个 MEDIUM，问用户，选交集
 - [x] 交集修复提交 f06f5e96 与第 3 轮盲审：一个 MEDIUM（耗时），合表原型已测，等用户选
-- [ ] 按用户的选择处理 MEDIUM-1、LOW-1 与 Not covered 措辞
+- [x] 按用户的选择处理 MEDIUM-1、LOW-1 与 Not covered 措辞：e5e00e79，验证见上节
 - [ ] 发版

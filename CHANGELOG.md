@@ -96,16 +96,22 @@ private application 10,681 → 10,686. `dead-code --min-lines 1 --no-ignore`
 returns the same definitions as 0.203.0 on all five.
 
 A full index (means of 3 runs, alternating with 0.203.0) took 2.96 s and
-now 2.99 s on the standard library, 3.94 s and now 3.97 s on the private
+now 2.94 s on the standard library, 3.92 s and now 3.97 s on the private
 application. Files written to stress the scope reads: 480 KB of
-annotations nested 150 generics deep, 1.04 s and now 1.16 s; 988 KB of
-functions nested 100 deep with 20 annotated parameters each, 8.13 s and
-now 8.23 s; 120 KB of calls nested 150 deep as arguments, 11.59 s and now
-11.79 s. A class now looks for the function around it as a `def` did:
-12,500 classes under 30 nested `if`s (990 KB) took 0.62 s and now 1.13 s,
-21,000 one-line classes under 30 `if`s 0.97 s and now 1.82 s, and a
-class at each of 30 nesting levels 0.72 s and now 1.02 s; the first file
-with `def`s instead of classes took 1.62 s and now 1.63 s.
+annotations nested 150 generics deep, 0.99 s and now 1.12 s; 988 KB of
+functions nested 100 deep with 20 annotated parameters each, 7.94 s and
+now 8.10 s; 120 KB of calls nested 150 deep as arguments, 11.06 s and now
+11.21 s. A class now looks for the function around it as a `def` did:
+12,500 classes under 30 nested `if`s (990 KB) took 0.59 s and now 1.08 s,
+21,000 one-line classes under 30 `if`s 0.93 s and now 1.73 s, and a
+class at each of 30 nesting levels 0.67 s and now 0.98 s; the first file
+with `def`s instead of classes took 1.57 s and now 1.58 s. A bare call
+now picks by two scopes, which costs most where every call sees many
+definitions of its name: 16,000 functions that each define and call their
+own `h` (901 KB) took 8.28 s and now 9.61 s, the same in JavaScript
+(869 KB) 8.25 s and now 9.53 s, and 40,000 of them in 1 MB (one run each)
+55.6 s and now 64.4 s. In both versions that time grows with the square
+of the number of same-named definitions in a file.
 
 ### Not covered
 
