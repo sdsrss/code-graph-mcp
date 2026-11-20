@@ -45,7 +45,7 @@ pub const INSTRUCTIONS_NOISY: &str = concat!(
     "module map \u{2192} `code-graph-mcp overview <dir>`; symbol source \u{2192} `code-graph-mcp show X`; text search with AST context \u{2192} `code-graph-mcp grep \"pat\" [paths]` (-i/-w/-F/-l, -c count, -t <lang>/-g <glob> scope, -A/-B/-C ctx, -M col-cap; grep exits).\n",
     "MCP tools (same data; load via ToolSearch): get_call_graph, get_ast_node include_impact=true, find_references, semantic_code_search for concept search without an exact symbol.\n",
     "The graph holds the calls it could resolve: dynamic dispatch, reflection and unresolved imports leave no edge, so an empty caller list is not proof that nothing calls X.\n",
-    "Still Grep for exact strings/regex; still Read files you will edit.\n",
+    "Still grep for exact strings/regex; still Read files you will edit.\n",
     "Diagnostics: `code-graph-mcp health-check`."
 );
 

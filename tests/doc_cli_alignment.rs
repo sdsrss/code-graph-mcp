@@ -933,3 +933,15 @@ fn resident_instructions_name_affected() {
         "quiet instructions must name `affected`"
     );
 }
+
+/// claudemd prompt audit F14 (2026-11-20): Claude Code builds with embedded
+/// search tools offer no Grep tool; lower-case `grep` names the shell command
+/// and the tool alike.
+#[test]
+fn resident_instructions_point_literal_search_at_grep() {
+    assert!(
+        INSTRUCTIONS_NOISY
+            .contains("Still grep for exact strings/regex; still Read files you will edit.\n"),
+        "noisy instructions must point literal-string search at grep"
+    );
+}

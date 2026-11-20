@@ -97,7 +97,7 @@ change breaks, every use of a symbol — one call replaces rounds of Grep + Read
 
 Unresolved calls (dynamic dispatch, reflection, unresolved imports) leave no edge, so
 an empty answer is not proof: confirm with grep before deleting or renaming.
-Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.
+Still use grep for literal strings/regex in non-code files; still Read files you'll edit.
 Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`
 <!-- code-graph-mcp:end -->"#;
 

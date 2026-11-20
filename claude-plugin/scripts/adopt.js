@@ -125,7 +125,7 @@ function buildBlock(projectType = 'generic') {
     '',
     'Unresolved calls (dynamic dispatch, reflection, unresolved imports) leave no edge, so',
     'an empty answer is not proof: confirm with grep before deleting or renaming.',
-    "Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.",
+    "Still use grep for literal strings/regex in non-code files; still Read files you'll edit.",
     'Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`',
   ].join('\n');
   return `${SENTINEL_BEGIN}\n${body}\n${SENTINEL_END}`;

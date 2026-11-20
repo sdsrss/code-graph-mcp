@@ -127,6 +127,16 @@ test('buildBlock generic: v2 sentinel + 8 base rows + pointer', () => {
   assert.ok(!block.includes('trace'), 'generic has no HTTP-trace row');
 });
 
+test('buildBlock points literal-string search at grep, which exists with or without a Grep tool', () => {
+  // Claude Code builds with embedded search tools offer no Grep tool; `grep`
+  // names the shell command and the tool alike (claudemd prompt audit F14).
+  const lines = buildBlock('generic').split('\n');
+  assert.ok(
+    lines.includes("Still use grep for literal strings/regex in non-code files; still Read files you'll edit."),
+    lines.join('\n'),
+  );
+});
+
 test('buildBlock web-rs inserts the HTTP-route → handler row', () => {
   const block = buildBlock('web-rs');
   assert.ok(block.includes('HTTP route → handler chain'), 'web project gets trace row');
