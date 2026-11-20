@@ -301,11 +301,12 @@ struct FileParsed {
     // Rust function id → its parameters, for this file's functions: the
     // batch-time half of `resolve::rust_call_shape_admits`.
     rust_fn_shapes: HashMap<i64, super::resolve::RustFnShape>,
-    // Node id → where a bare call sees it, for this file's lexical definitions
-    // (D#714, `visible_same_file_targets`).
-    node_scopes: HashMap<i64, LexicalScope>,
-    // The same as a bare call read it up to 0.203.0 (`ParsedNode::call_scope`).
-    call_scopes: HashMap<i64, LexicalScope>,
+    // Node id → where a name sees it and where a bare call saw it up to
+    // 0.203.0, for this file's lexical definitions (D#714, D#909,
+    // `visible_same_file_targets`). One map: a bare call looks each candidate
+    // up once for both picks (pre-tag review of 0.204.0, round 3: with two
+    // maps a 1 MB file of nested calls took 82 s, against 55 s in 0.203.0).
+    node_scopes: HashMap<i64, NodeScopes>,
     // This file's `method` nodes, for the same filter: a set, because it is
     // asked once per candidate of every bare call (pre-tag review of 0.187.0,
     // MEDIUM-1: a scan of `node_ids` made N calls among N same-named methods
@@ -736,8 +737,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         let mut node_qualified_names: Vec<Option<String>> = Vec::new();
         let mut node_types: Vec<String> = Vec::new();
         let mut node_lines: Vec<(u32, u32)> = Vec::new();
-        let mut node_scopes: HashMap<i64, LexicalScope> = HashMap::new();
-        let mut call_scopes: HashMap<i64, LexicalScope> = HashMap::new();
+        let mut node_scopes: HashMap<i64, NodeScopes> = HashMap::new();
         let mut method_ids: HashSet<i64> = HashSet::new();
         let mut rust_fns: Vec<super::resolve::RustFnRow> = Vec::new();
 
@@ -794,11 +794,8 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             node_qualified_names.push(pn.qualified_name.clone());
             node_types.push(pn.node_type.clone());
             node_lines.push((pn.start_line, pn.end_line));
-            if let Some(scope) = pn.lexical_scope {
-                node_scopes.insert(node_id, scope);
-            }
-            if let Some(scope) = pn.call_scope {
-                call_scopes.insert(node_id, scope);
+            if pn.lexical_scope.is_some() || pn.call_scope.is_some() {
+                node_scopes.insert(node_id, (pn.lexical_scope, pn.call_scope));
             }
             if pn.node_type == "method" {
                 method_ids.insert(node_id);
@@ -834,7 +831,6 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             node_lines,
             rust_fn_shapes,
             node_scopes,
-            call_scopes,
             method_ids,
         });
     }
@@ -2698,7 +2694,9 @@ fn resolve_batch_relations(
                     let had_local = !local.is_empty();
                     let visible = visible_same_file_targets(local, rel, pf);
                     // The scopes ruled every same-file definition out: no
-                    // edge, and no other file's (Python sees one of these).
+                    // edge. Deferred, the call would reach the deferred
+                    // pass's same-file tier, which binds every one of them
+                    // and reads no scope.
                     if had_local && visible.is_empty() {
                         continue;
                     }
@@ -2859,43 +2857,52 @@ fn resolve_batch_relations(
 /// definition it sees is always kept.
 ///
 /// A Python name read as a value or an annotation picks the same way (D#909).
-/// A bare call picks twice, by `node_scopes` and by the scopes it read up to
-/// 0.203.0 (`call_scopes`), and keeps what both keep: its targets are a
-/// subset of 0.203.0's, and may be none of them (a default `make()` whose
-/// `def` nests a `make` bound that one, where Python runs the module's).
+/// A bare call picks twice, by the scope a name sees a definition in and by
+/// the scope it read up to 0.203.0 ([`NodeScopes`]), and keeps what both
+/// keep: its targets are a subset of 0.203.0's, and may be none of them (a
+/// default `make()` whose `def` nests a `make` bound that one, where Python
+/// runs the module's).
 ///
 /// [`BareCall`]: crate::parser::treesitter::BareCall
 fn visible_same_file_targets(targets: Vec<i64>, rel: &ParsedRelation, pf: &FileParsed) -> Vec<i64> {
     let Some(call) = rel.call_at else {
         return targets;
     };
-    let innermost = |scopes: &HashMap<i64, LexicalScope>| {
-        targets
-            .iter()
-            .filter_map(|id| scopes.get(id))
-            .filter(|scope| scope.sees(call.at))
-            .map(|scope| scope.width())
-            .min()
-    };
-    let keeps = |scopes: &HashMap<i64, LexicalScope>, innermost: Option<usize>, id: &i64| {
-        let scope = scopes.get(id);
-        match (innermost, scope) {
-            (None, _) => true,
-            (Some(innermost), Some(scope)) => scope.sees(call.at) && scope.width() == innermost,
-            (Some(_), None) => call.reaches_members || !pf.method_ids.contains(id),
+    let picks_twice = rel.relation == REL_CALLS;
+    // The width of the innermost scope seen so far that sees the call.
+    let narrower = |innermost: Option<usize>, scope: Option<LexicalScope>| match scope {
+        Some(scope) if scope.sees(call.at) => {
+            Some(innermost.map_or(scope.width(), |w: usize| w.min(scope.width())))
         }
+        _ => innermost,
     };
-    let now = innermost(&pf.node_scopes);
-    let before = (rel.relation == REL_CALLS).then(|| innermost(&pf.call_scopes));
+    let (mut now, mut before) = (None, None);
+    for id in &targets {
+        if let Some(&(scope, call_scope)) = pf.node_scopes.get(id) {
+            now = narrower(now, scope);
+            before = narrower(before, call_scope);
+        }
+    }
+    let keeps = |innermost: Option<usize>, scope: Option<LexicalScope>, id: &i64| match (
+        innermost, scope,
+    ) {
+        (None, _) => true,
+        (Some(innermost), Some(scope)) => scope.sees(call.at) && scope.width() == innermost,
+        (Some(_), None) => call.reaches_members || !pf.method_ids.contains(id),
+    };
     targets
-        .iter()
+        .into_iter()
         .filter(|id| {
-            keeps(&pf.node_scopes, now, id)
-                && before.is_none_or(|before| keeps(&pf.call_scopes, before, id))
+            let (scope, call_scope) = pf.node_scopes.get(id).copied().unwrap_or_default();
+            keeps(now, scope, id) && (!picks_twice || keeps(before, call_scope, id))
         })
-        .copied()
         .collect()
 }
+
+/// A lexical definition's scope (`ParsedNode::lexical_scope`) and where a bare
+/// call saw it up to 0.203.0 (`ParsedNode::call_scope`); outside Python the two
+/// are the same.
+type NodeScopes = (Option<LexicalScope>, Option<LexicalScope>);
 
 fn cpp_implicit_this_members(
     language: &str,

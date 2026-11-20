@@ -121,13 +121,15 @@ with `def`s instead of classes took 1.62 s and now 1.63 s.
 - `global` and `nonlocal` are read per file and by name: once a file
   declares `h` either way, every `h` defined in a function stays a
   candidate for every name `h` in the file. A `def h` in a class body that
-  declares `global h` is still read as a method, so a function's `h` that
-  sees a definition of its own no longer binds it.
+  declares `global h` is still read as a method, so a name or a call `h`
+  that sees another of the file's definitions of `h` does not bind it.
 - A bare call binds only what 0.203.0's rule bound as well. Where that rule
   bound a wrong definition and the one its scope sees is another, the call
-  now binds neither (`def f(x=make())` above), and where it missed the
-  definition, the call still misses it (`h()` in one function, the
-  `def h()` that another declares `global h`).
+  now binds neither (`def f(x=make())` above, also inside a function that
+  defines a `make` of its own), and where it missed the definition, the
+  call still misses it (`h()` in one function and the `def h()` of another
+  that declares `global h`; `h()` in a function and the `def h()` of a
+  nested one that declares `nonlocal h`).
 - Four nested `wrapper` functions of the standard library's `functools.py`
   (three in `_lru_cache_wrapper`, one in `singledispatch`) lost their only
   incoming edges, which came from another function, and now have none: the

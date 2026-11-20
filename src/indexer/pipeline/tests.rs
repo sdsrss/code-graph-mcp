@@ -17317,11 +17317,13 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
 }
 
 /// Pre-tag review of 0.204.0, round 2: a bare call whose scopes rule out
-/// every same-file definition of its name binds nothing, not another file's
-/// namesake: the name is one of its own file's (here the module's `make`,
-/// which the scopes a call read up to 0.203.0 hide behind the nested one).
+/// every same-file definition of its name binds nothing (here the module's
+/// `make`, which the scopes a call read up to 0.203.0 hide behind the nested
+/// one). Round 3: deferred, the call would reach the deferred pass's
+/// same-file tier, which reads no scope and binds both `make`s; `lib.py`'s
+/// namesake stays unbound either way.
 #[test]
-fn a_python_call_its_scopes_rule_out_binds_no_other_file() {
+fn a_python_call_its_scopes_rule_out_binds_nothing() {
     let (_p, _d, db) = fresh_index_of(&[
         (
             "m.py",
