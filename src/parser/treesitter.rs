@@ -22,9 +22,17 @@ pub struct ParsedNode {
     pub param_types: Option<String>,
     /// True if this node is inside a test context (#[cfg(test)], mod tests, #[test], etc.)
     pub is_test: bool,
-    /// Where a bare call sees this definition ([`lexical_scope`]); None when it
-    /// is no lexical binding. In memory only, never stored.
+    /// Where a bare call or a Python name sees this definition
+    /// ([`lexical_scopes`]); None when it is no lexical binding. In memory
+    /// only, never stored.
     pub lexical_scope: Option<LexicalScope>,
+    /// Where a bare call saw it up to 0.203.0: a Python `def`'s whole node
+    /// rather than its body, no scope for a Python `class`, nothing for
+    /// `global`/`nonlocal`. A call keeps only the targets both scopes allow,
+    /// so D#909's scopes only take from what that rule chose (pre-tag review
+    /// of 0.204.0, round 2: reading `lexical_scope` alone, a call gained
+    /// edges Python never makes). In memory only, never stored.
+    pub call_scope: Option<LexicalScope>,
 }
 
 /// Where a definition binds its name for a bare call (D#714): what tells
@@ -57,7 +65,7 @@ impl LexicalScope {
 }
 
 /// The function-like kinds (an anonymous one too) and the member containers of
-/// a language [`lexical_scope`] covers.
+/// a language [`lexical_scopes`] covers.
 fn lexical_scope_kinds(
     language: &str,
 ) -> Option<(&'static [&'static str], &'static [&'static str])> {
@@ -97,37 +105,48 @@ fn lexical_scope_kinds(
 /// to its function.
 ///
 /// A Python `def` binds what its body defines in that body only: its
-/// defaults, annotations and decorators run around it, so the scope is the
-/// body's range, not the `def`'s (pre-tag review of 0.204.0: `def f(x=Row())`
-/// beside a module `class Row` bound only the `Row` that `f` defines).
-pub(crate) fn lexical_scope(def: &tree_sitter::Node, language: &str) -> Option<LexicalScope> {
-    let (functions, members) = lexical_scope_kinds(language)?;
+/// defaults, annotations and decorators run around it, so the first scope is
+/// the body's range, not the `def`'s (pre-tag review of 0.204.0: `def f(x=Row())`
+/// beside a module `class Row` bound only the `Row` that `f` defines). The
+/// second is the scope a bare call read up to 0.203.0, the whole `def`
+/// ([`ParsedNode::call_scope`]); the two differ only there.
+pub(crate) fn lexical_scopes(
+    def: &tree_sitter::Node,
+    language: &str,
+) -> (Option<LexicalScope>, Option<LexicalScope>) {
+    let both = |scope: LexicalScope| (Some(scope), Some(scope));
+    let Some((functions, members)) = lexical_scope_kinds(language) else {
+        return (None, None);
+    };
     let mut cur = def.parent();
     while let Some(n) = cur {
         if functions.contains(&n.kind()) {
-            let range = match n.child_by_field_name("body") {
-                Some(body) if language == "python" => body,
-                _ => n,
+            let whole = LexicalScope::Within(n.start_byte(), n.end_byte());
+            let body = match n.child_by_field_name("body") {
+                Some(body) if language == "python" => {
+                    LexicalScope::Within(body.start_byte(), body.end_byte())
+                }
+                _ => whole,
             };
-            return Some(LexicalScope::Within(range.start_byte(), range.end_byte()));
+            return (Some(body), Some(whole));
         }
         if members.contains(&n.kind()) {
-            return None;
+            return (None, None);
         }
         if is_nested_block(&n, language, functions) {
             match language {
-                "rust" => return Some(LexicalScope::Within(n.start_byte(), n.end_byte())),
+                "rust" => return both(LexicalScope::Within(n.start_byte(), n.end_byte())),
                 _ if def.kind() == "variable_declarator" => {
                     if def.parent().map(|p| p.kind()) == Some("lexical_declaration") {
-                        return Some(LexicalScope::Within(n.start_byte(), n.end_byte()));
+                        return both(LexicalScope::Within(n.start_byte(), n.end_byte()));
                     }
                 }
-                _ => return None,
+                _ => return (None, None),
             }
         }
         cur = n.parent();
     }
-    Some(LexicalScope::File)
+    both(LexicalScope::File)
 }
 
 /// A definition whose first container going up is a function of
@@ -172,7 +191,7 @@ fn is_nested_block(n: &tree_sitter::Node, language: &str, functions: &[&str]) ->
             .is_some_and(|p| functions.contains(&p.kind()) || NAMESPACES.contains(&p.kind()))
 }
 
-/// A bare call in a language [`lexical_scope`] covers (D#714): where it starts,
+/// A bare call in a language [`lexical_scopes`] covers (D#714): where it starts,
 /// for the resolver to pick the same-file definitions it sees, and whether a
 /// class or object member is a name it can reach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,7 +200,7 @@ pub struct BareCall {
     pub reaches_members: bool,
 }
 
-/// D#714: [`BareCall`] for a call in a language [`lexical_scope`] covers.
+/// D#714: [`BareCall`] for a call in a language [`lexical_scopes`] covers.
 ///
 /// A JS/TS bare call never reaches a member. A Python one may, from a class
 /// body: [`mark_python_class_body_calls`] decides that for the whole file once
@@ -711,7 +730,10 @@ pub fn extract_nodes_from_tree(
 /// keeps it as a candidate (pre-tag review of 0.204.0: `global h; def h()` in
 /// `f` lost the edge from another function's `return h`). Decided per file,
 /// by name, from one walk: a file that declares a name `global` anywhere
-/// leaves every nested definition of that name unscoped.
+/// leaves every nested definition of that name unscoped. Only
+/// `lexical_scope`: a bare call still keeps no target its `call_scope`
+/// rules out, so this can give a call back an edge D#909 took, never a new
+/// one.
 fn python_rebound_names_are_not_local(
     root: tree_sitter::Node,
     source: &str,
@@ -1052,7 +1074,7 @@ fn extract_nodes(
             let owner = parent_class.filter(|_| !enclosed_by_function(&node, language));
             if let Some(mut parsed) = extract_function_node(&node, source, "function", owner) {
                 parsed.is_test = node_is_test;
-                parsed.lexical_scope = lexical_scope(&node, language);
+                (parsed.lexical_scope, parsed.call_scope) = lexical_scopes(&node, language);
                 if matches!(config.name, "javascript" | "typescript" | "tsx") {
                     if let Some(q) = js_returned_member(&node, &parsed.name, source) {
                         parsed.qualified_name = Some(q);
@@ -1129,6 +1151,7 @@ fn extract_nodes(
                             param_types: sig_info.param_types,
                             is_test: node_is_test || is_gtest,
                             lexical_scope: None,
+                            call_scope: None,
                         });
                     }
                 }
@@ -1146,7 +1169,7 @@ fn extract_nodes(
                 };
                 if let Some(mut parsed) = extract_function_node(&node, source, nt, owner) {
                     parsed.is_test = node_is_test;
-                    parsed.lexical_scope = lexical_scope(&node, language);
+                    (parsed.lexical_scope, parsed.call_scope) = lexical_scopes(&node, language);
                     results.push(parsed);
                 }
             }
@@ -1156,7 +1179,7 @@ fn extract_nodes(
             let owner = parent_class.filter(|_| !enclosed_by_function(&node, language));
             if let Some(mut parsed) = extract_function_node(&node, source, "function", owner) {
                 parsed.is_test = node_is_test;
-                parsed.lexical_scope = lexical_scope(&node, language);
+                (parsed.lexical_scope, parsed.call_scope) = lexical_scopes(&node, language);
                 results.push(parsed);
             }
         }
@@ -1213,8 +1236,9 @@ fn extract_nodes(
                     // `def` does: a class nested in a function is that
                     // function's (D#909).
                     lexical_scope: (language == "python")
-                        .then(|| lexical_scope(&node, language))
+                        .then(|| lexical_scopes(&node, language).0)
                         .flatten(),
+                    call_scope: None,
                 });
                 extract_children(
                     node,
@@ -1579,6 +1603,7 @@ fn extract_nodes(
                                 param_types: None,
                                 is_test: node_is_test,
                                 lexical_scope: None,
+                                call_scope: None,
                             });
                         }
                     }
@@ -1692,6 +1717,7 @@ fn extract_nodes(
                     param_types: None,
                     is_test: false,
                     lexical_scope: None,
+                    call_scope: None,
                 });
             }
         }
@@ -1727,6 +1753,7 @@ fn extract_nodes(
                     param_types: None,
                     is_test: false,
                     lexical_scope: None,
+                    call_scope: None,
                 });
             }
         }
@@ -1903,6 +1930,7 @@ fn assigned_function_node(
         param_types: sig_info.param_types,
         is_test,
         lexical_scope: None,
+        call_scope: None,
     }
 }
 
@@ -1926,6 +1954,7 @@ fn make_simple_node(
         param_types: None,
         is_test,
         lexical_scope: None,
+        call_scope: None,
     }
 }
 
@@ -2129,6 +2158,7 @@ fn extract_function_node(
         param_types: sig_info.param_types,
         is_test: false,
         lexical_scope: None,
+        call_scope: None,
     })
 }
 
@@ -2288,6 +2318,7 @@ fn extract_named_arrows(node: &tree_sitter::Node, source: &str, language: &str) 
             };
             if value.kind() == "arrow_function" {
                 let sig_info = extract_signature_info(&value, source);
+                let (lexical_scope, call_scope) = lexical_scopes(&child, language);
                 out.push(ParsedNode {
                     node_type: "function".into(),
                     name: name.clone(),
@@ -2300,7 +2331,8 @@ fn extract_named_arrows(node: &tree_sitter::Node, source: &str, language: &str) 
                     return_type: sig_info.return_type,
                     param_types: sig_info.param_types,
                     is_test: false,
-                    lexical_scope: lexical_scope(&child, language),
+                    lexical_scope,
+                    call_scope,
                 });
             } else if !matches!(value.kind(), "function_expression" | "function")
                 && node.parent().map(|p| p.kind()) == Some("export_statement")
@@ -2353,6 +2385,7 @@ fn extract_named_arrows(node: &tree_sitter::Node, source: &str, language: &str) 
                         param_types: None,
                         is_test: false,
                         lexical_scope: None,
+                        call_scope: None,
                     });
                 }
             }
@@ -2860,6 +2893,7 @@ fn extract_dart_method_signature(
                         param_types: params,
                         is_test: false,
                         lexical_scope: None,
+                        call_scope: None,
                     });
                 }
                 "constructor_signature" => {
@@ -2886,6 +2920,7 @@ fn extract_dart_method_signature(
                         param_types: params,
                         is_test: false,
                         lexical_scope: None,
+                        call_scope: None,
                     });
                 }
                 _ => {}
@@ -2955,6 +2990,7 @@ fn extract_dart_top_level_function(
         param_types: params,
         is_test: false,
         lexical_scope: None,
+        call_scope: None,
     })
 }
 
@@ -3021,6 +3057,7 @@ fn extract_dart_declaration(
                         param_types: params,
                         is_test: false,
                         lexical_scope: None,
+                        call_scope: None,
                     });
                 }
                 "constructor_signature" => {
@@ -3047,6 +3084,7 @@ fn extract_dart_declaration(
                         param_types: params,
                         is_test: false,
                         lexical_scope: None,
+                        call_scope: None,
                     });
                 }
                 _ => {}

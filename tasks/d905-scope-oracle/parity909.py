@@ -12,6 +12,18 @@ DUMP = """SELECT e.relation||' '||e.confidence||' '||sf.path||':'||COALESCE(sn.q
  JOIN nodes tn ON tn.id=e.target_id JOIN files tf ON tf.id=tn.file_id WHERE e.relation IN ('calls','references')"""
 
 CASES = {
+    "round 2: a default call both scopes rule out, beside another file's namesake": [
+        {"a.py": "def make():\n    pass\n\n\ndef f(x=make()):\n    def make():\n        pass\n    return x\n",
+         "b.py": "def make():\n    pass\n"},
+        {"a.py": "def f(x=make()):\n    def make():\n        pass\n    return x\n",
+         "b.py": "def make():\n    pass\n"},
+        {"a.py": "def f(x=make()):\n    return x\n",
+         "b.py": "def make():\n    pass\n"},
+        {"a.py": "def make():\n    pass\n\n\ndef f(x=make()):\n    def make():\n        pass\n    return x\n",
+         "b.py": "def other():\n    pass\n"},
+        {"a.py": "def make():\n    pass\n\n\ndef f(x=make()):\n    def make():\n        pass\n    return x\n",
+         "b.py": "def make():\n    pass\n"},
+    ],
     "sibling nested defs: added, own removed, cross-file namesake removed": [
         {"a.py": "def a(app):\n    def index():\n        pass\n    app.add(view_func=index)\n",
          "b.py": "def index():\n    pass\n"},

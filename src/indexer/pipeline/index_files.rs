@@ -304,6 +304,8 @@ struct FileParsed {
     // Node id → where a bare call sees it, for this file's lexical definitions
     // (D#714, `visible_same_file_targets`).
     node_scopes: HashMap<i64, LexicalScope>,
+    // The same as a bare call read it up to 0.203.0 (`ParsedNode::call_scope`).
+    call_scopes: HashMap<i64, LexicalScope>,
     // This file's `method` nodes, for the same filter: a set, because it is
     // asked once per candidate of every bare call (pre-tag review of 0.187.0,
     // MEDIUM-1: a scan of `node_ids` made N calls among N same-named methods
@@ -735,6 +737,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
         let mut node_types: Vec<String> = Vec::new();
         let mut node_lines: Vec<(u32, u32)> = Vec::new();
         let mut node_scopes: HashMap<i64, LexicalScope> = HashMap::new();
+        let mut call_scopes: HashMap<i64, LexicalScope> = HashMap::new();
         let mut method_ids: HashSet<i64> = HashSet::new();
         let mut rust_fns: Vec<super::resolve::RustFnRow> = Vec::new();
 
@@ -794,6 +797,9 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             if let Some(scope) = pn.lexical_scope {
                 node_scopes.insert(node_id, scope);
             }
+            if let Some(scope) = pn.call_scope {
+                call_scopes.insert(node_id, scope);
+            }
             if pn.node_type == "method" {
                 method_ids.insert(node_id);
             }
@@ -828,6 +834,7 @@ fn insert_batch_nodes(db: &Database, pre_parsed: Vec<FilePreParsed>) -> Result<B
             node_lines,
             rust_fn_shapes,
             node_scopes,
+            call_scopes,
             method_ids,
         });
     }
@@ -2688,7 +2695,14 @@ fn resolve_batch_relations(
                         .filter(|id| local_ids.contains(id))
                         .copied()
                         .collect();
-                    visible_same_file_targets(local, rel, pf)
+                    let had_local = !local.is_empty();
+                    let visible = visible_same_file_targets(local, rel, pf);
+                    // The scopes ruled every same-file definition out: no
+                    // edge, and no other file's (Python sees one of these).
+                    if had_local && visible.is_empty() {
+                        continue;
+                    }
+                    visible
                 };
 
             let source_lang = pf.language.as_str();
@@ -2844,27 +2858,42 @@ fn resolve_batch_relations(
 /// stays when the call sees none: the rule only takes from the set, and the
 /// definition it sees is always kept.
 ///
+/// A Python name read as a value or an annotation picks the same way (D#909).
+/// A bare call picks twice, by `node_scopes` and by the scopes it read up to
+/// 0.203.0 (`call_scopes`), and keeps what both keep: its targets are a
+/// subset of 0.203.0's, and may be none of them (a default `make()` whose
+/// `def` nests a `make` bound that one, where Python runs the module's).
+///
 /// [`BareCall`]: crate::parser::treesitter::BareCall
 fn visible_same_file_targets(targets: Vec<i64>, rel: &ParsedRelation, pf: &FileParsed) -> Vec<i64> {
     let Some(call) = rel.call_at else {
         return targets;
     };
-    let at = call.at;
-    let Some(innermost) = targets
-        .iter()
-        .filter_map(|id| pf.node_scopes.get(id))
-        .filter(|scope| scope.sees(at))
-        .map(|scope| scope.width())
-        .min()
-    else {
-        return targets;
+    let innermost = |scopes: &HashMap<i64, LexicalScope>| {
+        targets
+            .iter()
+            .filter_map(|id| scopes.get(id))
+            .filter(|scope| scope.sees(call.at))
+            .map(|scope| scope.width())
+            .min()
     };
+    let keeps = |scopes: &HashMap<i64, LexicalScope>, innermost: Option<usize>, id: &i64| {
+        let scope = scopes.get(id);
+        match (innermost, scope) {
+            (None, _) => true,
+            (Some(innermost), Some(scope)) => scope.sees(call.at) && scope.width() == innermost,
+            (Some(_), None) => call.reaches_members || !pf.method_ids.contains(id),
+        }
+    };
+    let now = innermost(&pf.node_scopes);
+    let before = (rel.relation == REL_CALLS).then(|| innermost(&pf.call_scopes));
     targets
-        .into_iter()
-        .filter(|id| match pf.node_scopes.get(id) {
-            Some(scope) => scope.sees(at) && scope.width() == innermost,
-            None => call.reaches_members || !pf.method_ids.contains(id),
+        .iter()
+        .filter(|id| {
+            keeps(&pf.node_scopes, now, id)
+                && before.is_none_or(|before| keeps(&pf.call_scopes, before, id))
         })
+        .copied()
         .collect()
 }
 

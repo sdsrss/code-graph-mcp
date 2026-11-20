@@ -17046,11 +17046,14 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
             "class Row:\n    pass\n\n\ndef f(x=Row()):\n    class Row:\n        pass\n    return x\n",
             &["f@5 -> Row@1"],
         ),
+        // Round 2: a call keeps only what the scopes a call read up to 0.203.0
+        // keep too. Those saw the nested `make` from the header, the new ones
+        // only the module's, so this call binds neither.
         (
             "py: a call in a default to a def the def nests",
             "m.py",
             "def make():\n    pass\n\n\ndef f(x=make()):\n    def make():\n        pass\n    return x\n",
-            &["f@5 -> make@1"],
+            &[],
         ),
         (
             "py: a class its function declares global (kept)",
@@ -17064,6 +17067,45 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
             "m.js",
             "class Row {}\n\nfunction a() {\n  class Row {}\n  return Row();\n}\n\nfunction b() {\n  return Row();\n}\n",
             &["a@3 -> Row@1", "a@3 -> Row@4", "b@8 -> Row@1", "b@8 -> Row@4"],
+        ),
+        // Pre-tag review of 0.204.0, round 2: no call gains an edge 0.203.0
+        // did not make. `global h` leaves `h` unscoped for names only; a
+        // header call that sees no definition keeps 0.203.0's pick; a
+        // method's default binds the class body's method, which both keep.
+        (
+            "py: a def its function declares global, called after it",
+            "m.py",
+            "def h():\n    pass\n\n\ndef f():\n    global h\n    def h():\n        pass\n    return h()\n",
+            &["f@5 -> h@7"],
+        ),
+        (
+            "py: another function's global leaves a nested def shadowing",
+            "m.py",
+            "def h():\n    pass\n\n\ndef k():\n    global h\n    h = None\n\n\ndef g():\n    def h():\n        \
+             pass\n    return h()\n\n\ndef m():\n    return h()\n",
+            &["g@10 -> h@11", "m@16 -> h@1"],
+        ),
+        (
+            "py: a default call that sees no definition (as 0.203.0)",
+            "m.py",
+            "def f(x=make()):\n    def make():\n        pass\n    return x\n\n\ndef g():\n    def make():\n        \
+             pass\n    return make()\n",
+            &["f@1 -> make@2", "g@7 -> make@8"],
+        ),
+        (
+            "py: a method's default, the class body defines the name",
+            "m.py",
+            "def make():\n    pass\n\n\nclass C:\n    def make(self):\n        pass\n    def m(self, x=make()):\n        \
+             def make():\n            pass\n        return x\n",
+            &["m@8 -> make@6"],
+        ),
+        // D#909 is Python's: a JS function's whole node stays its scope (node
+        // runs a default outside the body too, which no version covers).
+        (
+            "js: a call in a default to a function the function nests",
+            "m.js",
+            "function make() {}\n\nfunction f(x = make()) {\n  function make() {}\n  return x;\n}\n",
+            &["f@3 -> make@4"],
         ),
         (
             "rs: nested fns in sibling fns",
@@ -17274,6 +17316,35 @@ fn a_bare_call_binds_the_same_file_definition_its_scope_sees() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// Pre-tag review of 0.204.0, round 2: a bare call whose scopes rule out
+/// every same-file definition of its name binds nothing, not another file's
+/// namesake: the name is one of its own file's (here the module's `make`,
+/// which the scopes a call read up to 0.203.0 hide behind the nested one).
+#[test]
+fn a_python_call_its_scopes_rule_out_binds_no_other_file() {
+    let (_p, _d, db) = fresh_index_of(&[
+        (
+            "m.py",
+            "def make():\n    pass\n\n\ndef f(x=make()):\n    def make():\n        pass\n    return x\n",
+        ),
+        ("lib.py", "def make():\n    pass\n"),
+    ]);
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT tf.path || ':' || nt.name || '@' || nt.start_line FROM edges e \
+             JOIN nodes ns ON ns.id = e.source_id JOIN nodes nt ON nt.id = e.target_id \
+             JOIN files tf ON tf.id = nt.file_id WHERE e.relation = 'calls' AND ns.name = 'f'",
+        )
+        .unwrap();
+    let got: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(got, Vec::<String>::new());
+}
+
 /// Every same-file `references` edge as `source@line -> target@line`, sorted.
 fn same_file_reference_lines(db: &Database) -> Vec<String> {
     let mut stmt = db
@@ -17390,6 +17461,23 @@ fn d909_a_python_reference_binds_the_same_file_definition_its_scope_sees() {
             "value: a def its function declares global (kept)",
             "def h():\n    pass\n\n\ndef f():\n    global h\n    def h():\n        pass\n\n\ndef g():\n    return h\n",
             &["g@11 -> h@1", "g@11 -> h@7"],
+        ),
+        (
+            "value: a global statement naming two names",
+            "def h():\n    pass\n\n\ndef f():\n    global a, h\n    def h():\n        pass\n\n\ndef g():\n    return h\n",
+            &["g@11 -> h@1", "g@11 -> h@7"],
+        ),
+        (
+            "value: the second global statement of the file",
+            "def h():\n    pass\n\n\ndef k():\n    global zz\n\n\ndef f():\n    global h\n    def h():\n        \
+             pass\n\n\ndef g():\n    return h\n",
+            &["g@15 -> h@1", "g@15 -> h@11"],
+        ),
+        (
+            "value: global leaves the module's def scoped, so a method drops",
+            "def h():\n    pass\n\n\nclass C:\n    def h(self):\n        pass\n\n\ndef f():\n    global h\n    \
+             def h():\n        pass\n\n\ndef g():\n    return h\n",
+            &["g@16 -> h@1", "g@16 -> h@12"],
         ),
         (
             "value: a def its function declares nonlocal (kept)",

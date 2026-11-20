@@ -7,17 +7,18 @@ The full index of a project with Python code changes. On CPython 3.14's
 standard library, nltk 3.9.2, flask 3.1.0, this repository at 0.202.0's
 commit and a private application it loses the edges described below and
 gains none (checked edge for edge: relation, both ends with their start
-lines, confidence and metadata). Elsewhere two kinds of bare call can gain
-the edge Python makes (below). The MCP server rebuilds the index when it
-starts. From the command line, a query answers from the old index with
-"This index was built by an older code-graph (index v145, this binary
-v146): answers come from it until it is rebuilt — run: code-graph-mcp
-reindex", and the first `incremental-index` prints "Index version mismatch
-(stored v145 ≠ binary v146): clearing + rebuilding". 0.203.0 answers
-queries from an index this version wrote but will not write to it: its
-`incremental-index` exits 1 and says to delete `.code-graph/index.db*`
-first to rebuild at its version. To pin the binary back:
-`npm i -g @sdsrs/code-graph@0.203.0`, then delete
+lines, confidence and metadata). In any project the change only removes
+edges: a name read as a value or an annotation kept every candidate in
+0.203.0, and a bare call now keeps only targets 0.203.0 bound as well. The
+MCP server rebuilds the index when it starts. From the command line, a
+query answers from the old index with "This index was built by an older
+code-graph (index v145, this binary v146): answers come from it until it is
+rebuilt — run: code-graph-mcp reindex", and the first `incremental-index`
+prints "Index version mismatch (stored v145 ≠ binary v146): clearing +
+rebuilding". 0.203.0 answers queries from an index this version wrote but
+will not write to it: its `incremental-index` exits 1 and says to delete
+`.code-graph/index.db*` first to rebuild at its version. To pin the binary
+back: `npm i -g @sdsrs/code-graph@0.203.0`, then delete
 `~/.cache/code-graph/bin/code-graph-mcp` and set
 `CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0. The plugin's
 scripts are unchanged.
@@ -42,15 +43,16 @@ keeps all of them, as before, and so does the tail of `mod.Row`. A Python
 `Row()` in a function that defines its own `class Row` binds that class.
 
 A `def`'s defaults, annotations and decorators run around it, where Python
-evaluates them, so they see none of the definitions in its body. An
+evaluates them, so they see none of the definitions in its body: an
 annotation `x: Row` of a `def` whose body defines a `class Row` binds the
-module's `Row`, and so does a bare call in a default: `def f(x=make())`
-whose body defines `make` bound only that nested `make` since 0.185.0 and
-now binds the module's. A `def` or `class` whose name the file declares
-`global` or `nonlocal` binds that name outside its function, so it stays a
-candidate for every name and bare call in the file, as it was for names in
-0.203.0: a bare call `h()` now binds the `def h()` of a function that
-declares `global h` as well as the module's `h`.
+module's `Row`, and so does a call `Row()` in a default. A `def` or `class`
+whose name the file declares `global` or `nonlocal` binds that name outside
+its function, so it stays a candidate for every name in the file, as in
+0.203.0. A bare call keeps only the targets that the rule it followed in
+0.203.0 keeps too, so it never gains one: `def f(x=make())` whose body
+defines `make` bound only that nested `make` since 0.185.0, and now binds no
+`make` (Python runs the module's), and a bare call `h()` binds the
+`def h()` of a function that declares `global h` only where 0.203.0 did.
 
 Measured on fresh indexes of the same files, 0.203.0 against this version:
 
@@ -74,14 +76,17 @@ in the source, that edge is wrong as well.
 
 Random edit sequences of Python projects, each step's incremental index
 compared edge for edge with a fresh index of the same files (4,500
-sequences of one generator and 1,500 of each of two more): the same
-sequences differ as under 0.203.0, by the same edges at the same steps.
+sequences of one generator, 1,500 of each of two more, and 2,000 of one
+that writes `global`/`nonlocal` lines, defaults, annotations and
+decorators beside nested namesakes): the same sequences differ as under
+0.203.0, by the same edges at the same steps.
 Edit sequences written for these cases (a sibling function's nested
 definition added, a function's own removed, a module-level class moved to
 another file, a method namesake, a decorator's definition removed, a
 `global` declaration removed and restored, a module-level class that a
-default calls moved to another file): the incremental index matched a
-fresh one at every step.
+default calls moved to another file, a default call that binds nothing
+beside another file's namesake): the incremental index matched a fresh one
+at every step.
 
 ### change: definitions those edges kept alive may now have none
 
@@ -90,15 +95,17 @@ nltk 2,182 → 2,183, flask 745 → 766, this repository 471 → 471, the
 private application 10,681 → 10,686. `dead-code --min-lines 1 --no-ignore`
 returns the same definitions as 0.203.0 on all five.
 
-A full index (means of 3 runs, alternating with 0.203.0) took 3.06 s and
-now 3.10 s on the standard library, 3.98 s and now 3.94 s on the private
+A full index (means of 3 runs, alternating with 0.203.0) took 2.96 s and
+now 2.99 s on the standard library, 3.94 s and now 3.97 s on the private
 application. Files written to stress the scope reads: 480 KB of
-annotations nested 150 generics deep, 1.01 s and now 1.12 s; 988 KB of
-functions nested 100 deep with 20 annotated parameters each, 8.06 s and
-now 8.05 s; 120 KB of calls nested 150 deep as arguments, 11.50 s and now
-11.37 s. A class now looks for the function around it as a `def` did:
-12,500 classes under 30 nested `if`s (990 KB) took 0.57 s and now 1.06 s;
-the same file with `def`s instead took 1.60 s and now 1.63 s.
+annotations nested 150 generics deep, 1.04 s and now 1.16 s; 988 KB of
+functions nested 100 deep with 20 annotated parameters each, 8.13 s and
+now 8.23 s; 120 KB of calls nested 150 deep as arguments, 11.59 s and now
+11.79 s. A class now looks for the function around it as a `def` did:
+12,500 classes under 30 nested `if`s (990 KB) took 0.62 s and now 1.13 s,
+21,000 one-line classes under 30 `if`s 0.97 s and now 1.82 s, and a
+class at each of 30 nesting levels 0.72 s and now 1.02 s; the first file
+with `def`s instead of classes took 1.62 s and now 1.63 s.
 
 ### Not covered
 
@@ -109,10 +116,18 @@ the same file with `def`s instead took 1.60 s and now 1.63 s.
   until then, skipping the functions around the class. In a class inside a
   function that defines `helper`, `x = staticmethod(helper)` written before
   the class body's own `def helper` now binds the function's `helper` and
-  the method, and lost its edge to the module's `helper`.
+  the method, and lost its edge to the module's `helper`. So does a bare
+  call `Row()`, an annotation or a decorator written there.
 - `global` and `nonlocal` are read per file and by name: once a file
   declares `h` either way, every `h` defined in a function stays a
-  candidate for every `h` in the file.
+  candidate for every name `h` in the file. A `def h` in a class body that
+  declares `global h` is still read as a method, so a function's `h` that
+  sees a definition of its own no longer binds it.
+- A bare call binds only what 0.203.0's rule bound as well. Where that rule
+  bound a wrong definition and the one its scope sees is another, the call
+  now binds neither (`def f(x=make())` above), and where it missed the
+  definition, the call still misses it (`h()` in one function, the
+  `def h()` that another declares `global h`).
 - Four nested `wrapper` functions of the standard library's `functools.py`
   (three in `_lru_cache_wrapper`, one in `singledispatch`) lost their only
   incoming edges, which came from another function, and now have none: the
