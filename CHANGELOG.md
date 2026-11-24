@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.205.0
+
+**Upgrading: no index rebuild.** `INDEX_VERSION` stays 146. Three things a
+reader sees change. `impact` and every answer built on it now say when the
+depth they walked cut the caller chain, so the note and the JSON key
+`callers_truncated` appear on more answers: on a private application, 53 of
+150 sampled production functions that have callers, where 0.204.0 flagged 1.
+A script that treated `callers_truncated` as an error should read
+`callers_truncated_note`, which names the cause. The CLAUDE.md block and the
+MCP instructions say `grep` instead of `Grep`, so a project that adopted the
+block gets the "This project's CLAUDE.md carries an out-of-date code-graph
+block" notice at one session start; `CODE_GRAPH_NO_TEMPLATE_REFRESH=1`
+silences it. `url` moves to 2.5.9 for RUSTSEC-2026-0592. To pin the binary
+back: `npm i -g @sdsrs/code-graph@0.204.0`, then delete
+`~/.cache/code-graph/bin/code-graph-mcp` and set
+`CODE_GRAPH_NO_AUTO_UPDATE=1`, as described under 0.171.0.
+
+### fix: impact says when the requested depth cut the caller chain
+
+`impact` walks callers to `--depth` (3 by default). When the callers at that
+depth had callers of their own, it still printed "N callers total" and the
+JSON carried no `callers_truncated`: the key fired for the 200-row traversal
+limit and for a depth above the cap of 10. On a private application,
+`impact normalize_email` printed "4 callers total" where `--depth 4` lists 9,
+and in a session with the plugin installed a model answered with exactly
+those 4 (`tasks/specs/maintenance-mode-2026-11-24.md`, P0-2b).
+
+The walk now runs its expansion query once more from the deepest level it
+returned, with the same relation and confidence floor and without the nodes
+it already visited. When that finds a caller, each impact answer says its
+counts are a floor:
+
+- `impact`: `⚠ Caller traversal stopped at the requested depth while callers
+  at that depth have callers of their own, so the caller counts, affected
+  files and risk level below are computed from a PARTIAL caller set and are a
+  FLOOR, not a total. List the deeper callers with a larger depth (`impact
+  --depth N` / get_call_graph `depth`, at most 10).`
+- `impact --json`, `show --impact --json` and MCP `get_ast_node` with
+  `include_impact` (which walks a fixed depth of 3): `callers_truncated: true`
+  and that sentence in `callers_truncated_note`. `show --impact` prints it
+  under its impact line.
+- The pre-edit hook's summary: `⚠ the caller traversal stopped early, so these
+  counts are a floor, not a total`.
+- The prompt hook's `[code-graph:impact]` push, which is `impact`'s text.
+
+Above the cap of 10 only the cap's note is given: a deeper request cannot
+help there. Measured on that application (150 production functions with
+callers, seeded; `tasks/impact-depth-note-2026-11-24/measure.py`): of the 53
+answers that carry the note, 47 list more production callers at `--depth 10`,
+5 list more covering tests and no more production callers, and 1 is an
+answer that already hit the row limit (0.204.0 flagged it too), which a
+deeper walk does not extend. Median time per `impact` call: 4 ms on both
+versions.
+
+### fix(steering): literal-string search points at grep, not the Grep tool
+
+The managed CLAUDE.md block said "Still use Grep for literal strings/regex"
+and the MCP instructions "Still Grep for exact strings/regex". Claude Code
+builds with embedded search tools offer no Grep tool, only Bash, where
+`grep` works. Both now say `grep`. The block's template fingerprint changes,
+which is what shows the out-of-date notice once (above).
+
+### fix(deps): url 2.5.9 (RUSTSEC-2026-0592)
+
+`url` 2.5.8, reached through `reqwest` and `rusqlite`, overflows the stack in
+`Url::origin()` on nested `blob:` URLs; the scheduled `cargo audit` on main
+was red from 2026-11-23. `form_urlencoded` moves from 1.2.2 to 1.2.3 with it,
+as `url` 2.5.9 requires. Lockfile only.
+
+### Not covered
+
+- The prompt hook still pushes `impact` for a prompt such as "I want to
+  change X; which functions call it?". Its counts now carry the floor note;
+  the push itself is unchanged.
+- A bare Python call of a name its own file assigns at module level
+  (`_now = (...)`) still binds the project's definition of that name in
+  another file: on the private application, 2 of the 7 callers
+  `impact _now` lists.
+- `callgraph`, `trace` and MCP `get_call_graph` print the depth they were
+  asked for and claim no total; they carry no new note.
+
 ## 0.204.0
 
 **Upgrading: every index rebuilds once.** `INDEX_VERSION` goes 145 → 146.
