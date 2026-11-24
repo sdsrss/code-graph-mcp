@@ -23,6 +23,12 @@ Each of the 70 picks was judged by hand against its grep command.
 | wrong picks followed by opening the named file | 0 of 6 | 0 of 6 | 0 of 12 |
 | right picks followed by opening the named file | 17 of 37 | 14 of 21 | 31 of 58 |
 
+- Acted on, checked a second way: for each of the 12 wrong picks, up to the
+  next human prompt (at most 15 tool calls), no tool call names the pointed
+  file by path or file name, and no assistant text names the picked symbol
+  or that file (the one text hit, after `module`, is the model's own
+  `module.exports` edit). An influence that leaves neither trace is outside
+  what a transcript shows.
 - Wrong symbol: `module` from `module.exports`, `describe` from
   `describe('…` (a test-framework global with a project namesake), a word
   from a URL path in an alternation, a generic lower-case word in an
