@@ -12105,6 +12105,75 @@ fn impact_stays_silent_when_the_traversal_was_complete() {
     assert!(v.get("callers_truncated_note").is_none(), "{out}");
 }
 
+/// A chain `chain_a <- chain_b <- … <- chain_{last}`: each calls the previous.
+fn setup_caller_chain_project(len: usize) -> TempDir {
+    let project = TempDir::new().unwrap();
+    let src = project.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let names: Vec<String> = (0..len)
+        .map(|i| format!("chain_{}", (b'a' + i as u8) as char))
+        .collect();
+    let mut body = format!("pub fn {}() {{}}\n", names[0]);
+    for w in names.windows(2) {
+        body.push_str(&format!("pub fn {}() {{ {}(); }}\n", w[1], w[0]));
+    }
+    std::fs::write(src.join("lib.rs"), body).unwrap();
+    let db_dir = project.path().join(code_graph_mcp::domain::CODE_GRAPH_DIR);
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db = code_graph_mcp::storage::db::Database::open(&db_dir.join("index.db")).unwrap();
+    code_graph_mcp::indexer::pipeline::run_full_index(&db, project.path(), None, None).unwrap();
+    project
+}
+
+/// 2026-11-24 (tasks/specs/prompt-callers-off-impact-depth-2026-11-24.md):
+/// `impact normalize_email` printed "4 callers total" at the default depth 3
+/// where the chain held 9, and a model copied the 4. A depth the user asked for
+/// (or the default) that cuts the chain makes every count a floor.
+#[test]
+fn impact_says_when_the_requested_depth_cut_the_caller_chain() {
+    let project = setup_caller_chain_project(5); // callers of chain_a at depths 1..4
+
+    let (text, stderr, code) = run_cli(&project, &["impact", "chain_a"]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(
+        text.contains("3 callers total"),
+        "fixture precondition: {text}"
+    );
+    assert!(
+        text.contains("requested depth") && text.contains("FLOOR") && text.contains("--depth"),
+        "the default depth 3 cut chain_e: {text}"
+    );
+
+    let (out, stderr, code) = run_cli(&project, &["impact", "chain_a", "--json"]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["total_callers"].as_u64(), Some(3), "{out}");
+    assert_eq!(v["callers_truncated"].as_bool(), Some(true), "{out}");
+    assert!(
+        v["callers_truncated_note"]
+            .as_str()
+            .is_some_and(|n| n.contains("requested depth")),
+        "{out}"
+    );
+
+    // `show --impact` runs the same traversal.
+    let (show, stderr, code) = run_cli(&project, &["show", "chain_a", "--impact", "--json"]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(
+        show.contains("callers_truncated") && show.contains("requested depth"),
+        "{show}"
+    );
+
+    // Negative control: a depth that reaches the end of the chain claims nothing.
+    let (whole, stderr, code) = run_cli(&project, &["impact", "chain_a", "--depth", "4", "--json"]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    let w: serde_json::Value = serde_json::from_str(whole.trim()).unwrap();
+    assert_eq!(w["total_callers"].as_u64(), Some(4), "{whole}");
+    assert!(w.get("callers_truncated").is_none(), "{whole}");
+    let (whole_text, _e, _c) = run_cli(&project, &["impact", "chain_a", "--depth", "4"]);
+    assert!(!whole_text.contains("FLOOR"), "{whole_text}");
+}
+
 // ---------------------------------------------------------------------------
 // SURF-18 (audit 2026-09-07, P1): `show --refs / --impact` swallowed every
 // edge-query failure with `unwrap_or_default()`. An empty caller set is what

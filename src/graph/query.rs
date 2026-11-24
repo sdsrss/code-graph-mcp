@@ -107,6 +107,11 @@ pub struct CallGraphResult {
     /// True when the caller requested depth > `CALL_GRAPH_MAX_DEPTH`; the result
     /// only reflects the first `CALL_GRAPH_MAX_DEPTH` levels, deeper chains may exist.
     pub depth_capped: bool,
+    /// The walk stopped at the depth it was asked for while a node of the
+    /// deepest level it returned has a neighbour (in the walked direction, at
+    /// the same confidence floor) it has not visited: a deeper request would
+    /// return more. Set independently of `depth_capped`.
+    pub deeper_beyond_depth: bool,
     /// Depth actually used by the SQL query (after clamping).
     pub effective_max_depth: i32,
     /// Depth originally requested by the caller (pre-clamp).
@@ -218,7 +223,7 @@ pub fn get_call_graph_seeded(
     let effective_max_depth = max_depth.min(CALL_GRAPH_MAX_DEPTH);
     let depth_capped = max_depth > CALL_GRAPH_MAX_DEPTH;
 
-    let (mut nodes, limit_hit) = match direction {
+    let (mut nodes, limit_hit, deeper_beyond_depth) = match direction {
         "callees" => query_direction_seeded(
             conn,
             seed,
@@ -234,21 +239,21 @@ pub fn get_call_graph_seeded(
             min_confidence_rank,
         )?,
         "both" => {
-            let (callees, c1) = query_direction_seeded(
+            let (callees, c1, d1) = query_direction_seeded(
                 conn,
                 seed,
                 effective_max_depth,
                 Direction::Callees,
                 min_confidence_rank,
             )?;
-            let (callers, c2) = query_direction_seeded(
+            let (callers, c2, d2) = query_direction_seeded(
                 conn,
                 seed,
                 effective_max_depth,
                 Direction::Callers,
                 min_confidence_rank,
             )?;
-            (merge_results(callees, callers), c1 || c2)
+            (merge_results(callees, callers), c1 || c2, d1 || d2)
         }
         other => {
             return Err(anyhow!(
@@ -284,6 +289,7 @@ pub fn get_call_graph_seeded(
         nodes,
         limit_hit,
         depth_capped,
+        deeper_beyond_depth,
         effective_max_depth,
         requested_max_depth,
         suppressed_ambiguous,
@@ -417,6 +423,7 @@ fn query_direction(
         direction,
         min_confidence_rank,
     )
+    .map(|(nodes, limit_hit, _)| (nodes, limit_hit))
 }
 
 fn query_direction_seeded(
@@ -425,7 +432,7 @@ fn query_direction_seeded(
     max_depth: i32,
     direction: Direction,
     min_confidence_rank: u8,
-) -> Result<(Vec<CallGraphNode>, bool)> {
+) -> Result<(Vec<CallGraphNode>, bool, bool)> {
     let max_depth = max_depth.min(CALL_GRAPH_MAX_DEPTH); // Hard cap on traversal depth
 
     // Seed. Never SEED on an `<external>` sentinel: it has no outgoing calls, so
@@ -456,7 +463,7 @@ fn query_direction_seeded(
         rows.collect::<Result<Vec<_>, _>>()?
     };
     if frontier.is_empty() {
-        return Ok((Vec::new(), false));
+        return Ok((Vec::new(), false, false));
     }
 
     // node_id → (depth, parent). Seeds are depth 0 with no parent.
@@ -493,14 +500,7 @@ fn query_direction_seeded(
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
-            // The `nodes t` join mirrors the CTE's: an edge pointing at a row
-            // with no `nodes` entry is not expanded.
-            let sql = format!(
-                "SELECT e.{from_col}, e.{to_col}
-                 FROM edges e
-                 JOIN nodes t ON t.id = e.{to_col}
-                 WHERE e.{from_col} IN ({placeholders}) AND e.relation = ? {conf_gate}"
-            );
+            let sql = expand_sql(from_col, to_col, &placeholders, conf_gate);
             let rank_of: HashMap<i64, usize> = chunk
                 .iter()
                 .enumerate()
@@ -538,6 +538,34 @@ fn query_direction_seeded(
         }
         frontier = next;
         depth += 1;
+    }
+
+    // Stopped by the requested depth with nodes left unexpanded: would one more
+    // level discover anything? The same expansion query as the loop's, so an
+    // edge under the floor or an already-visited node (a cycle) counts as
+    // nothing, exactly as it would in a deeper walk.
+    let mut deeper_beyond_depth = false;
+    if depth > max_depth && !frontier.is_empty() {
+        'chunks: for chunk in frontier.chunks(FRONTIER_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut stmt = conn.prepare(&expand_sql(from_col, to_col, &placeholders, conf_gate))?;
+            let rank_param: i64 = min_confidence_rank as i64;
+            let mut params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(chunk.len() + 2);
+            for id in chunk {
+                params.push(id as &dyn rusqlite::types::ToSql);
+            }
+            params.push(&REL_CALLS);
+            params.push(&rank_param);
+            let mut rows = stmt.query(params.as_slice())?;
+            while let Some(row) = rows.next()? {
+                if !seen.contains_key(&row.get::<_, i64>(1)?) {
+                    deeper_beyond_depth = true;
+                    break 'chunks;
+                }
+            }
+        }
     }
 
     // Node metadata. The `files` INNER JOIN is the CTE's: a node with no file
@@ -644,7 +672,21 @@ fn query_direction_seeded(
     rows.truncate(CALL_GRAPH_ROW_LIMIT);
     let results: Vec<CallGraphNode> = rows.into_iter().map(|(_, _, _, n)| n).collect();
 
-    Ok((results, limit_hit))
+    Ok((results, limit_hit, deeper_beyond_depth))
+}
+
+/// One BFS expansion step: `(from, to)` pairs leaving the frontier ids bound to
+/// `placeholders`, then the relation and the confidence rank (`conf_gate`).
+/// Shared by the level loop and the past-the-depth check so the two cannot
+/// disagree on what counts as a neighbour. The `nodes t` join mirrors the old
+/// CTE's: an edge pointing at a row with no `nodes` entry is not expanded.
+fn expand_sql(from_col: &str, to_col: &str, placeholders: &str, conf_gate: &str) -> String {
+    format!(
+        "SELECT e.{from_col}, e.{to_col}
+         FROM edges e
+         JOIN nodes t ON t.id = e.{to_col}
+         WHERE e.{from_col} IN ({placeholders}) AND e.relation = ? {conf_gate}"
+    )
 }
 
 /// Count the seed symbol's DIRECT edges (in `direction`) whose confidence rank
@@ -1643,6 +1685,109 @@ mod tests {
         assert!(!small.depth_capped, "depth=5 must not trip the cap");
         assert_eq!(small.requested_max_depth, 5);
         assert_eq!(small.effective_max_depth, 5);
+    }
+
+    /// A chain `names[0] <- names[1] <- … ` (each calls the previous) with every
+    /// edge at `conf`.
+    fn caller_chain(conn: &Connection, names: &[&str], conf: &str) -> Vec<i64> {
+        let fid = upsert_file(
+            conn,
+            &FileRecord {
+                path: "chain.ts".into(),
+                blake3_hash: "h1".into(),
+                last_modified: 1,
+                language: Some("typescript".into()),
+            },
+        )
+        .unwrap();
+        let ids: Vec<i64> = names
+            .iter()
+            .map(|n| insert_node(conn, &node(n, fid)).unwrap())
+            .collect();
+        for w in ids.windows(2) {
+            insert_edge(conn, w[1], w[0], REL_CALLS, None).unwrap();
+            set_edge_confidence(conn, w[1], w[0], conf);
+        }
+        ids
+    }
+
+    /// 2026-11-24: `impact normalize_email` printed "4 callers total" at the
+    /// default depth 3 where the chain held 9; nothing said the deepest layer
+    /// had callers of its own. `depth_capped` only fires above
+    /// CALL_GRAPH_MAX_DEPTH.
+    #[test]
+    fn deeper_beyond_depth_flags_a_traversal_the_requested_depth_cut() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        caller_chain(
+            conn,
+            &["A", "B", "C", "D", "E"],
+            crate::domain::CONF_EXTRACTED,
+        );
+
+        let cut = get_call_graph(conn, "A", "callers", 3, None).unwrap();
+        assert_eq!(cut.nodes.iter().map(|n| n.depth).max(), Some(3));
+        assert!(cut.deeper_beyond_depth, "E calls D, which sits at depth 3");
+        assert!(!cut.depth_capped && !cut.limit_hit);
+
+        let whole = get_call_graph(conn, "A", "callers", 4, None).unwrap();
+        assert!(!whole.deeper_beyond_depth, "the chain ends at depth 4");
+        let past = get_call_graph(conn, "A", "callers", 6, None).unwrap();
+        assert!(
+            !past.deeper_beyond_depth,
+            "a depth past the chain's end cuts nothing"
+        );
+
+        // The same BFS serves callees.
+        let down = get_call_graph(conn, "E", "callees", 2, None).unwrap();
+        assert!(down.deeper_beyond_depth);
+        assert!(
+            !get_call_graph(conn, "E", "callees", 4, None)
+                .unwrap()
+                .deeper_beyond_depth
+        );
+    }
+
+    /// The check is the traversal's next level, so it follows the traversal's
+    /// rules: an edge under the confidence floor and an already-visited caller
+    /// (a cycle) are not "deeper callers".
+    #[test]
+    fn deeper_beyond_depth_follows_only_what_the_traversal_would() {
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let ids = caller_chain(conn, &["A", "B", "C"], crate::domain::CONF_EXTRACTED);
+        let fid: i64 = conn
+            .query_row("SELECT file_id FROM nodes WHERE id = ?1", [ids[0]], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // X calls C (depth 2) only by an ambiguous name match.
+        let x = insert_node(conn, &node("X", fid)).unwrap();
+        insert_edge(conn, x, ids[2], REL_CALLS, None).unwrap();
+        set_edge_confidence(conn, x, ids[2], crate::domain::CONF_AMBIGUOUS);
+        let inferred = crate::domain::confidence_rank(crate::domain::CONF_INFERRED);
+        let at_floor = get_call_graph_filtered(conn, "A", "callers", 2, None, inferred).unwrap();
+        assert!(
+            !at_floor.deeper_beyond_depth,
+            "X is below the floor the traversal applies"
+        );
+        let all = get_call_graph_filtered(conn, "A", "callers", 2, None, 0).unwrap();
+        assert!(
+            all.deeper_beyond_depth,
+            "at the ambiguous floor X is a deeper caller"
+        );
+
+        // A cycle: A calls C, so C's caller beyond depth 2 is A, already visited.
+        let (db2, _tmp2) = test_db();
+        let conn2 = db2.conn();
+        let ids2 = caller_chain(conn2, &["A", "B", "C"], crate::domain::CONF_EXTRACTED);
+        insert_edge(conn2, ids2[0], ids2[2], REL_CALLS, None).unwrap();
+        set_edge_confidence(conn2, ids2[0], ids2[2], crate::domain::CONF_EXTRACTED);
+        assert!(
+            !get_call_graph(conn2, "A", "callers", 2, None)
+                .unwrap()
+                .deeper_beyond_depth
+        );
     }
 
     fn set_edge_confidence(conn: &Connection, src: i64, tgt: i64, conf: &str) {

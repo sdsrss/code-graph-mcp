@@ -9128,6 +9128,49 @@ end
         );
     }
 
+    /// 2026-11-24: `include_impact` walks a fixed depth of 3; a chain that goes
+    /// deeper makes its counts a floor, and the note says so.
+    #[test]
+    fn test_get_ast_node_impact_says_when_its_depth_cut_the_chain() {
+        let chain = |len: usize| {
+            let names: Vec<String> = (0..len).map(|i| format!("dchain_{i}")).collect();
+            let mut body = format!("pub fn {}() {{}}\n", names[0]);
+            for w in names.windows(2) {
+                body.push_str(&format!("pub fn {}() {{ {}(); }}\n", w[1], w[0]));
+            }
+            body
+        };
+        let deep = TempDir::new().unwrap();
+        std::fs::write(deep.path().join("a.rs"), chain(5)).unwrap();
+        let server = McpServer::new_test_with_project(deep.path());
+        server.ensure_indexed().unwrap();
+        let out = ast_node_call(
+            &server,
+            json!({ "symbol_name": "dchain_0", "file_path": "a.rs", "include_impact": true }),
+        );
+        assert_eq!(out["impact"]["callers_truncated"], json!(true), "{out}");
+        assert!(
+            out["impact"]["callers_truncated_note"]
+                .as_str()
+                .is_some_and(|n| n.contains("requested depth")),
+            "{out}"
+        );
+
+        // Negative control: a chain that ends at depth 3 is complete.
+        let flat = TempDir::new().unwrap();
+        std::fs::write(flat.path().join("a.rs"), chain(4)).unwrap();
+        let s2 = McpServer::new_test_with_project(flat.path());
+        s2.ensure_indexed().unwrap();
+        let quiet = ast_node_call(
+            &s2,
+            json!({ "symbol_name": "dchain_0", "file_path": "a.rs", "include_impact": true }),
+        );
+        assert!(
+            quiet["impact"].get("callers_truncated").is_none(),
+            "{quiet}"
+        );
+    }
+
     /// CON-01's gate still binds on this branch: `skip_indexing` means no write
     /// handle and no resync, so the caller knowingly gets the pre-edit row.
     #[test]
