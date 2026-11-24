@@ -1,6 +1,6 @@
 # 提示词阶段不再推送调用方列表；impact 到达深度上限时明说（2026-11-24）
 
-状态：进行中
+状态：进行中。用户 2026-11-24 在带偏测试结果出来后选择**只发选项 3**。选项 2 不发，提交 ad46735b 保留在分支 `ups-inject-off-opt2`。
 
 ## 背景与目标
 
@@ -34,12 +34,12 @@ F 期中立主会话里，这个 hook 的 impact / search 注入 5 次，跟进 
 
 ## 验收标准
 
-- [x] AC1：impact、callgraph、search 三种意图的提示，hook 都没有输出（测试先红后绿）——验证：`node --test claude-plugin/scripts/user-prompt-context.test.js`
-- [x] AC2：点名一个已索引文件的提示仍然输出 overview；没有 manifest 时仍然输出重启提示——验证：同上
+- [x]（只在 ups-inject-off-opt2 上，不发）AC1：impact、callgraph、search 三种意图的提示，hook 都没有输出（测试先红后绿）——验证：`node --test claude-plugin/scripts/user-prompt-context.test.js`
+- [x]（只在 ups-inject-off-opt2 上，不发）AC2：点名一个已索引文件的提示仍然输出 overview；没有 manifest 时仍然输出重启提示——验证：同上
 - [x] AC3：遍历到达请求深度、更深处还有按同一置信度下限可达的调用方时，`truncated()` 为真；刚好查完、置信度低于下限、或者只剩已访问过的节点（环）时为假——验证：`cargo test --lib graph::`
 - [x] AC4：说明文字只点名自己的原因和调整方式（`--depth`，最大 10），与行数上限、深度硬上限的说明互不包含——验证：`cargo test --lib graph::routes`
 - [x] AC5：用 CLI 端到端跑一条深度 4 的调用链：`impact`（默认深度 3）的文本带 ⚠ 说明，JSON 里 `callers_truncated` 为 true；加 `--depth 4` 后两者都没有——验证：新的 e2e 测试
-- [ ] AC6：daagu 副本上，`impact normalize_email` 带上说明；hook 对 T1n、T2n 和自然问法都不再输出——验证：手工命令，写进验证记录
+- [ ] AC6：daagu 副本上，`impact normalize_email` 带上说明；编辑前 hook 的摘要带上"这是下限"那一行——验证：手工命令，写进验证记录（选项 2 不发，提示词 hook 那半条作废）
 - [ ] AC7：全量测试和两条 clippy 腿都是绿的；pre-commit 通过
 
 ## 方案
@@ -62,7 +62,7 @@ F 期中立主会话里，这个 hook 的 impact / search 注入 5 次，跟进 
 
 - 2026-11-24：在分支 `ups-inject-off` 上开发。带偏测试在后台跑，结果写进 maintenance-mode spec 和 CHANGELOG。
 - 选项 3 已提交（f8d82ed3），AC3、AC4、AC5 都已验证。选项 2 已单独提交（ad46735b），AC1、AC2 已验证。
-- **等用户决定**：P0-2b 发现装插件组少用 41% 的轮数（10/10 对），正确率不变。选项 2 删掉的正是这条注入，所以选项 2 的前提动摇了，要请用户在新证据下决定：只发选项 3（丢弃 ad46735b）、2 和 3 都发，还是再测一轮（开发版、装插件但关掉提示词注入，约 $1）。
+- **用户决定（2026-11-24，问答）：只发选项 3。** 下面这条是当时问的问题，留作记录：P0-2b 发现装插件组少用 41% 的轮数（10/10 对），正确率不变。选项 2 删掉的正是这条注入，所以选项 2 的前提动摇了，要请用户在新证据下决定：只发选项 3（丢弃 ad46735b）、2 和 3 都发，还是再测一轮（开发版、装插件但关掉提示词注入，约 $1）。
 
 ## 验证记录
 
