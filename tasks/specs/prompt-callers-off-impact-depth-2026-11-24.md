@@ -1,6 +1,6 @@
 # 提示词阶段不再推送调用方列表；impact 到达深度上限时明说（2026-11-24）
 
-状态：进行中。用户 2026-11-24 在带偏测试结果出来后选择**只发选项 3**。选项 2 不发，提交 ad46735b 保留在分支 `ups-inject-off-opt2`。
+状态：完成（2026-11-24，0.205.0 已发布）。用户 2026-11-24 在带偏测试结果出来后选择**只发选项 3**。选项 2 不发，提交 ad46735b 保留在分支 `ups-inject-off-opt2`。
 
 ## 背景与目标
 
@@ -39,8 +39,8 @@ F 期中立主会话里，这个 hook 的 impact / search 注入 5 次，跟进 
 - [x] AC3：遍历到达请求深度、更深处还有按同一置信度下限可达的调用方时，`truncated()` 为真；刚好查完、置信度低于下限、或者只剩已访问过的节点（环）时为假——验证：`cargo test --lib graph::`
 - [x] AC4：说明文字只点名自己的原因和调整方式（`--depth`，最大 10），与行数上限、深度硬上限的说明互不包含——验证：`cargo test --lib graph::routes`
 - [x] AC5：用 CLI 端到端跑一条深度 4 的调用链：`impact`（默认深度 3）的文本带 ⚠ 说明，JSON 里 `callers_truncated` 为 true；加 `--depth 4` 后两者都没有——验证：新的 e2e 测试
-- [ ] AC6：daagu 副本上，`impact normalize_email` 带上说明；编辑前 hook 的摘要带上"这是下限"那一行——验证：手工命令，写进验证记录（选项 2 不发，提示词 hook 那半条作废）
-- [ ] AC7：全量测试和两条 clippy 腿都是绿的；pre-commit 通过
+- [x] AC6：daagu 副本上，`impact normalize_email` 带上说明；编辑前 hook 的摘要带上"这是下限"那一行——验证：手工命令，写进验证记录（选项 2 不发，提示词 hook 那半条作废）
+- [x] AC7：全量测试和两条 clippy 腿都是绿的；pre-commit 通过
 
 ## 方案
 
@@ -51,12 +51,12 @@ F 期中立主会话里，这个 hook 的 impact / search 注入 5 次，跟进 
 
 ## 计划
 
-- [ ] S1：hook 测试改为新行为（先红），再改 hook（转绿）——覆盖 AC1、AC2
-- [ ] S2：query.rs / routes.rs 单元测试（先红），再实现——覆盖 AC3、AC4
-- [ ] S3：CLI e2e 测试——覆盖 AC5
-- [ ] S4：文档和 CHANGELOG；版本 0.205.0（INDEX_VERSION 不变）
-- [ ] S5：daagu 副本实测——覆盖 AC6；全量检查——覆盖 AC7
-- [ ] S6：发版前评审（新开的子代理，独立简报），修复，然后按发版手册发版
+- [x] S1（只在 ups-inject-off-opt2 上，不发）：hook 测试改为新行为（先红），再改 hook（转绿）——覆盖 AC1、AC2
+- [x] S2：query.rs / routes.rs 单元测试（先红），再实现——覆盖 AC3、AC4
+- [x] S3：CLI e2e 测试——覆盖 AC5
+- [x] S4：文档和 CHANGELOG；版本 0.205.0（INDEX_VERSION 不变）
+- [x] S5：daagu 副本实测——覆盖 AC6；全量检查——覆盖 AC7
+- [x] S6：发版前评审（新开的子代理，独立简报），修复，然后按发版手册发版
 
 ## 决策与进展
 
@@ -80,3 +80,10 @@ F 期中立主会话里，这个 hook 的 impact / search 注入 5 次，跟进 
 - 新的 CLI e2e 和 MCP 测试 → 通过：impact_* 29/29，lib 107/107。用变异探针确认过：关掉检测后两个测试都在"requested depth"断言上失败。
 - JS 全量 → 通过：1785 过，0 失败，3 跳过。hook-fire 的正对照改用 overview 提示。
 - pre-commit（cargo test、两条 clippy 腿）→ 通过：f8d82ed3、ad46735b。
+- AC7 → 通过：发版提交 87e289c9、修复提交 a5e0abae 和 d662a118 的 pre-commit 都通过（全量 cargo test、两条 clippy 腿）。d662a118 的 CI 45479103125 → 通过，7/7。新测试在 macOS、Windows 两条腿的日志里各 10/10。
+- AC6 → 通过，用的是发布出去的产物：npm 装 `@sdsrs/code-graph@0.205.0`，linux-x64 包自带的二进制，以及包里自带的 `pre-edit-guide.js`。
+  - `impact normalize_email`（默认深度 3）：4 callers total，带"stopped at depth 3 … FLOOR, not a total … impact --depth N"说明。
+  - `--depth 10`：9 个，没有说明。真值是 9 个。
+  - 编辑前 hook 的摘要带"⚠ the caller traversal stopped early, so these counts are a floor, not a total"。
+- 发版：tag v0.205.0（d662a118）。Release 45481732742 → 通过，10/10（约 33 分钟）。GitHub Release 非草稿，14 个附件，说明取自 CHANGELOG 0.205.0 节。npm 六个包的 latest 都是 0.205.0，`_npmUser` 都是 GitHub Actions（trustedPublisher github）。
+- 发布产物上的 5 层调用链（chain_0 … chain_4）：默认深度给 3 个，带说明，JSON 里 `callers_truncated` 为 true；`--depth 4` 给 4 个，没有说明。
