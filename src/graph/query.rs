@@ -1795,31 +1795,37 @@ mod tests {
     /// already visited, not deeper.
     #[test]
     fn deeper_beyond_depth_reads_every_chunk_and_only_calls_from_outside_the_walk() {
-        // M4: 450 direct callers of `hub` (two FRONTIER_CHUNKs at depth 1); only
-        // the last-discovered one has a caller, so it sits in the second chunk.
-        let (db, _tmp) = test_db();
-        let conn = db.conn();
-        let ids = caller_chain(conn, &["hub"], crate::domain::CONF_EXTRACTED);
-        let fid: i64 = conn
-            .query_row("SELECT file_id FROM nodes WHERE id = ?1", [ids[0]], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        let mut last = 0;
-        for i in 0..450 {
-            last = insert_node(conn, &node(&format!("w{i}"), fid)).unwrap();
-            insert_edge(conn, last, ids[0], REL_CALLS, None).unwrap();
-            set_edge_confidence(conn, last, ids[0], crate::domain::CONF_EXTRACTED);
+        // M4: 450 direct callers of `hub` (two FRONTIER_CHUNKs at depth 1), and
+        // one caller of one of them: the last-discovered (second chunk), then
+        // the first-discovered (first chunk), so reading either chunk alone
+        // misses one of the two runs (0.205.0 review round 2).
+        for deep_index in [449usize, 0] {
+            let (db, _tmp) = test_db();
+            let conn = db.conn();
+            let ids = caller_chain(conn, &["hub"], crate::domain::CONF_EXTRACTED);
+            let fid: i64 = conn
+                .query_row("SELECT file_id FROM nodes WHERE id = ?1", [ids[0]], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let mut ws = Vec::new();
+            for i in 0..450 {
+                let w = insert_node(conn, &node(&format!("w{i}"), fid)).unwrap();
+                insert_edge(conn, w, ids[0], REL_CALLS, None).unwrap();
+                set_edge_confidence(conn, w, ids[0], crate::domain::CONF_EXTRACTED);
+                ws.push(w);
+            }
+            const { assert!(450 > FRONTIER_CHUNK) };
+            let top = insert_node(conn, &node("top", fid)).unwrap();
+            insert_edge(conn, top, ws[deep_index], REL_CALLS, None).unwrap();
+            set_edge_confidence(conn, top, ws[deep_index], crate::domain::CONF_EXTRACTED);
+            assert!(
+                get_call_graph(conn, "hub", "callers", 1, None)
+                    .unwrap()
+                    .deeper_beyond_depth,
+                "deeper caller of w{deep_index}"
+            );
         }
-        const { assert!(450 > FRONTIER_CHUNK) };
-        let top = insert_node(conn, &node("top", fid)).unwrap();
-        insert_edge(conn, top, last, REL_CALLS, None).unwrap();
-        set_edge_confidence(conn, top, last, crate::domain::CONF_EXTRACTED);
-        assert!(
-            get_call_graph(conn, "hub", "callers", 1, None)
-                .unwrap()
-                .deeper_beyond_depth
-        );
 
         // M10: a non-call edge into the deepest level is no caller.
         let (db2, _tmp2) = test_db();

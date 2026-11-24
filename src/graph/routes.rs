@@ -32,8 +32,11 @@ pub struct RouteCallers {
     /// The walk stopped at its depth while callers at that depth have callers
     /// of their own (`CallGraphResult::deeper_beyond_depth`).
     pub deeper_beyond_depth: bool,
-    /// The depth the walk ran to (`CallGraphResult::effective_max_depth`):
-    /// what the depth note names, and whether a larger depth exists to suggest.
+    /// The depth the walk was asked to run to, after clamping
+    /// (`CallGraphResult::effective_max_depth`): the depth note's number, and
+    /// whether a larger depth exists to suggest. A chain that ends sooner keeps
+    /// the asked depth here, but then `deeper_beyond_depth` is false and no
+    /// depth note is shown; whenever it is set the walk did reach this depth.
     pub walked_depth: i32,
 }
 
@@ -277,7 +280,8 @@ mod tests {
     }
 
     /// Above CALL_GRAPH_MAX_DEPTH a deeper request cannot help: the cap's note
-    /// alone (reachable through callers that do not clamp first).
+    /// alone. No caller reaches it today: impact clamps --depth to 1..=10, and
+    /// show / MCP get_ast_node pass 3. Kept for a caller that does not clamp.
     #[test]
     fn the_depth_cap_note_wins_over_the_depth_note() {
         let note = deeper(false, true, crate::graph::query::CALL_GRAPH_MAX_DEPTH)
@@ -287,13 +291,17 @@ mod tests {
             note.contains("depth cap") && !note.contains("stopped at depth"),
             "{note}"
         );
+        // Its knob is the limit/cap advice, not the depth-10 sentence
+        // (0.205.0 review round 2, mutant R4).
+        assert!(
+            note.contains("Narrow the query") && !note.contains("deepest any query"),
+            "{note}"
+        );
     }
 
     #[test]
     fn truncation_note_is_silent_when_nothing_was_cut() {
-        // The negative control for the three above, and the guard on the
-        // `unreachable!()` in the (false, false) arm: `truncated()` must return
-        // first, so that arm stays unreachable rather than panicking a user.
+        // The negative control for the notes above: nothing cut, no note.
         assert!(route_callers(false, false).truncation_note().is_none());
     }
 

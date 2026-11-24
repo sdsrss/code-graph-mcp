@@ -61,8 +61,8 @@ not extend. At `--depth 10`, 7 of the 53 still carry a note: 6 because the
 deeper walk hits the row limit, 1 because 10 is the deepest walk. Median time
 per `impact` call: 4 ms on both versions.
 
-The extra query also runs for `callgraph`, `trace` and MCP `get_call_graph`,
-which do not show the result. The pre-tag review measured it: on that
+The extra query also runs for `callgraph`, `trace` and MCP `get_call_graph`
+and `find_http_route`, which do not show the result. The pre-tag review measured it: on that
 application, the median per-function difference at depth 3 was +0.02 ms
 (p90 +0.58 ms); on a synthetic 51,000-edge fixture where 1,000 callers of one
 function call one another, `impact hub --depth 1` went from 8.6 to 18.8 ms
@@ -100,6 +100,10 @@ as `url` 2.5.9 requires. Lockfile only.
   gain only tests at `--depth 10`, and their production counts are complete.
 - The JSON gives no structured cause for `callers_truncated`; the cause is in
   the text of `callers_truncated_note`.
+- The row-limit advice in the note ("read the full traversal with
+  get_call_graph / `callgraph --direction callers`") points at surfaces that
+  stop at the same 200 rows, and in text output the note sits under the
+  counts it calls "below"; both wordings predate this release.
 - The detail document the CLAUDE.md block points at
   (`.claude/plugin_code_graph_mcp.md`) still says "Grep for literal strings".
 

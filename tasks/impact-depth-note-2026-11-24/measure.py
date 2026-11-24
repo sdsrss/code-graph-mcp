@@ -7,7 +7,8 @@ Samples production function/method nodes that have at least one incoming
 `calls` edge (seeded), runs `impact --node-id N --json` with BASE and HEAD at
 the default depth, and HEAD again at --depth 10. Prints how many answers carry
 `callers_truncated` on each binary, how many of HEAD's flagged answers gain
-production callers / covering tests at depth 10, and the per-call wall time of
+production callers / covering tests at depth 10, how many still carry a note
+at depth 10 and why (row limit / depth 10 is the deepest walk), and the per-call wall time of
 BASE vs HEAD (median of the sample). Reads the index with immutable=1;
 `impact` itself may refresh stale files in the corpus copy (use a copy).
 """
@@ -53,6 +54,7 @@ def main():
     sample = rows[:a.n]
     out = {"pool": len(rows), "n": len(sample), "base_flag": 0, "head_flag": 0, "answered": 0,
            "flag_gains_prod": 0, "flag_gains_tests_only": 0, "flag_gains_nothing": 0,
+           "still_noted_at_depth10": 0, "depth10_row_limit": 0, "depth10_deepest_walk": 0,
            "base_s": [], "head_s": [], "examples": []}
     for nid, name, path in sample:
         b, tb = run(a.base, a.corpus, ["impact", "--node-id", str(nid), "--json"])
@@ -68,6 +70,10 @@ def main():
             d, _ = run(a.head, a.corpus, ["impact", "--node-id", str(nid), "--depth", "10", "--json"])
             if d is None:
                 continue
+            if d.get("callers_truncated"):
+                out["still_noted_at_depth10"] += 1
+                note = d.get("callers_truncated_note", "")
+                out["depth10_row_limit" if "row traversal limit" in note else "depth10_deepest_walk"] += 1
             dp = d["total_callers"] - h["total_callers"]
             dt = d["tests_affected"] - h["tests_affected"]
             if dp > 0:
