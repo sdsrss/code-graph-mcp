@@ -7,8 +7,9 @@ reader sees change. `impact` and every answer built on it now say when the
 depth they walked cut the caller chain, so the note and the JSON key
 `callers_truncated` appear on more answers: on a private application, 53 of
 150 sampled production functions that have callers, where 0.204.0 flagged 1.
-A script that treated `callers_truncated` as an error should read
-`callers_truncated_note`, which names the cause. The CLAUDE.md block and the
+A script that treated `callers_truncated` as an error will see it on more
+answers; the cause is given only as text, in `callers_truncated_note`. The
+CLAUDE.md block and the
 MCP instructions say `grep` instead of `Grep`, so a project that adopted the
 block gets the "This project's CLAUDE.md carries an out-of-date code-graph
 block" notice at one session start; `CODE_GRAPH_NO_TEMPLATE_REFRESH=1`
@@ -21,8 +22,10 @@ back: `npm i -g @sdsrs/code-graph@0.204.0`, then delete
 
 `impact` walks callers to `--depth` (3 by default). When the callers at that
 depth had callers of their own, it still printed "N callers total" and the
-JSON carried no `callers_truncated`: the key fired for the 200-row traversal
-limit and for a depth above the cap of 10. On a private application,
+JSON carried no `callers_truncated`. In 0.204.0 that key came from the
+200-row traversal limit: `impact` clamps `--depth` to 10 before it walks, so
+a larger `--depth` did not set it either (a 14-function chain at `--depth 15`
+listed 10 callers, no key). On a private application,
 `impact normalize_email` printed "4 callers total" where `--depth 4` lists 9,
 and in a session with the plugin installed a model answered with exactly
 those 4 (`tasks/specs/maintenance-mode-2026-11-24.md`, P0-2b).
@@ -32,11 +35,15 @@ returned, with the same relation and confidence floor and without the nodes
 it already visited. When that finds a caller, each impact answer says its
 counts are a floor:
 
-- `impact`: `⚠ Caller traversal stopped at the requested depth while callers
-  at that depth have callers of their own, so the caller counts, affected
-  files and risk level below are computed from a PARTIAL caller set and are a
-  FLOOR, not a total. List the deeper callers with a larger depth (`impact
-  --depth N` / get_call_graph `depth`, at most 10).`
+- `impact`: `⚠ Caller traversal stopped at depth 3 while callers at that
+  depth have callers of their own, so the caller counts, affected files and
+  risk level below are computed from a PARTIAL caller set and are a FLOOR, not
+  a total. List the deeper callers with a larger depth (`impact --depth N` /
+  get_call_graph `depth`, at most 10).` At depth 10 the last sentence reads
+  `10 is the deepest any query walks; to go further, run impact on one of the
+  callers at depth 10.` When the 200-row limit fired as well, the note names
+  both causes and gives only the limit's advice (narrow the query), since the
+  limit keeps the shallowest rows and a deeper walk lists no more.
 - `impact --json`, `show --impact --json` and MCP `get_ast_node` with
   `include_impact` (which walks a fixed depth of 3): `callers_truncated: true`
   and that sentence in `callers_truncated_note`. `show --impact` prints it
@@ -45,14 +52,22 @@ counts are a floor:
   counts are a floor, not a total`.
 - The prompt hook's `[code-graph:impact]` push, which is `impact`'s text.
 
-Above the cap of 10 only the cap's note is given: a deeper request cannot
-help there. Measured on that application (150 production functions with
-callers, seeded; `tasks/impact-depth-note-2026-11-24/measure.py`): of the 53
-answers that carry the note, 47 list more production callers at `--depth 10`,
-5 list more covering tests and no more production callers, and 1 is an
-answer that already hit the row limit (0.204.0 flagged it too), which a
-deeper walk does not extend. Median time per `impact` call: 4 ms on both
-versions.
+Measured on that application (150 production functions with callers,
+seeded; `tasks/impact-depth-note-2026-11-24/measure.py`): of the 53 answers
+that carry the note, 47 list more production callers at `--depth 10`, 5 list
+more covering tests and no more production callers, and 1 is an answer that
+already hit the row limit (0.204.0 flagged it too), which a deeper walk does
+not extend. At `--depth 10`, 7 of the 53 still carry a note: 6 because the
+deeper walk hits the row limit, 1 because 10 is the deepest walk. Median time
+per `impact` call: 4 ms on both versions.
+
+The extra query also runs for `callgraph`, `trace` and MCP `get_call_graph`,
+which do not show the result. The pre-tag review measured it: on that
+application, the median per-function difference at depth 3 was +0.02 ms
+(p90 +0.58 ms); on a synthetic 51,000-edge fixture where 1,000 callers of one
+function call one another, `impact hub --depth 1` went from 8.6 to 18.8 ms
+and `callgraph hub --direction callers --depth 1` from 8.0 to 17.9 ms
+(medians of 30 runs).
 
 ### fix(steering): literal-string search points at grep, not the Grep tool
 
@@ -80,6 +95,13 @@ as `url` 2.5.9 requires. Lockfile only.
   `impact _now` lists.
 - `callgraph`, `trace` and MCP `get_call_graph` print the depth they were
   asked for and claim no total; they carry no new note.
+- The note does not say whether the callers past the depth are production
+  callers or covering tests. On the application, 5 of the 53 noted answers
+  gain only tests at `--depth 10`, and their production counts are complete.
+- The JSON gives no structured cause for `callers_truncated`; the cause is in
+  the text of `callers_truncated_note`.
+- The detail document the CLAUDE.md block points at
+  (`.claude/plugin_code_graph_mcp.md`) still says "Grep for literal strings".
 
 ## 0.204.0
 

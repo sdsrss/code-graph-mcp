@@ -9152,7 +9152,7 @@ end
         assert!(
             out["impact"]["callers_truncated_note"]
                 .as_str()
-                .is_some_and(|n| n.contains("requested depth")),
+                .is_some_and(|n| n.contains("stopped at depth 3")),
             "{out}"
         );
 

@@ -29,9 +29,12 @@ pub struct RouteCallers {
     pub limit_hit: bool,
     /// The requested depth exceeded `CALL_GRAPH_MAX_DEPTH` — deeper callers exist.
     pub depth_capped: bool,
-    /// The walk stopped at the requested depth while its deepest callers have
-    /// callers of their own (`CallGraphResult::deeper_beyond_depth`).
+    /// The walk stopped at its depth while callers at that depth have callers
+    /// of their own (`CallGraphResult::deeper_beyond_depth`).
     pub deeper_beyond_depth: bool,
+    /// The depth the walk ran to (`CallGraphResult::effective_max_depth`):
+    /// what the depth note names, and whether a larger depth exists to suggest.
+    pub walked_depth: i32,
 }
 
 impl RouteCallers {
@@ -41,14 +44,18 @@ impl RouteCallers {
     }
 
     /// One sentence naming why the set is partial, what that makes the numbers
-    /// mean, and the knob for each cause. Single-sourced so every impact surface
-    /// says the same thing — `attach_truncation_flags` is the equivalent for the
-    /// call-graph surfaces. Above the depth cap a deeper request cannot help,
-    /// so there the cap alone is named.
+    /// mean, and the one knob that can help. Single-sourced so every impact
+    /// surface says the same thing — `attach_truncation_flags` is the equivalent
+    /// for the call-graph surfaces. A larger depth is suggested only when one
+    /// exists and the row limit did not fire: the limit keeps the shallowest
+    /// rows, so a deeper walk under it lists nothing more (0.205.0 pre-tag
+    /// review F1/F3). The depth named is the one walked, since show / MCP /
+    /// the hooks walk a fixed 3 nobody requested (F8).
     pub fn truncation_note(&self) -> Option<String> {
         if !self.truncated() {
             return None;
         }
+        let max_depth = crate::graph::query::CALL_GRAPH_MAX_DEPTH;
         let deeper = self.deeper_beyond_depth && !self.depth_capped;
         let mut causes: Vec<String> = Vec::new();
         if self.limit_hit {
@@ -61,31 +68,31 @@ impl RouteCallers {
             causes.push("hit the depth cap".to_string());
         }
         if deeper {
-            causes.push(
-                "stopped at the requested depth while callers at that depth have callers of their own"
-                    .to_string(),
-            );
-        }
-        let mut knobs: Vec<String> = Vec::new();
-        if self.limit_hit || self.depth_capped {
-            knobs.push(
-                "Narrow the query (file_path / a more specific symbol) or read the full \
-                 traversal with get_call_graph / `callgraph --direction callers`."
-                    .to_string(),
-            );
-        }
-        if deeper {
-            knobs.push(format!(
-                "List the deeper callers with a larger depth (`impact --depth N` / get_call_graph \
-                 `depth`, at most {}).",
-                crate::graph::query::CALL_GRAPH_MAX_DEPTH
+            causes.push(format!(
+                "stopped at depth {} while callers at that depth have callers of their own",
+                self.walked_depth
             ));
         }
+        let knob = if self.limit_hit || self.depth_capped {
+            "Narrow the query (file_path / a more specific symbol) or read the full \
+             traversal with get_call_graph / `callgraph --direction callers`."
+                .to_string()
+        } else if self.walked_depth < max_depth {
+            format!(
+                "List the deeper callers with a larger depth (`impact --depth N` / get_call_graph \
+                 `depth`, at most {max_depth})."
+            )
+        } else {
+            format!(
+                "{max_depth} is the deepest any query walks; to go further, run impact on one of \
+                 the callers at depth {max_depth}."
+            )
+        };
         Some(format!(
             "Caller traversal {}, so the caller counts, affected files and risk level \
              below are computed from a PARTIAL caller set and are a FLOOR, not a total. {}",
             causes.join(" and "),
-            knobs.join(" ")
+            knob
         ))
     }
 }
@@ -126,6 +133,7 @@ pub fn get_callers_with_route_info_seeded(
     let limit_hit = callers.limit_hit;
     let depth_capped = callers.depth_capped;
     let deeper_beyond_depth = callers.deeper_beyond_depth;
+    let walked_depth = callers.effective_max_depth;
     // No early return for the empty case: `fetch_route_metadata_map`
     // short-circuits on an empty id list and the map below yields an empty Vec,
     // so the tail already produces a byte-identical `RouteCallers`. A guard here
@@ -153,6 +161,7 @@ pub fn get_callers_with_route_info_seeded(
         limit_hit,
         depth_capped,
         deeper_beyond_depth,
+        walked_depth,
     })
 }
 
@@ -175,6 +184,7 @@ mod tests {
             limit_hit,
             depth_capped,
             deeper_beyond_depth: false,
+            walked_depth: 3,
         }
     }
 
@@ -204,22 +214,30 @@ mod tests {
         );
     }
 
-    /// 2026-11-24: the requested depth stopped the walk while the deepest layer
-    /// had callers of its own. Its knob is the depth, not narrowing the query.
-    #[test]
-    fn truncation_note_names_the_requested_depth_and_its_knob() {
-        let rc = RouteCallers {
+    fn deeper(limit_hit: bool, depth_capped: bool, walked_depth: i32) -> RouteCallers {
+        RouteCallers {
             callers: vec![],
-            limit_hit: false,
-            depth_capped: false,
+            limit_hit,
+            depth_capped,
             deeper_beyond_depth: true,
-        };
+            walked_depth,
+        }
+    }
+
+    /// 2026-11-24: the walk's depth cut the chain while the deepest layer had
+    /// callers of their own. It names the depth walked, not "the requested
+    /// depth" (show / MCP / hooks walk a fixed 3, 0.205.0 review F8), and its
+    /// knob is a larger depth.
+    #[test]
+    fn truncation_note_names_the_depth_walked_and_its_knob() {
+        let rc = deeper(false, false, 3);
         assert!(rc.truncated());
         let note = rc.truncation_note().unwrap();
         assert!(
-            note.contains("requested depth") && note.contains("--depth"),
+            note.contains("stopped at depth 3") && note.contains("--depth"),
             "{note}"
         );
+        assert!(!note.contains("requested depth"), "{note}");
         assert!(
             !note.contains("depth cap") && !note.contains("row traversal limit"),
             "a note that names another cause sends the reader to the wrong knob: {note}"
@@ -227,19 +245,46 @@ mod tests {
         assert!(note.contains("FLOOR, not a total"), "{note}");
     }
 
-    /// Above CALL_GRAPH_MAX_DEPTH a deeper request cannot help: the cap's note
-    /// alone, not advice to raise --depth.
+    /// At CALL_GRAPH_MAX_DEPTH no larger depth exists, and impact clamps
+    /// --depth to it before the walk, so `depth_capped` never fires on an
+    /// impact surface (0.205.0 review F1): the note must not suggest a depth.
     #[test]
-    fn the_depth_cap_note_wins_over_the_requested_depth_note() {
-        let rc = RouteCallers {
-            callers: vec![],
-            limit_hit: false,
-            depth_capped: true,
-            deeper_beyond_depth: true,
-        };
-        let note = rc.truncation_note().unwrap();
+    fn at_the_deepest_walk_the_note_suggests_no_larger_depth() {
+        let max = crate::graph::query::CALL_GRAPH_MAX_DEPTH;
+        let note = deeper(false, false, max).truncation_note().unwrap();
+        assert!(note.contains(&format!("stopped at depth {max}")), "{note}");
+        assert!(!note.contains("--depth"), "{note}");
         assert!(
-            note.contains("depth cap") && !note.contains("requested depth"),
+            note.contains(&format!("run impact on one of the callers at depth {max}")),
+            "{note}"
+        );
+    }
+
+    /// The row limit keeps the shallowest rows, so under it a deeper walk lists
+    /// nothing more (0.205.0 review F3: daagu `_process_fx`, 89 / 110 at depth 3
+    /// and at depth 10). Both causes are named; only the limit's knob is given.
+    #[test]
+    fn under_the_row_limit_the_note_suggests_no_larger_depth() {
+        let note = deeper(true, false, 3).truncation_note().unwrap();
+        assert!(
+            note.contains("row traversal limit") && note.contains("stopped at depth 3"),
+            "{note}"
+        );
+        assert!(
+            note.contains("Narrow the query") && !note.contains("--depth"),
+            "{note}"
+        );
+    }
+
+    /// Above CALL_GRAPH_MAX_DEPTH a deeper request cannot help: the cap's note
+    /// alone (reachable through callers that do not clamp first).
+    #[test]
+    fn the_depth_cap_note_wins_over_the_depth_note() {
+        let note = deeper(false, true, crate::graph::query::CALL_GRAPH_MAX_DEPTH)
+            .truncation_note()
+            .unwrap();
+        assert!(
+            note.contains("depth cap") && !note.contains("stopped at depth"),
             "{note}"
         );
     }

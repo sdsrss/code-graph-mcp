@@ -1790,6 +1790,77 @@ mod tests {
         );
     }
 
+    /// 0.205.0 pre-tag review F6 survivors M4 / M10 / M15: the check reads every
+    /// frontier chunk, only `calls` edges, and a neighbour on the same level is
+    /// already visited, not deeper.
+    #[test]
+    fn deeper_beyond_depth_reads_every_chunk_and_only_calls_from_outside_the_walk() {
+        // M4: 450 direct callers of `hub` (two FRONTIER_CHUNKs at depth 1); only
+        // the last-discovered one has a caller, so it sits in the second chunk.
+        let (db, _tmp) = test_db();
+        let conn = db.conn();
+        let ids = caller_chain(conn, &["hub"], crate::domain::CONF_EXTRACTED);
+        let fid: i64 = conn
+            .query_row("SELECT file_id FROM nodes WHERE id = ?1", [ids[0]], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut last = 0;
+        for i in 0..450 {
+            last = insert_node(conn, &node(&format!("w{i}"), fid)).unwrap();
+            insert_edge(conn, last, ids[0], REL_CALLS, None).unwrap();
+            set_edge_confidence(conn, last, ids[0], crate::domain::CONF_EXTRACTED);
+        }
+        const { assert!(450 > FRONTIER_CHUNK) };
+        let top = insert_node(conn, &node("top", fid)).unwrap();
+        insert_edge(conn, top, last, REL_CALLS, None).unwrap();
+        set_edge_confidence(conn, top, last, crate::domain::CONF_EXTRACTED);
+        assert!(
+            get_call_graph(conn, "hub", "callers", 1, None)
+                .unwrap()
+                .deeper_beyond_depth
+        );
+
+        // M10: a non-call edge into the deepest level is no caller.
+        let (db2, _tmp2) = test_db();
+        let conn2 = db2.conn();
+        let ids2 = caller_chain(conn2, &["A", "B"], crate::domain::CONF_EXTRACTED);
+        let fid2: i64 = conn2
+            .query_row("SELECT file_id FROM nodes WHERE id = ?1", [ids2[0]], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let r = insert_node(conn2, &node("R", fid2)).unwrap();
+        insert_edge(conn2, r, ids2[1], crate::domain::REL_REFERENCES, None).unwrap();
+        set_edge_confidence(conn2, r, ids2[1], crate::domain::CONF_EXTRACTED);
+        assert!(
+            !get_call_graph(conn2, "A", "callers", 1, None)
+                .unwrap()
+                .deeper_beyond_depth
+        );
+
+        // M15: B1 and B2 both call A; B2 also calls B1. At depth 1 both are
+        // visited, so B2 -> B1 is no deeper caller.
+        let (db3, _tmp3) = test_db();
+        let conn3 = db3.conn();
+        let ids3 = caller_chain(conn3, &["A", "B1"], crate::domain::CONF_EXTRACTED);
+        let fid3: i64 = conn3
+            .query_row("SELECT file_id FROM nodes WHERE id = ?1", [ids3[0]], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let b2 = insert_node(conn3, &node("B2", fid3)).unwrap();
+        for (src, tgt) in [(b2, ids3[0]), (b2, ids3[1])] {
+            insert_edge(conn3, src, tgt, REL_CALLS, None).unwrap();
+            set_edge_confidence(conn3, src, tgt, crate::domain::CONF_EXTRACTED);
+        }
+        assert!(
+            !get_call_graph(conn3, "A", "callers", 1, None)
+                .unwrap()
+                .deeper_beyond_depth
+        );
+    }
+
     fn set_edge_confidence(conn: &Connection, src: i64, tgt: i64, conf: &str) {
         conn.execute(
             "UPDATE edges SET confidence = ?3 WHERE source_id = ?1 AND target_id = ?2",

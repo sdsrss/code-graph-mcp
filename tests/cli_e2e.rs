@@ -12140,7 +12140,7 @@ fn impact_says_when_the_requested_depth_cut_the_caller_chain() {
         "fixture precondition: {text}"
     );
     assert!(
-        text.contains("requested depth") && text.contains("FLOOR") && text.contains("--depth"),
+        text.contains("stopped at depth 3") && text.contains("FLOOR") && text.contains("--depth"),
         "the default depth 3 cut chain_e: {text}"
     );
 
@@ -12152,7 +12152,7 @@ fn impact_says_when_the_requested_depth_cut_the_caller_chain() {
     assert!(
         v["callers_truncated_note"]
             .as_str()
-            .is_some_and(|n| n.contains("requested depth")),
+            .is_some_and(|n| n.contains("stopped at depth 3")),
         "{out}"
     );
 
@@ -12160,7 +12160,7 @@ fn impact_says_when_the_requested_depth_cut_the_caller_chain() {
     let (show, stderr, code) = run_cli(&project, &["show", "chain_a", "--impact", "--json"]);
     assert_eq!(code, 0, "stderr:\n{stderr}");
     assert!(
-        show.contains("callers_truncated") && show.contains("requested depth"),
+        show.contains("callers_truncated") && show.contains("stopped at depth 3"),
         "{show}"
     );
 
@@ -12172,6 +12172,38 @@ fn impact_says_when_the_requested_depth_cut_the_caller_chain() {
     assert!(w.get("callers_truncated").is_none(), "{whole}");
     let (whole_text, _e, _c) = run_cli(&project, &["impact", "chain_a", "--depth", "4"]);
     assert!(!whole_text.contains("FLOOR"), "{whole_text}");
+}
+
+/// 0.205.0 pre-tag review F1: impact clamps --depth to CALL_GRAPH_MAX_DEPTH
+/// before it walks, so at 10 (and at 15, clamped) the note named the depth
+/// knob although no larger depth exists.
+#[test]
+fn impact_at_the_deepest_walk_suggests_no_larger_depth() {
+    let project = setup_caller_chain_project(14); // callers of chain_a at depths 1..13
+    for depth in ["10", "15"] {
+        let (out, stderr, code) =
+            run_cli(&project, &["impact", "chain_a", "--depth", depth, "--json"]);
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(
+            v["total_callers"].as_u64(),
+            Some(10),
+            "--depth {depth}: {out}"
+        );
+        let note = v["callers_truncated_note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("stopped at depth 10"),
+            "--depth {depth}: {out}"
+        );
+        assert!(
+            !note.contains("--depth"),
+            "no larger depth exists to suggest: {note}"
+        );
+        assert!(
+            note.contains("run impact on one of the callers at depth 10"),
+            "{note}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
