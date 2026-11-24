@@ -62,7 +62,7 @@ impl RouteCallers {
         }
         if deeper {
             causes.push(
-                "stopped at the requested depth while the deepest callers listed have callers of their own"
+                "stopped at the requested depth while callers at that depth have callers of their own"
                     .to_string(),
             );
         }
