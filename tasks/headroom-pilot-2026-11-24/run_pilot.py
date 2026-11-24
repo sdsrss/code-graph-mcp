@@ -4,6 +4,13 @@
         --models claude-haiku-5-5 claude-sonnet-5-5 claude-opus-5-5 --rounds 2 --round2-models M ... \
         --max-total-usd 5.0 --cap claude-haiku-5-5=0.40 --cap claude-sonnet-5-5=0.70 --cap claude-opus-5-5=1.00
 
+--arms none plugin adds a with-plugin arm (2026-11-24 misled test): the plugin dir given by
+--plugin-src is staged under .claude/plugins/ (plugin mode, tests removed) and loaded with
+--plugin-dir, --binary is copied to the session HOME's ~/.cache/code-graph/bin, and the corpus
+is copied WITH its .code-graph/ index. After the run the session transcript under the
+config dir is searched for the `[code-graph:impact]` injection (row "injected"). Tags are
+r<round>-<arm>-<model>-<case>; --skip drops tags by fnmatch pattern.
+
 Round 1 runs every case x model once before round 2 repeats any (round 2 only for
 --round2-models), so a budget stop still leaves one run of each. Each run is a real
 `claude -p` session with its own HOME and CLAUDE_CONFIG_DIR (credentials linked in,
@@ -23,6 +30,7 @@ Truth file: {"case", "kind": "sites"|"callers", "prompt", "truth"}; sites are
 """
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -73,24 +81,55 @@ def score(case, reply):
             "answered": len(got), "missed": missed, "extra": extra}
 
 
-def one_run(tag, case, model, budget, args, tools):
+def stage_plugin(args):
+    plugin = args.out / "stage" / ".claude" / "plugins" / "code-graph-mcp"
+    if not plugin.exists():
+        shutil.copytree(args.plugin_src, plugin, symlinks=True)
+        for t in plugin.rglob("*.test.js"):
+            t.unlink()
+    return plugin
+
+
+def injected(cfg):
+    for p in cfg.glob("projects/*/*.jsonl"):
+        for line in p.read_text(errors="replace").splitlines():
+            if '"attachment"' not in line or "[code-graph:impact]" not in line:
+                continue
+            a = json.loads(line).get("attachment") or {}
+            body = a.get("content") or a.get("stdout") or ""
+            body = "\n".join(map(str, body)) if isinstance(body, list) else str(body)
+            if "[code-graph:impact]" in body:
+                return body[body.index("[code-graph:impact]"):][:1500]
+    return None
+
+
+def one_run(tag, case, model, budget, args, tools, arm):
     root = args.out / tag
     if root.exists():
         shutil.rmtree(root)
     ws, home, cfg, tmp = root / "ws", root / "home", root / "config", root / "tmp"
-    shutil.copytree(args.corpus, ws, symlinks=True, ignore=shutil.ignore_patterns(".code-graph"))
+    ignore = None if arm == "plugin" else shutil.ignore_patterns(".code-graph")
+    shutil.copytree(args.corpus, ws, symlinks=True, ignore=ignore)
     for d in (home, cfg, tmp):
         d.mkdir(parents=True)
     (cfg / ".credentials.json").symlink_to(CREDENTIALS)
     env = {"HOME": str(home), "PATH": f"{tools}:/usr/bin:/bin", "CLAUDE_CONFIG_DIR": str(cfg),
-           "TMPDIR": str(tmp), "TERM": "dumb", "LANG": "C.UTF-8", "USER": os.environ.get("USER", "eval")}
+           "TMPDIR": str(tmp), "TERM": "dumb", "LANG": "C.UTF-8", "USER": os.environ.get("USER", "eval"),
+           "CODE_GRAPH_NO_AUTO_UPDATE": "1", "CODE_GRAPH_DISABLE_MODEL_DOWNLOAD": "1"}
+    extra = []
+    if arm == "plugin":
+        cg_bin = home / ".cache" / "code-graph" / "bin"
+        cg_bin.mkdir(parents=True)
+        shutil.copy2(args.binary, cg_bin / "code-graph-mcp")
+        extra = ["--plugin-dir", str(stage_plugin(args))]
     for k in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY",
               "https_proxy", "http_proxy", "no_proxy", "all_proxy"):
         if k in os.environ:
             env[k] = os.environ[k]
-    cmd = ["claude", "-p", case["prompt"], "--model", model, "--max-budget-usd", f"{budget:.2f}",
+    allowed = TOOLS + (["mcp__plugin_code-graph-mcp_code-graph__*"] if arm == "plugin" else [])
+    cmd = ["claude", "-p", case["prompt"], "--model", model, "--max-budget-usd", f"{budget:.2f}", *extra,
            "--output-format", "stream-json", "--verbose",
-           "--permission-mode", "dontAsk", "--tools", *TOOLS, "--allowedTools", *TOOLS]
+           "--permission-mode", "dontAsk", "--tools", *TOOLS, "--allowedTools", *allowed]
     trace = root / "trace.jsonl"
     started = time.time()
     with open(trace, "w") as out:
@@ -108,12 +147,12 @@ def one_run(tag, case, model, budget, args, tools):
         elif ev.get("type") == "system" and ev.get("subtype") == "init":
             init = ev
     reply = result.get("result") or ""
-    row = {"tag": tag, "case": case["case"], "model": model, "rc": proc.returncode,
+    row = {"tag": tag, "arm": arm, "case": case["case"], "model": model, "rc": proc.returncode,
            "secs": round(time.time() - started), "cost": result.get("total_cost_usd", 0.0),
            "turns": result.get("num_turns"), "subtype": result.get("subtype"),
            "is_error": result.get("is_error", True), "used_code_graph": bool(USED_CG.search(text)),
            "init_model": init.get("model"), "mcp_servers": [s.get("name") for s in init.get("mcp_servers", [])],
-           "stderr_tail": proc.stderr[-300:] if proc.returncode else ""}
+           "stderr_tail": proc.stderr[-300:] if proc.returncode else "", "injected": injected(cfg)}
     s = score(case, reply)
     row.update(s if s else {"recall": None, "precision": None})
     (root / "reply.md").write_text(reply)
@@ -131,6 +170,10 @@ def main():
     ap.add_argument("--round2-models", nargs="*", default=None)
     ap.add_argument("--max-total-usd", type=float, required=True)
     ap.add_argument("--cap", action="append", default=[], help="MODEL=USD per-session cap")
+    ap.add_argument("--arms", nargs="+", default=["none"], choices=["none", "plugin"])
+    ap.add_argument("--plugin-src", type=Path)
+    ap.add_argument("--binary", type=Path)
+    ap.add_argument("--skip", nargs="*", default=[])
     args = ap.parse_args()
     caps = dict((k, float(v)) for k, v in (c.split("=", 1) for c in args.cap))
     cases = [json.loads(p.read_text()) for p in args.cases]
@@ -146,9 +189,11 @@ def main():
     plan = []
     for r in range(1, args.rounds + 1):
         models = args.models if r == 1 or args.round2_models is None else args.round2_models
-        plan += [(f"r{r}-{m.split('-')[1]}-{c['case']}", c, m) for m in models for c in cases]
-    for tag, case, model in plan:
-        if any(d["tag"] == tag for d in done):
+        arms = args.arms
+        plan += [(f"r{r}-{a}-{m.split('-')[1]}-{c['case']}" if arms != ["none"] else f"r{r}-{m.split('-')[1]}-{c['case']}",
+                  c, m, a) for a in arms for m in models for c in cases]
+    for tag, case, model, arm in plan:
+        if any(d["tag"] == tag for d in done) or any(fnmatch.fnmatch(tag, p) for p in args.skip):
             continue
         spent = sum(d["cost"] for d in done)
         mine = [d["cost"] for d in done if d["model"] == model]
@@ -157,12 +202,14 @@ def main():
         if estimate > left:
             print(f"skip {tag}: spent ${spent:.2f}, estimate ${estimate:.2f} > left ${left:.2f}", flush=True)
             continue
-        row = one_run(tag, case, model, min(caps.get(model, 1.0), left), args, tools)
+        row = one_run(tag, case, model, min(caps.get(model, 1.0), left), args, tools, arm)
         done.append(row)
         with open(results, "a") as f:
             f.write(json.dumps(row) + "\n")
-        print(json.dumps({k: row.get(k) for k in ("tag", "cost", "turns", "subtype", "recall", "precision",
-                                                   "answered", "used_code_graph", "init_model")}), flush=True)
+        print(json.dumps({**{k: row.get(k) for k in ("tag", "cost", "turns", "subtype", "recall", "precision",
+                                                      "answered", "used_code_graph", "init_model")},
+                          "injected": bool(row.get("injected")), "missed": row.get("missed"),
+                          "extra": row.get("extra")}), flush=True)
     print(f"total ${sum(d['cost'] for d in done):.2f} over {len(done)} run(s)", flush=True)
 
 
