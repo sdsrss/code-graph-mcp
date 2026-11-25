@@ -70,29 +70,53 @@ size and machine.
 
 ## Efficiency: code-graph vs Traditional Tools
 
-How many TOOL CALLS each question takes, comparing code-graph-mcp against Grep
-+ Read + Glob. These are call counts, not token measurements: the left column is
-the round trips the traditional approach needs before it can answer, the right
-column is the single call that answers it. Token cost follows call count only
-loosely — how much source lands in the context window depends on the files, so
-this table does not claim a token ratio.
+### Measured in Claude Code sessions (2026-11)
 
-### Tool Call Reduction
+Paired `claude -p` sessions with and without the installed plugin (hooks and MCP
+server; the coding run also had the CLAUDE.md block), on a private
+Python/TypeScript repository of about 1,300-1,550 indexed files. These are
+measurements, with their sample sizes; read the scope below before applying them
+to your project.
 
-| Scenario | Traditional | code-graph | Savings |
-|----------|:-----------:|:----------:|:-------:|
-| Project architecture overview | 5-8 calls | 1 call (`project_map`) | **~85%** |
-| Find function by concept | 3-5 calls | 1 call (`semantic_code_search`) | **~75%** |
-| Trace 2-level call chain | 8-15 calls | 1 call (`get_call_graph`) | **~90%** |
-| Pre-change impact analysis | 10-20+ calls | 1 call (`get_ast_node` + `include_impact`) | **~95%** |
-| Module structure & exports | 5+ calls | 1 call (`module_overview`) | **~80%** |
-| File dependency mapping | 3-5 calls | 1 call (`module_overview` + `include_deps`) | **~75%** |
-| Similar code detection | N/A | 1 call (`get_ast_node` + `include_similar`) | **unique** |
+| Question | Sessions | Without the plugin | With the plugin |
+|----------|----------|--------------------|-----------------|
+| "Who calls X?" before changing it (two prompts) | 10 pairs, Claude Haiku / Sonnet / Opus 5.5, v0.204.0 | 79 turns, $0.81; every caller found in 9 of 10 sessions | 47 turns (-41%), $0.69 (-16%); every caller found in 11 of 12 |
+| Coding: change a function whose callers in other files must change too (3 real commits replayed, graded by the commit's own tests plus the full suite) | 9 pairs, Opus 5.5, v0.205.0 | 9/9 correct, $5.96, 231 turns | 9/9 correct, $6.07 (+1.7%, paired 95% CI -13% to +17%), 233 turns |
+
+- The caller-question numbers were noticed after the fact: that run was built to
+  check whether an incomplete injected caller list misleads the model (1 of 12
+  plugin sessions copied it; a session without the plugin missed 4 of the same 5
+  deepest callers on its own). Treat them as one observation, not a
+  pre-registered result.
+- Without the plugin, Claude listed callers exactly with grep in every baseline
+  session we ran (20 sessions: up to 50 call sites, call chains 4 deep, a
+  same-named decoy; the Python standard library and the repository above).
+- In day-to-day use across our own projects, Claude seldom called the tools on
+  its own (about 0.4 calls per 1,000 tool calls); most graph answers reached it
+  through the plugin's hooks.
+- Not measured: repositories of 10,000+ files, cross-language call chains,
+  chains deeper than 4, clients other than Claude Code.
+
+So expect the gain on questions about callers and change impact. For routine
+coding on a repository of this size, expect no measurable difference.
+
+### Which call answers what
+
+| Scenario | One call |
+|----------|----------|
+| Project architecture overview | `project_map` |
+| Find function by concept | `semantic_code_search` |
+| Trace a call chain | `get_call_graph` |
+| Pre-change impact analysis | `get_ast_node` + `include_impact` |
+| Module structure & exports | `module_overview` |
+| File dependency mapping | `module_overview` + `include_deps` |
+| Similar code detection | `get_ast_node` + `include_similar` |
 
 ### Session token savings
 
-`tests/effectiveness_bench.rs` is the only reproducible number here, and it is
-worth being precise about what it measures. For each of five navigation tasks it
+`tests/effectiveness_bench.rs` is the only number here you can reproduce
+yourself (the sessions above ran on a private repository), and it is worth being
+precise about what it measures. For each of five navigation tasks it
 runs the real CLI on a fixture project and compares the response size in bytes
 against a **hand-set** `baseline_bytes` for the Grep+Read approach. Bytes stand
 in for tokens; the baselines are estimates committed once and held fixed, so its
@@ -109,9 +133,9 @@ an "Overall Session Efficiency" table (~80% fewer calls, ~95% fewer lines read,
 40-60% session savings) whose first rows had no source at all; they are gone
 rather than dressed up.
 
-### What code-graph Uniquely Enables
+### What one query returns
 
-- **Impact analysis** — "Changing `conn` affects 33 functions across 4 files, 78 tests at HIGH risk" — impossible to derive manually with Grep
+- **Impact analysis** — "Changing `conn` affects 33 functions across 4 files, 78 tests at HIGH risk" — with grep that is one search per hop, plus picking out the tests
 - **Transitive call tracing** — Follow `main` → `run_serve` → `handle_message` → `handle_tools_call` → `conn` in one query
 - **Semantic search** — Find `authenticate_session` when searching "handle user login"
 - **Dependency strength** — Not just "file A imports file B", but "file A uses 38 symbols from file B"
