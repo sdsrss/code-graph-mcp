@@ -6,18 +6,19 @@ name: Routing Bench
 # tests/routing_bench.rs::P_AT_1_THRESHOLD), and surfaces the score to the
 # GitHub Actions summary so per-release drift is visible at a glance.
 #
-# Cost: ~$0.10 per run via OpenRouter (Claude Sonnet 4.5). Schedule: weekly
-# Sunday + manual dispatch + on every release tag (post-tag tracking, not
-# pre-merge gating — keeps tag pushes from blocking on transient API failures).
+# Cost: ~$0.10 per run via OpenRouter (Claude Sonnet 4.5). Triggers: manual
+# dispatch + every release tag (post-tag tracking, not pre-merge gating — keeps
+# tag pushes from blocking on transient API failures). The weekly Sunday
+# schedule was dropped on 2026-11-24 when feature work stopped
+# (tasks/specs/maintenance-mode-2026-11-24.md): with the tool descriptions and
+# the model both fixed, a weekly paid run re-measured nothing new (last: 22/22).
+# A release still measures, because a release is when the descriptions change.
 #
 # Setup: add OPENROUTER_API_KEY to repo secrets (Settings → Secrets and
 # variables → Actions). Without the secret the test silently no-ops, so a
 # missing secret on a fork is benign.
 
 on:
-  schedule:
-    # Sundays 03:17 UTC — odd minute to avoid the on-the-hour scheduler stampede.
-    - cron: '17 3 * * 0'
   workflow_dispatch:
     inputs:
       model:
